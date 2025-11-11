@@ -1,13 +1,65 @@
 import { Niivue } from "@niivue/niivue";
-import { runInference } from "./brainchop-mainthread.js";
+import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
+import { runInferenceWebGpu } from "./inference-webgpu.js";
 import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
-import { isChrome, localSystemDetails } from "./brainchop-diagnostics.js";
+import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
 
+// --- Backend State ---
+let selectedBackend = "tfjs_worker"; // Default backend
+let gpuDevice = null;
+let isWebGpuAvailable = false;
+
+/**
+ * Detects WebGPU support, initializes the device, and populates the backend UI selector.
+ */
+// In main.js
+async function initializeBackend() {
+  const backendSelect = document.getElementById("backendSelect");
+  let options = '<option value="tfjs_worker">WebGL Worker (tf.js)</option><option value="tfjs_main">WebGL Main (tf.js)</option>';
+
+  if ('gpu' in navigator) {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) {
+          // --- FIX IS HERE: Request BOTH maxBufferSize and maxStorageBufferBindingSize ---
+          const requiredLimits = {
+            maxBufferSize: adapter.limits.maxBufferSize,
+            maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
+          };
+          const requiredFeatures = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
+          
+          gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+          
+          isWebGpuAvailable = true;
+          const f16Status = requiredFeatures.length > 0 ? " (f16)" : "";
+          // Prepend WebGPU option if available
+          options = `<option value="webgpu">WebGPU${f16Status}</option>` + options;
+          selectedBackend = "webgpu"; // Set WebGPU as default
+          console.log(`WebGPU is available. F16 support: ${f16Status !== ""}`);
+      }
+    } catch(e) {
+      console.error("WebGPU initialization failed.", e);
+    }
+  }
+  
+  backendSelect.innerHTML = options;
+  if (!isWebGpuAvailable) {
+      console.log("WebGPU not available, falling back to WebGL.");
+      backendSelect.value = "tfjs_worker"; // Ensure a fallback is selected
+      selectedBackend = "tfjs_worker";
+  }
+}
+
 async function main() {
+  let diagnosticsString = "";
+  let missingLabelStatus = "";
+  let chopWorker;
+  
   dragMode.onchange = async function () {
     nv1.opts.dragMode = this.selectedIndex;
   };
+
   drawDrop.onchange = async function () {
     if (nv1.volumes.length < 2) {
       window.alert("No segmentation open (use the Segmentation pull down)");
@@ -28,13 +80,11 @@ async function main() {
     let img = nv1.volumes[1].img;
     let draw = await nv1.saveImage({ filename: "", isSaveDrawing: true });
     const niiHdrBytes = 352;
-    const nvox = draw.length;
-    if (mode === 1) {
-      //append
+    const nvox = img.length;
+    if (mode === 1) { //append
       for (let i = 0; i < nvox; i++) if (draw[niiHdrBytes + i] > 0) img[i] = 1;
     }
-    if (mode === 2) {
-      //delete
+    if (mode === 2) { //delete
       for (let i = 0; i < nvox; i++) if (draw[niiHdrBytes + i] > 0) img[i] = 0;
     }
     nv1.closeDrawing();
@@ -43,16 +93,19 @@ async function main() {
     penDrop.selectedIndex = -1;
     drawDrop.selectedIndex = -1;
   };
+
   penDrop.onchange = async function () {
     const mode = parseInt(this.value);
     nv1.setDrawingEnabled(mode >= 0);
     if (mode >= 0) nv1.setPenValue(mode & 7, mode > 7);
   };
+
   aboutBtn.onclick = function () {
     window.alert(
       "Drag and drop NIfTI images. Use pulldown menu to choose brainchop model",
     );
   };
+
   diagnosticsBtn.onclick = function () {
     if (diagnosticsString.length < 1) {
       window.alert(
@@ -70,13 +123,16 @@ async function main() {
     navigator.clipboard.writeText(diagnosticsString);
     window.alert("Diagnostics copied to clipboard\n" + diagnosticsString);
   };
+
   opacitySlider0.oninput = function () {
     nv1.setOpacity(0, opacitySlider0.value / 255);
     nv1.updateGLVolume();
   };
+
   opacitySlider1.oninput = function () {
     nv1.setOpacity(1, opacitySlider1.value / 255);
   };
+
   async function ensureConformed() {
     const nii = nv1.volumes[0];
     let isConformed =
@@ -89,297 +145,244 @@ async function main() {
     ) {
       isConformed = false;
     }
-    if (isConformed) {
-      return;
-    }
+    if (isConformed) return;
     const nii2 = await nv1.conform(nii, false);
     await nv1.removeVolume(nv1.volumes[0]);
     await nv1.addVolume(nii2);
   }
+
   async function closeAllOverlays() {
     while (nv1.volumes.length > 1) {
       await nv1.removeVolume(nv1.volumes[1]);
     }
   }
-  modelSelect.onchange = async function () {
-    if (this.selectedIndex < 0) {
-      modelSelect.selectedIndex = 11;
-    }
+  
+  async function runSelectedInference() {
+    if (modelSelect.selectedIndex < 0) return;
+    
     await closeAllOverlays();
     await ensureConformed();
-    const model = inferenceModelsList[this.selectedIndex];
-    const opts = brainChopOpts;
-    // opts.rootURL should be the url without the query string
-    const urlParams = new URL(window.location.href);
-    // remove the query string
-    opts.rootURL = urlParams.origin + urlParams.pathname;
-    const isLocalhost = Boolean(
-      window.location.hostname === "localhost" ||
-        // [::1] is the IPv6 localhost address.
-        window.location.hostname === "[::1]" ||
-        // 127.0.0.1/8 is considered localhost for IPv4.
-        window.location.hostname.match(
-          /^127(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3}$/,
-        ),
-    );
-    if (isLocalhost) {
-      opts.rootURL = location.protocol + "//" + location.host;
+
+    const modelEntry = inferenceModelsList[modelSelect.value];
+    const opts = { ...brainChopOpts };
+    opts.rootURL = window.location.origin;
+
+    selectedBackend = document.getElementById("backendSelect").value;
+    
+    const niftiImage = nv1.volumes[0].img;
+
+    switch (selectedBackend) {
+        case 'webgpu':
+            if (!isWebGpuAvailable) {
+                window.alert("WebGPU is not available on this browser/device.");
+                return;
+            }
+            if (!modelEntry.webgpu_safetensor) {
+                window.alert("The selected model does not have a WebGPU implementation.");
+                return;
+            }
+            runInferenceWebGpu(gpuDevice, opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+            break;
+        
+        case 'tfjs_worker':
+            if (typeof chopWorker !== "undefined") {
+              console.log("Worker is busy. Please wait.");
+              return;
+            }
+            
+            const plainNiftiHeader = {
+                dims: nv1.volumes[0].hdr.dims,
+                datatypeCode: nv1.volumes[0].hdr.datatypeCode,
+            };
+
+            chopWorker = new MyWorker({ type: "module" });
+            chopWorker.postMessage({ opts, modelEntry, niftiHeader: plainNiftiHeader, niftiImage });
+            chopWorker.onmessage = function (event) {
+              const { cmd, message, progressFrac, modalMessage, statData, img, opts, modelEntry } = event.data;
+              if (cmd === "ui") {
+                if (modalMessage) {
+                  chopWorker.terminate();
+                  chopWorker = undefined;
+                }
+                callbackUI(message, progressFrac, modalMessage, statData);
+              }
+              if (cmd === "img") {
+                chopWorker.terminate();
+                chopWorker = undefined;
+                callbackImg(img, opts, modelEntry);
+              }
+            };
+            break;
+
+        case 'tfjs_main':
+            runInferenceTfjsMain(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+            break;
     }
-    if (workerCheck.checked) {
-      if (typeof chopWorker !== "undefined") {
-        console.log(
-          "Unable to start new segmentation: previous call has not completed",
-        );
-        return;
-      }
-      chopWorker = await new MyWorker({ type: "module" });
-      const hdr = {
-        datatypeCode: nv1.volumes[0].hdr.datatypeCode,
-        dims: nv1.volumes[0].hdr.dims,
-      };
-      const msg = {
-        opts,
-        modelEntry: model,
-        niftiHeader: hdr,
-        niftiImage: nv1.volumes[0].img,
-      };
-      chopWorker.postMessage(msg);
-      chopWorker.onmessage = function (event) {
-        const cmd = event.data.cmd;
-        if (cmd === "ui") {
-          if (event.data.modalMessage !== "") {
-            chopWorker.terminate();
-            chopWorker = undefined;
-          }
-          callbackUI(
-            event.data.message,
-            event.data.progressFrac,
-            event.data.modalMessage,
-            event.data.statData,
-          );
-        }
-        if (cmd === "img") {
-          chopWorker.terminate();
-          chopWorker = undefined;
-          callbackImg(event.data.img, event.data.opts, event.data.modelEntry);
-        }
-      };
-    } else {
-      runInference(
-        opts,
-        model,
-        nv1.volumes[0].hdr,
-        nv1.volumes[0].img,
-        callbackImg,
-        callbackUI,
-      );
-    }
-  };
+  }
+
+  modelSelect.onchange = runSelectedInference;
+  backendSelect.onchange = runSelectedInference;
+
   saveImgBtn.onclick = function () {
-    nv1.volumes[1].saveToDisk("segmentaion.nii.gz");
+    if (nv1.volumes.length < 2) {
+      window.alert("No segmentation to save.");
+      return;
+    }
+    nv1.volumes[1].saveToDisk("segmentation.nii.gz");
   };
+
   saveSceneBtn.onclick = function () {
     nv1.saveDocument("brainchop.nvd");
   };
-  workerCheck.onchange = function () {
-    modelSelect.onchange();
-  };
+
   clipCheck.onchange = function () {
-    if (clipCheck.checked) {
-      nv1.setClipPlane([0, 0, 90]);
-    } else {
-      nv1.setClipPlane([2, 0, 90]);
-    }
+    nv1.setClipPlane(clipCheck.checked ? [0, 0, 90] : [2, 0, 90]);
   };
+
   function doLoadImage() {
     opacitySlider0.oninput();
   }
+
   async function fetchJSON(fnm) {
     const response = await fetch(fnm);
-    const js = await response.json();
-    return js;
+    return await response.json();
   }
+
   async function getUniqueValuesAndCounts(uint8Array) {
-    // Use a Map to count occurrences
     const countsMap = new Map();
-
-    for (let i = 0; i < uint8Array.length; i++) {
-      const value = uint8Array[i];
-      if (countsMap.has(value)) {
-        countsMap.set(value, countsMap.get(value) + 1);
-      } else {
-        countsMap.set(value, 1);
-      }
+    for (const value of uint8Array) {
+      countsMap.set(value, (countsMap.get(value) || 0) + 1);
     }
-
-    // Convert the Map to an array of objects
-    const result = Array.from(countsMap, ([value, count]) => ({
-      value,
-      count,
-    }));
-
-    return result;
+    return Array.from(countsMap, ([value, count]) => ({ value, count }));
   }
+
   async function createLabeledCounts(uniqueValuesAndCounts, labelStrings) {
-    if (uniqueValuesAndCounts.length !== labelStrings.length) {
-      missingLabelStatus = "Failed to Predict Labels - "
-      console.error(
-        "Mismatch in lengths: uniqueValuesAndCounts has",
-        uniqueValuesAndCounts.length,
-        "items, but labelStrings has",
-        labelStrings.length,
-        "items.",
-      );
+    if (!labelStrings || uniqueValuesAndCounts.length !== labelStrings.length) {
+      missingLabelStatus = "Failed to Predict Some Labels - ";
     }
-
     return labelStrings.map((label, index) => {
-      // Find the entry matching the current label index
       const entry = uniqueValuesAndCounts.find(item => item.value === index);
-
-      // If an entry is found, append the count value with 'mm3', otherwise show 'Missing'
       const countText = entry ? `${entry.count} mm3` : "Missing";
-
-      countText === "Missing"
-      ? missingLabelStatus += `${label}, ` : null;
-
+      if (countText === "Missing") missingLabelStatus += `${label}, `;
       return `${label}   ${countText}`;
     });
   }
+
   async function callbackImg(img, opts, modelEntry) {
-    closeAllOverlays();
+    await closeAllOverlays();
     const overlayVolume = await nv1.volumes[0].clone();
     overlayVolume.zeroImage();
-    overlayVolume.hdr.scl_inter = 0;
-    overlayVolume.hdr.scl_slope = 1;
-    overlayVolume.img = new Uint8Array(img);
-    const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
-    console.log(roiVolumes);
+    Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
+    overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
+    
     if (modelEntry.colormapPath) {
+      const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
       const cmap = await fetchJSON(modelEntry.colormapPath);
       const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"]);
-      console.log(newLabels);
-      overlayVolume.setColormapLabel({
-        R: cmap["R"],
-        G: cmap["G"],
-        B: cmap["B"],
-        labels: newLabels,
-      });
-      // n.b. most models create indexed labels, but those without colormap mask scalar input
+      overlayVolume.setColormapLabel({ R: cmap["R"], G: cmap["G"], B: cmap["B"], labels: newLabels });
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
     } else {
       let colormap = opts.atlasSelectedColorTable.toLowerCase();
-      const cmaps = nv1.colormaps();
-      if (!cmaps.includes(colormap)) {
-        colormap = "actc";
-      }
+      if (!nv1.colormaps().includes(colormap)) colormap = "actc";
       overlayVolume.colormap = colormap;
     }
     overlayVolume.opacity = opacitySlider1.value / 255;
     await nv1.addVolume(overlayVolume);
   }
+
   async function reportTelemetry(statData) {
-    if (typeof statData === "string" || statData instanceof String) {
-      function strToArray(str) {
-        const list = JSON.parse(str);
-        const array = [];
-        for (const key in list) {
-          array[key] = list[key];
+    if (typeof statData === "string") {
+        try {
+            statData = JSON.parse(statData);
+        } catch(e) {
+            console.error("Failed to parse telemetry data", e);
+            return;
         }
-        return array;
-      }
-      statData = strToArray(statData);
     }
     statData = await localSystemDetails(statData, nv1.gl);
-    diagnosticsString =
-      ":: Diagnostics can help resolve issues https://github.com/neuroneural/brainchop/issues ::\n";
+    diagnosticsString = ":: Diagnostics https://github.com/neuroneural/brainchop/issues ::\n";
     for (const key in statData) {
-      diagnosticsString += key + ": " + statData[key] + "\n";
+      diagnosticsString += `${key}: ${statData[key]}\n`;
     }
   }
-  function callbackUI(
-    message = "",
-    progressFrac = -1,
-    modalMessage = "",
-    statData = [],
-  ) {
-    if (message !== "") {
+
+  function callbackUI(message = "", progressFrac = -1, modalMessage = "", statData = []) {
+    if (message) {
       console.log(message);
       document.getElementById("location").innerHTML = message;
     }
     if (isNaN(progressFrac)) {
-      // memory issue
       memstatus.style.color = "red";
       memstatus.innerHTML = "Memory Issue";
     } else if (progressFrac >= 0) {
       modelProgress.value = progressFrac * modelProgress.max;
     }
-    if (modalMessage !== "") {
+    if (modalMessage) {
       window.alert(modalMessage);
     }
-    if (Object.keys(statData).length > 0) {
+    if (statData && Object.keys(statData).length > 0) {
       reportTelemetry(statData);
     }
   }
+
   function handleLocationChange(data) {
     document.getElementById("location").innerHTML = data.string
       .split("   ")
       .map((value) => `<p style="font-size: 14px;margin:0px;">${value}</p>`)
       .join("");
   }
+
   const defaults = {
     backColor: [0.4, 0.4, 0.4, 1],
     show3Dcrosshair: true,
     onLocationChange: handleLocationChange,
   };
-  let diagnosticsString = "";
-  let missingLabelStatus = ""
-  let chopWorker;
+  
   const nv1 = new Niivue(defaults);
-  nv1.attachToCanvas(gl1);
-  nv1.opts.dragMode = nv1.dragModes.pan;
-  nv1.opts.multiplanarForceRender = true;
-  nv1.opts.yoke3Dto2DZoom = true;
-  nv1.opts.crosshairGap = 11;
+  await nv1.attachTo("gl1");
+  Object.assign(nv1.opts, {
+    dragMode: nv1.dragModes.pan,
+    multiplanarForceRender: true,
+    yoke3Dto2DZoom: true,
+    crosshairGap: 11,
+  });
   nv1.setInterpolation(true);
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
+  
   for (let i = 0; i < inferenceModelsList.length; i++) {
     const option = document.createElement("option");
     option.text = inferenceModelsList[i].modelName;
-    option.value = inferenceModelsList[i].id.toString();
+    option.value = i;
     modelSelect.appendChild(option);
   }
   nv1.onImageLoaded = doLoadImage;
   modelSelect.selectedIndex = -1;
   drawDrop.selectedIndex = -1;
-  workerCheck.checked = await isChrome(); // TODO: Safari does not yet support WebGL TFJS webworkers, test FireFox
-  // uncomment next two lines to automatically run segmentation when web page is loaded
-  // modelSelect.selectedIndex = 11
-  // modelSelect.onchange()
-
-  // get the query string parameter model.
-  // if set, select the model from the dropdown list and call the modelSelect.onchange() function
+  
+  await initializeBackend();
+  
+  // --- FIX IS HERE ---
+  // Use URLSearchParams to correctly parse the query string.
   const urlParams = new URLSearchParams(window.location.search);
   const modelParam = urlParams.get("model");
-  if (modelParam) {
-    // make sure the model index is a number
-    modelSelect.selectedIndex = Number(modelParam);
-    modelSelect.onchange();
+  if (modelParam && modelParam < inferenceModelsList.length) {
+    modelSelect.value = modelParam;
+    runSelectedInference();
   }
 }
 
 async function updateStarCount() {
   try {
-    const response = await fetch(
-      `https://api.github.com/repos/neuroneural/brainchop`,
-    );
+    const response = await fetch("https://api.github.com/repos/neuroneural/brainchop");
     const data = await response.json();
     document.getElementById("star-count").textContent = data.stargazers_count;
   } catch (error) {
     console.error("Error fetching star count:", error);
   }
 }
+
 (async function () {
   await main();
-  updateStarCount();
+  await updateStarCount();
 })();
 

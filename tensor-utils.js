@@ -1,6 +1,51 @@
 import * as tf from '@tensorflow/tfjs'
 import { BWLabeler } from './bwlabels.js'
 
+export async function cropAndGetCorner(tensor3d, mask_3d, userPadding) {
+  // Find bounding box
+  const [row_min, row_max, col_min, col_max, depth_min, depth_max] = await firstLastNonZero3D(mask_3d);
+
+  // Calculate dimensions
+  const height = row_max - row_min + 1;
+  const width = col_max - col_min + 1;
+  const depth = depth_max - depth_min + 1;
+
+  // Adjust starting corner based on padding, ensuring we don't exceed 256 or go negative
+  const adjustCorner = (min, max, size, pad) => {
+    const startPad = Math.min(min, pad); // how much we can pad towards start
+    const endPad = Math.min(255 - max, pad); // how much we can pad towards end
+    const newStart = Math.max(0, min - startPad);
+    const newEnd = Math.min(255, max + endPad);
+    return [newStart, newEnd];
+  };
+
+  const [safeRowStart, safeRowEnd] = adjustCorner(row_min, row_max, height, userPadding);
+  const [safeColStart, safeColEnd] = adjustCorner(col_min, col_max, width, userPadding);
+  const [safeDepthStart, safeDepthEnd] = adjustCorner(depth_min, depth_max, depth, userPadding);
+
+  // Extract cropped brain with safe bounds
+  const cropped = tensor3d.slice(
+    [safeRowStart, safeColStart, safeDepthStart],
+    [safeRowEnd - safeRowStart + 1, safeColEnd - safeColStart + 1, safeDepthEnd - safeDepthStart + 1]
+  );
+
+  return { cropped, corner: [safeRowStart, safeColStart, safeDepthStart] };
+}
+
+
+export async function restoreTo256Cube(tensor3d, corner) {
+  const [row_min, col_min, depth_min] = corner;
+  const [height, width, depth] = tensor3d.shape;
+
+  const paddings = [
+    [row_min, Math.max(0, 256 - height - row_min)],
+    [col_min, Math.max(0, 256 - width - col_min)],
+    [depth_min, Math.max(0, 256 - depth - depth_min)]
+  ];
+
+  return tensor3d.pad(paddings);
+}
+
 export async function addZeroPaddingTo3dTensor(tensor3d, rowPadArr = [1, 1], colPadArr = [1, 1], depthPadArr = [1, 1]) {
   if (tensor3d.rank !== 3) {
     throw new Error('Tensor must be 3D');
@@ -706,7 +751,6 @@ export class SequentialConvLayer {
  */
 export async function processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts) {
   // --- Step 1: Single Data Transfer from GPU to CPU ---
-  // This is the only 'await' and the only interaction with the GPU.
     console.log('Downloading segmentation data from GPU to CPU...');
     const segmentationData = await outLabelVolume.data(); // This returns a TypedArray (e.g., Int32Array)
 
@@ -714,7 +758,6 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
   console.log('Data download complete. Starting CPU processing.');
 
   // --- Step 2: Apply Post-Processing (if enabled) ---
-  // This logic is now identical to your old, working function.
   if (opts.isPostProcessEnable) {
     console.log('Applying CPU-based connected-component labeling...');
     const bwStartTime = performance.now();
@@ -734,11 +777,10 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     }
 
     const bwTime = ((performance.now() - bwStartTime) / 1000).toFixed(4);
-    console.log(`Connected-component labeling took: ${bwTime} seconds.`); // <-- This will likely show ~5 seconds.
+    console.log(`Connected-component labeling took: ${bwTime} seconds.`); // <-- This will likely show ~0.5 seconds.
   }
 
   // --- Step 3: Apply Final Model Logic on the CPU ---
-  // This switch statement is adapted directly from your old function.
   switch (modelEntry.type) {
     case 'Brain_Masking': {
       const brainMask = new Uint8Array(segmentationData.length);

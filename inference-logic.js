@@ -6,6 +6,8 @@ import {
     gn_convByOutputChannelAndInputSlicing,
     LayerNormInPlace,
     firstLastNonZero3D,
+    cropAndGetCorner,
+    restoreTo256Cube,    
     isModelChnlLast,
     minMaxNormalizeVolumeData,
     quantileNormalizeVolumeData,
@@ -13,51 +15,6 @@ import {
     SequentialConvLayer
 } from './tensor-utils.js';
 
-
-async function cropAndGetCorner(tensor3d, mask_3d, userPadding) {
-  // Find bounding box
-  const [row_min, row_max, col_min, col_max, depth_min, depth_max] = await firstLastNonZero3D(mask_3d);
-
-  // Calculate dimensions
-  const height = row_max - row_min + 1;
-  const width = col_max - col_min + 1;
-  const depth = depth_max - depth_min + 1;
-
-  // Adjust starting corner based on padding, ensuring we don't exceed 256 or go negative
-  const adjustCorner = (min, max, size, pad) => {
-    const startPad = Math.min(min, pad); // how much we can pad towards start
-    const endPad = Math.min(255 - max, pad); // how much we can pad towards end
-    const newStart = Math.max(0, min - startPad);
-    const newEnd = Math.min(255, max + endPad);
-    return [newStart, newEnd];
-  };
-
-  const [safeRowStart, safeRowEnd] = adjustCorner(row_min, row_max, height, userPadding);
-  const [safeColStart, safeColEnd] = adjustCorner(col_min, col_max, width, userPadding);
-  const [safeDepthStart, safeDepthEnd] = adjustCorner(depth_min, depth_max, depth, userPadding);
-
-  // Extract cropped brain with safe bounds
-  const cropped = tensor3d.slice(
-    [safeRowStart, safeColStart, safeDepthStart],
-    [safeRowEnd - safeRowStart + 1, safeColEnd - safeColStart + 1, safeDepthEnd - safeDepthStart + 1]
-  );
-
-  return { cropped, corner: [safeRowStart, safeColStart, safeDepthStart] };
-}
-
-
-async function restoreTo256Cube(tensor3d, corner) {
-  const [row_min, col_min, depth_min] = corner;
-  const [height, width, depth] = tensor3d.shape;
-
-  const paddings = [
-    [row_min, Math.max(0, 256 - height - row_min)],
-    [col_min, Math.max(0, 256 - width - col_min)],
-    [depth_min, Math.max(0, 256 - depth - depth_min)]
-  ];
-
-  return tensor3d.pad(paddings);
-}
 
 export async function runFullVolumeInference(
   opts,

@@ -1,0 +1,201 @@
+import * as tf from '@tensorflow/tfjs';
+import {
+    quantileNormalizeVolumeData,
+    minMaxNormalizeVolumeData,
+    processSegmentationVolume
+} from './tensor-utils.js';
+
+// Use relative paths and eager loading for better error detection
+const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js', { eager: true });
+
+// Helper to get available runners for debugging
+function getAvailableRunners() {
+    return Object.keys(runnerModules).map(path => {
+        const match = path.match(/\/([^\/]+)_runner\.js$/);
+        return match ? match[1] : null;
+    }).filter(Boolean);
+}
+
+// Helper to find runner module with flexible matching
+function findRunnerModule(runnerName) {
+    // Try exact path first
+    const exactPath = `./webgpu_runners/${runnerName}_runner.js`;
+    if (runnerModules[exactPath]) {
+        return runnerModules[exactPath];
+    }
+    
+    // Try case-insensitive match
+    const lowerName = runnerName.toLowerCase();
+    for (const [path, module] of Object.entries(runnerModules)) {
+        if (path.toLowerCase().includes(`/${lowerName}_runner.js`)) {
+            return module;
+        }
+    }
+    
+    // Try partial match (in case runnerName doesn't include full name)
+    for (const [path, module] of Object.entries(runnerModules)) {
+        if (path.includes(runnerName)) {
+            return module;
+        }
+    }
+    
+    return null;
+}
+
+// Helper to safely setup the network
+async function setupNetwork(device, modelEntry, callbackUI) {
+    const runnerModule = findRunnerModule(modelEntry.webgpu_runner);
+    
+    if (!runnerModule) {
+        const available = getAvailableRunners();
+        throw new Error(
+            `Runner '${modelEntry.webgpu_runner}' not found. ` +
+            `Available runners: ${available.join(', ') || 'none'}. ` +
+            `Looking in: ./webgpu_runners/`
+        );
+    }
+    
+    // Validate the module has the expected export
+    if (!runnerModule.setupNet && !runnerModule.default?.setupNet) {
+        throw new Error(
+            `Runner module '${modelEntry.webgpu_runner}' doesn't export 'setupNet'. ` +
+            `Exported keys: ${Object.keys(runnerModule).join(', ')}`
+        );
+    }
+    
+    // Try to fetch the weights file with error handling
+    let weightsBuffer;
+    try {
+        const response = await fetch(modelEntry.webgpu_safetensor);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        weightsBuffer = await response.arrayBuffer();
+    } catch (error) {
+        throw new Error(
+            `Failed to load weights from '${modelEntry.webgpu_safetensor}': ${error.message}`
+        );
+    }
+    
+    // Get setupNet function (handle both named and default exports)
+    const setupNet = runnerModule.setupNet || runnerModule.default?.setupNet;
+    
+    // Setup the network with proper error context
+    try {
+        return await setupNet(device, new Uint8Array(weightsBuffer), callbackUI);
+    } catch (error) {
+        throw new Error(
+            `Failed to setup network for '${modelEntry.webgpu_runner}': ${error.message}`
+        );
+    }
+}
+
+export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
+    callbackUI('Starting WebGPU inference...', 0);
+    const inferenceStartTime = performance.now();
+    let outLabelVolume; // To hold the tensor for final disposal
+
+    try {
+        // Validate inputs
+        if (!device) {
+            throw new Error('WebGPU device is required but not provided');
+        }
+        
+        if (!modelEntry?.webgpu_runner) {
+            throw new Error('Model entry must specify webgpu_runner property');
+        }
+        
+        if (!modelEntry?.webgpu_safetensor) {
+            throw new Error('Model entry must specify webgpu_safetensor property');
+        }
+
+        // --- PRE-PROCESSING: FULL VOLUME ---
+        callbackUI('Preparing input data...', 0.1);
+        
+        let tensor = tf.tensor(niftiImage, [256, 256, 256], 'float32');
+        const normalized_tensor = modelEntry.enableQuantileNorm
+            ? await quantileNormalizeVolumeData(tensor)
+            : await minMaxNormalizeVolumeData(tensor);
+        tensor.dispose();
+        tensor = normalized_tensor;
+
+        if (modelEntry.enableTranspose) {
+            const transposed_tensor = tensor.transpose();
+            tensor.dispose();
+            tensor = transposed_tensor;
+        }
+        
+        const inputData = await tensor.data();
+        const finalShape = tensor.shape;
+        tensor.dispose();
+        callbackUI('Input data prepared (full volume).', 0.3);
+
+        // --- DYNAMIC RUNNER & INFERENCE ---
+        callbackUI('Loading model runner...', 0.4);
+        
+        const execute = await setupNetwork(device, modelEntry, callbackUI);
+        
+        if (typeof execute !== 'function') {
+            throw new Error(
+                `setupNet for '${modelEntry.webgpu_runner}' didn't return a function. ` +
+                `Returned type: ${typeof execute}`
+            );
+        }
+        
+        callbackUI('Running inference...', 0.5);
+        const inferenceResultArray = await execute(inputData);
+        
+        if (!inferenceResultArray || !Array.isArray(inferenceResultArray)) {
+            throw new Error(
+                `Inference didn't return expected array format. ` +
+                `Returned: ${typeof inferenceResultArray}`
+            );
+        }
+        
+        callbackUI(`WebGPU inference took ${((performance.now() - inferenceStartTime) / 1000).toFixed(2)}s.`, 0.9);
+
+        // --- POST-PROCESSING ---
+        console.log('Inference result shape:', inferenceResultArray[0]?.length);
+        
+        outLabelVolume = tf.tidy(() => {
+            let volume = tf.tensor(inferenceResultArray[0], finalShape, 'int32');
+            
+            if (modelEntry.enableTranspose) {
+                volume = volume.transpose();
+            }
+            
+            // Validation check
+            const sum = tf.sum(volume).dataSync()[0];
+            console.log('Segmentation volume sum:', sum);
+            
+            if (sum === 0) {
+                console.warn('Warning: Segmentation resulted in all zeros');
+            }
+            
+            return volume;
+        });
+
+        const finalImage = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+        
+        callbackImg(finalImage, opts, modelEntry);
+        callbackUI('Segmentation finished.', 1);
+
+    } catch (error) {
+        console.error("WebGPU Inference Error:", error);
+        
+        // Provide more specific error messages
+        let errorMessage = error.message;
+        if (error.message.includes('not found')) {
+            errorMessage += '. Check that the runner file exists and the name matches.';
+        } else if (error.message.includes('fetch')) {
+            errorMessage += '. Check network connection and file paths.';
+        }
+        
+        callbackUI('', -1, `WebGPU Error: ${errorMessage}`);
+    } finally {
+        // Clean up tensor
+        if (outLabelVolume) {
+            outLabelVolume.dispose();
+        }
+    }
+}

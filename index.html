@@ -28,6 +28,10 @@
     <label for="opacitySlider1">Overlay Opacity</label>
     <input type="range" min="0" max="255" value="128" class="slider" id="opacitySlider1" />
     &nbsp;
+    <label for="backendSelect">Backend:</label>
+    <select id="backendSelect">
+      <!-- Options will be populated by main.js -->
+    </select>
     <label for="modelSelect">Segmentation Model</label>
     <select id="modelSelect">
     </select>
@@ -35,9 +39,6 @@
     <button id="saveImgBtn">Save Segmentation</button>
     &nbsp;
     <button id="saveSceneBtn">Save Scene</button>
-    &nbsp;
-    <label for="workerCheck">Use Webworker</label>
-    <input type="checkbox" title="webworkers are faster but not supported by all browsers" id="workerCheck" checked />
     &nbsp;
     <label for="penDrop">Draw</label>
     <select id="penDrop">

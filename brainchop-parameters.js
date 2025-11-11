@@ -27,7 +27,8 @@ const inferenceModelsList = [
     type: 'Segmentation',
     path: '/models/model5_gw_ae/model.json',
     modelName: '\u26A1 Tissue GWM (light)',
-    colormapPath: './models/model5_gw_ae/colormap3.json',
+      colormapPath: './models/model5_gw_ae/colormap3.json',
+      webgpu_safetensor: './models/model5_gw_ae/model.safetensors',      webgpu_runner: 'model5', //'model5_gw_ae',
     preModelId: null, // Model run first e.g.  crop the brain   { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -98,7 +99,8 @@ const inferenceModelsList = [
     type: 'Atlas',
     path: '/models/model30chan18cls/model.json',
     modelName: '\u{1FA93} Subcortical + GWM (High Mem, Fast)',
-    colormapPath: './models/model30chan18cls/colormap.json',
+      colormapPath: './models/model30chan18cls/colormap.json',
+      webgpu_safetensor: './models/model30chan18cls/model.safetensors',      webgpu_runner: 'model30chan18cls',
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -379,18 +381,21 @@ const inferenceModelsList = [
   },
   {
     id: 16,
-    type: 'Brain_Extraction',
+    type: 'Brain_Masking',
     path: '/models/mindgrab/model.json',
-    modelName: '\u{1F9E0}\u{1FA93} omnimodal Skull Strip (High Mem, Fast)',
+      modelName: '\u{1F9E0}\u{1FA93} omnimodal Skull Strip (High Mem, Fast)',
+      webgpu_safetensor: './models/mindgrab/model.safetensors',
+      webgpu_runner: 'mindgrab',      
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
     numOverlapBatches: 0, // Number of extra overlap batches for inference
-    enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
+      enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
+      isPostProcessEnable: true, // If true 3D Connected Components filter will apply
     enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
     cropPadding: 20, // Padding size add to cropped brain
     autoThreshold: 0.5, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
-    enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
+    enableQuantileNorm: true, // Some models needs Quantile Normaliztion.
     filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
     enableSeqConv: false, // For low memory system and low configuration, enable sequential convolution instead of last layer
     textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
