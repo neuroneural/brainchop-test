@@ -23,7 +23,7 @@ function findRunnerModule(runnerName) {
     if (runnerModules[exactPath]) {
         return runnerModules[exactPath];
     }
-    
+
     // Try case-insensitive match
     const lowerName = runnerName.toLowerCase();
     for (const [path, module] of Object.entries(runnerModules)) {
@@ -31,21 +31,21 @@ function findRunnerModule(runnerName) {
             return module;
         }
     }
-    
+
     // Try partial match (in case runnerName doesn't include full name)
     for (const [path, module] of Object.entries(runnerModules)) {
         if (path.includes(runnerName)) {
             return module;
         }
     }
-    
+
     return null;
 }
 
 // Helper to safely setup the network
 async function setupNetwork(device, modelEntry, callbackUI) {
     const runnerModule = findRunnerModule(modelEntry.webgpu_runner);
-    
+
     if (!runnerModule) {
         const available = getAvailableRunners();
         throw new Error(
@@ -54,7 +54,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             `Looking in: ./webgpu_runners/`
         );
     }
-    
+
     // Validate the module has the expected export
     if (!runnerModule.setupNet && !runnerModule.default?.setupNet) {
         throw new Error(
@@ -62,7 +62,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             `Exported keys: ${Object.keys(runnerModule).join(', ')}`
         );
     }
-    
+
     // Try to fetch the weights file with error handling
     let weightsBuffer;
     try {
@@ -76,10 +76,10 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             `Failed to load weights from '${modelEntry.webgpu_safetensor}': ${error.message}`
         );
     }
-    
+
     // Get setupNet function (handle both named and default exports)
     const setupNet = runnerModule.setupNet || runnerModule.default?.setupNet;
-    
+
     // Setup the network with proper error context
     try {
         return await setupNet(device, new Uint8Array(weightsBuffer), callbackUI);
@@ -93,6 +93,11 @@ async function setupNetwork(device, modelEntry, callbackUI) {
 export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
     callbackUI('Starting WebGPU inference...', 0);
     const inferenceStartTime = performance.now();
+    const statData = {};
+    statData.startTime = Date.now();
+    statData.TF_Backend = 'webgpu';
+    statData.isModelFullVol = true;
+
     let outLabelVolume; // To hold the tensor for final disposal
 
     try {
@@ -100,18 +105,18 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         if (!device) {
             throw new Error('WebGPU device is required but not provided');
         }
-        
+
         if (!modelEntry?.webgpu_runner) {
             throw new Error('Model entry must specify webgpu_runner property');
         }
-        
+
         if (!modelEntry?.webgpu_safetensor) {
             throw new Error('Model entry must specify webgpu_safetensor property');
         }
 
         // --- PRE-PROCESSING: FULL VOLUME ---
         callbackUI('Preparing input data...', 0.1);
-        
+
         let tensor = tf.tensor(niftiImage, [256, 256, 256], 'float32');
         const normalized_tensor = modelEntry.enableQuantileNorm
             ? await quantileNormalizeVolumeData(tensor)
@@ -124,7 +129,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             tensor.dispose();
             tensor = transposed_tensor;
         }
-        
+
         const inputData = await tensor.data();
         const finalShape = tensor.shape;
         tensor.dispose();
@@ -132,57 +137,65 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         // --- DYNAMIC RUNNER & INFERENCE ---
         callbackUI('Loading model runner...', 0.4);
-        
+
         const execute = await setupNetwork(device, modelEntry, callbackUI);
-        
+
         if (typeof execute !== 'function') {
             throw new Error(
                 `setupNet for '${modelEntry.webgpu_runner}' didn't return a function. ` +
                 `Returned type: ${typeof execute}`
             );
         }
-        
+
         callbackUI('Running inference...', 0.5);
         const inferenceResultArray = await execute(inputData);
-        
+
         if (!inferenceResultArray || !Array.isArray(inferenceResultArray)) {
             throw new Error(
                 `Inference didn't return expected array format. ` +
                 `Returned: ${typeof inferenceResultArray}`
             );
         }
-        
-        callbackUI(`WebGPU inference took ${((performance.now() - inferenceStartTime) / 1000).toFixed(2)}s.`, 0.9);
+
+        const Inference_t = ((performance.now() - inferenceStartTime) / 1000).toFixed(4);
+        callbackUI(`WebGPU inference took ${Inference_t}s.`, 0.9);
 
         // --- POST-PROCESSING ---
         console.log('Inference result shape:', inferenceResultArray[0]?.length);
-        
+
         outLabelVolume = tf.tidy(() => {
             let volume = tf.tensor(inferenceResultArray[0], finalShape, 'int32');
-            
+
             if (modelEntry.enableTranspose) {
                 volume = volume.transpose();
             }
-            
+
             // Validation check
             const sum = tf.sum(volume).dataSync()[0];
             console.log('Segmentation volume sum:', sum);
-            
+
             if (sum === 0) {
                 console.warn('Warning: Segmentation resulted in all zeros');
             }
-            
+
             return volume;
         });
 
+        const postProcessStartTime = performance.now();
         const finalImage = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
-        
+        const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
+
         callbackImg(finalImage, opts, modelEntry);
-        callbackUI('Segmentation finished.', 1);
+
+        statData.Inference_t = Inference_t;
+        statData.Postprocess_t = Postprocess_t;
+        statData.Status = 'OK';
+
+        callbackUI(modelEntry.modelName + '<br>Segmentation finished.', 1, '', statData);
 
     } catch (error) {
         console.error("WebGPU Inference Error:", error);
-        
+
         // Provide more specific error messages
         let errorMessage = error.message;
         if (error.message.includes('not found')) {
@@ -190,8 +203,13 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         } else if (error.message.includes('fetch')) {
             errorMessage += '. Check network connection and file paths.';
         }
-        
-        callbackUI('', -1, `WebGPU Error: ${errorMessage}`);
+
+        statData.Inference_t = Infinity;
+        statData.Postprocess_t = Infinity;
+        statData.Status = 'Fail';
+        statData.Error_Type = errorMessage;
+
+        callbackUI('', -1, `WebGPU Error: ${errorMessage}`, statData);
     } finally {
         // Clean up tensor
         if (outLabelVolume) {

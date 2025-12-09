@@ -229,7 +229,7 @@ export async function runFullVolumeInference(
   statData.Inference_t = Inference_t;
   statData.Postprocess_t = Postprocess_t;
   statData.Status = 'OK';
-  callbackUI('Segmentation finished', 0);
+  callbackUI(modelEntry.modelName + '<br>Segmentation finished', 0);
   callbackUI('', -1, '', statData);
   callbackImg(outimg, opts, modelEntry);
 

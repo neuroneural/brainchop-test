@@ -151,6 +151,7 @@ async function main() {
   }
 
   async function runSelectedInference() {
+    if (modelSelect.value === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
 
     await closeAllOverlays();
@@ -328,6 +329,7 @@ async function main() {
 
   function doLoadImage() {
     opacitySlider0.oninput();
+    modelSelect.value = "-1";
   }
 
   async function fetchJSON(fnm) {
@@ -436,14 +438,31 @@ async function main() {
   nv1.setInterpolation(true);
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
 
+  // Add placeholder option
+  const placeholderOption = document.createElement("option");
+  placeholderOption.text = "Run Segmentation Model";
+  placeholderOption.value = "-1";
+  placeholderOption.disabled = true;
+  placeholderOption.selected = true;
+  placeholderOption.hidden = true;
+  modelSelect.appendChild(placeholderOption);
+
   for (let i = 0; i < inferenceModelsList.length; i++) {
     const option = document.createElement("option");
     option.text = inferenceModelsList[i].modelName;
     option.value = i;
+
+    if (inferenceModelsList[i].type === 'Divider') {
+      option.disabled = true;
+    }
+
     modelSelect.appendChild(option);
   }
   nv1.onImageLoaded = doLoadImage;
-  modelSelect.selectedIndex = -1;
+  // modelSelect.selectedIndex = -1; // Removed as we want the placeholder to be selected by default (which is index 0 or value "-1")
+  // Actually, we set selected=true on placeholder, so browser should pick it up.
+  // But let's be explicit.
+  modelSelect.value = "-1";
   drawDrop.selectedIndex = -1;
 
   await initializeBackend();
