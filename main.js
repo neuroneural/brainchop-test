@@ -159,7 +159,7 @@ async function main() {
 
     const modelEntry = inferenceModelsList[modelSelect.value];
     const opts = { ...brainChopOpts };
-    opts.rootURL = window.location.origin;
+    opts.rootURL = window.location.origin + import.meta.env.BASE_URL;
 
     const niftiImage = nv1.volumes[0].img;
 
