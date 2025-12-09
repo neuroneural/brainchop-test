@@ -1,18 +1,18 @@
 import * as tf from '@tensorflow/tfjs'
 
 import {
-    applyMriThreshold,
-    convByOutputChannelAndInputSlicing,
-    gn_convByOutputChannelAndInputSlicing,
-    LayerNormInPlace,
-    firstLastNonZero3D,
-    cropAndGetCorner,
-    restoreTo256Cube,    
-    isModelChnlLast,
-    minMaxNormalizeVolumeData,
-    quantileNormalizeVolumeData,
-    processSegmentationVolume,
-    SequentialConvLayer
+  applyMriThreshold,
+  convByOutputChannelAndInputSlicing,
+  gn_convByOutputChannelAndInputSlicing,
+  LayerNormInPlace,
+  firstLastNonZero3D,
+  cropAndGetCorner,
+  restoreTo256Cube,
+  isModelChnlLast,
+  minMaxNormalizeVolumeData,
+  quantileNormalizeVolumeData,
+  processSegmentationVolume,
+  SequentialConvLayer
 } from './tensor-utils.js';
 
 
@@ -72,15 +72,15 @@ export async function runFullVolumeInference(
   // Adjust model input shape (common logic)
   let adjusted_input_shape;
   if (isChannelLast) {
-      res.layers[0].batchInputShape[1] = cropped_slices_3d_w_pad.shape[0];
-      res.layers[0].batchInputShape[2] = cropped_slices_3d_w_pad.shape[1];
-      res.layers[0].batchInputShape[3] = cropped_slices_3d_w_pad.shape[2];
-      adjusted_input_shape = [opts.batchSize, res.layers[0].batchInputShape[1], res.layers[0].batchInputShape[2], res.layers[0].batchInputShape[3], opts.numOfChan];
+    res.layers[0].batchInputShape[1] = cropped_slices_3d_w_pad.shape[0];
+    res.layers[0].batchInputShape[2] = cropped_slices_3d_w_pad.shape[1];
+    res.layers[0].batchInputShape[3] = cropped_slices_3d_w_pad.shape[2];
+    adjusted_input_shape = [opts.batchSize, res.layers[0].batchInputShape[1], res.layers[0].batchInputShape[2], res.layers[0].batchInputShape[3], opts.numOfChan];
   } else {
-      res.layers[0].batchInputShape[2] = cropped_slices_3d_w_pad.shape[0];
-      res.layers[0].batchInputShape[3] = cropped_slices_3d_w_pad.shape[1];
-      res.layers[0].batchInputShape[4] = cropped_slices_3d_w_pad.shape[2];
-      adjusted_input_shape = [opts.batchSize, opts.numOfChan, res.layers[0].batchInputShape[2], res.layers[0].batchInputShape[3], res.layers[0].batchInputShape[4]];
+    res.layers[0].batchInputShape[2] = cropped_slices_3d_w_pad.shape[0];
+    res.layers[0].batchInputShape[3] = cropped_slices_3d_w_pad.shape[1];
+    res.layers[0].batchInputShape[4] = cropped_slices_3d_w_pad.shape[2];
+    adjusted_input_shape = [opts.batchSize, opts.numOfChan, res.layers[0].batchInputShape[2], res.layers[0].batchInputShape[3], res.layers[0].batchInputShape[4]];
   }
 
   let currentOutputTensor = cropped_slices_3d_w_pad.reshape(adjusted_input_shape);
@@ -91,11 +91,11 @@ export async function runFullVolumeInference(
 
   // GPU Sync Tuning (applies to both strategies)
   const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-    const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
-    let SYNC_GPU_EVERY_N_LAYERS = (isSafari || isFirefox) ? 10 : 15;
-    if (modelEntry.enableSeqConv) {
-        SYNC_GPU_EVERY_N_LAYERS = 1;
-    }
+  const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
+  let SYNC_GPU_EVERY_N_LAYERS = (isSafari || isFirefox) ? 10 : 15;
+  if (modelEntry.enableSeqConv) {
+    SYNC_GPU_EVERY_N_LAYERS = 1;
+  }
   console.log(`Syncing GPU every ${SYNC_GPU_EVERY_N_LAYERS} layers.`);
 
   // The loop termination condition depends on the strategy
@@ -104,22 +104,22 @@ export async function runFullVolumeInference(
   while (i <= loopEnd) {
     try {
       // --- STRATEGY SELECTION ---
-        let nextTensor;
-        if (modelEntry.enableSeqConv && res.layers[i].activation.getClassName() === 'linear') {
-            // The fix is to await the async function directly, without a tidy() wrapper.
-            const convFunction = res.layers[i].name.endsWith('_gn')
-                  ? gn_convByOutputChannelAndInputSlicing
-                  : convByOutputChannelAndInputSlicing;
+      let nextTensor;
+      if (modelEntry.enableSeqConv && res.layers[i].activation.getClassName() === 'linear') {
+        // The fix is to await the async function directly, without a tidy() wrapper.
+        const convFunction = res.layers[i].name.endsWith('_gn')
+          ? gn_convByOutputChannelAndInputSlicing
+          : convByOutputChannelAndInputSlicing;
 
-            nextTensor = await convFunction(
-                currentOutputTensor,
-                res.layers[i].getWeights()[0],
-                res.layers[i].getWeights()[1],
-                res.layers[i].strides,
-                res.layers[i].padding,
-                res.layers[i].dilationRate,
-                3
-            );
+        nextTensor = await convFunction(
+          currentOutputTensor,
+          res.layers[i].getWeights()[0],
+          res.layers[i].getWeights()[1],
+          res.layers[i].strides,
+          res.layers[i].padding,
+          res.layers[i].dilationRate,
+          3
+        );
 
       } else {
         // STRATEGY 1: Standard Layer Apply
@@ -138,23 +138,23 @@ export async function runFullVolumeInference(
 
     } catch (err) {
       // Universal error handling
-        callbackUI(err.message, -1, err.message);
-        tf.engine().endScope()
-        tf.engine().disposeVariables()
+      callbackUI(err.message, -1, err.message);
+      tf.engine().endScope()
+      tf.engine().disposeVariables()
 
-        statData.Inference_t = Infinity
-        statData.Postprocess_t = Infinity
-        statData.Status = 'Fail'
-        statData.Error_Type = err.message
-        statData.Extra_Err_Info = 'Failed while model layer ' + i + ' apply'
+      statData.Inference_t = Infinity
+      statData.Postprocess_t = Infinity
+      statData.Status = 'Fail'
+      statData.Error_Type = err.message
+      statData.Extra_Err_Info = 'Failed while model layer ' + i + ' apply'
 
-        callbackUI('', -1, '', statData)
-        return 0;
+      callbackUI('', -1, '', statData)
+      return 0;
     }
 
     // Universal GPU Sync and UI Callback
-      if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
-          console.log(`Layer ${i}... (Syncing GPU)`);
+    if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
+      console.log(`Layer ${i}... (Syncing GPU)`);
       callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
       const firstElement = currentOutputTensor.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]);
       await firstElement.data();
@@ -174,7 +174,9 @@ export async function runFullVolumeInference(
     // --- FINAL PROCESSING FOR SEQCONV ---
     console.log('Applying final SequentialConvLayer...');
     const seqConvLayer = new SequentialConvLayer(res, 10, isChannelLast, callbackUI);
-    outLabelVolume = await seqConvLayer.apply(currentOutputTensor);
+    const seqConvResult = await seqConvLayer.apply(currentOutputTensor);
+    outLabelVolume = seqConvResult.asType('int32');
+    seqConvResult.dispose();
     currentOutputTensor.dispose(); // Dispose the input to the final layer
     console.log('SequentialConvLayer output shape:', outLabelVolume.shape);
 
@@ -182,9 +184,9 @@ export async function runFullVolumeInference(
     // --- FINAL PROCESSING FOR STANDARD METHOD ---
     console.log('Applying final ArgMax...');
     outLabelVolume = tf.tidy(() => {
-        const axis = isChannelLast ? -1 : 1;
-        const prediction_argmax = tf.argMax(currentOutputTensor, axis);
-        return tf.squeeze(prediction_argmax);
+      const axis = isChannelLast ? -1 : 1;
+      const prediction_argmax = tf.argMax(currentOutputTensor, axis);
+      return tf.squeeze(prediction_argmax);
     });
     currentOutputTensor.dispose(); // The tidy already disposed the original, but this is safe
     console.log('ArgMax output shape:', outLabelVolume.shape);
@@ -201,7 +203,7 @@ export async function runFullVolumeInference(
     outLabelVolume = outLabelVolume.transpose();
   }
 
-    //Restore to original volume size
+  //Restore to original volume size
   const PaddingStartTime = performance.now();
   console.log('outLabelVolume without padding shape: ', outLabelVolume.shape);
   outLabelVolume = await restoreTo256Cube(outLabelVolume, refVoxel);

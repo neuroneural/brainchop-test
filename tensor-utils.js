@@ -226,7 +226,7 @@ function instanceNorm(x, epsilon = 1e-5) {
 
 export async function gn_convByOutputChannelAndInputSlicing(input, filter, biases, stride, pad, dilationRate, sliceSize) {
 
-//    const finalResult = tf.tidy(() => {
+  //    const finalResult = tf.tidy(() => {
   const inChannels = input.shape[4];
   const outChannels = filter.shape[4];
 
@@ -267,7 +267,7 @@ export async function gn_convByOutputChannelAndInputSlicing(input, filter, biase
     }
 
     // --- KEY CHANGE ---
-      // Apply instance normalization to the resulting channel.
+    // Apply instance normalization to the resulting channel.
     // Apply normalization
     const normalizedChannel = instanceNorm(biasedOutputChannel);
     biasedOutputChannel.dispose();
@@ -284,7 +284,7 @@ export async function gn_convByOutputChannelAndInputSlicing(input, filter, biase
   }
 
   return outputChannels;
-    }// );
+}// );
 //     return finalResult;
 // }
 
@@ -751,8 +751,8 @@ export class SequentialConvLayer {
  */
 export async function processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts) {
   // --- Step 1: Single Data Transfer from GPU to CPU ---
-    console.log('Downloading segmentation data from GPU to CPU...');
-    const segmentationData = await outLabelVolume.data(); // This returns a TypedArray (e.g., Int32Array)
+  console.log('Downloading segmentation data from GPU to CPU...');
+  const segmentationData = await outLabelVolume.data(); // This returns a TypedArray (e.g., Int32Array)
 
   const Vshape = outLabelVolume.shape;
   console.log('Data download complete. Starting CPU processing.');
@@ -800,6 +800,128 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     default: {
       // For other cases, return the (potentially modified) segmentation data.
       return new Uint8Array(segmentationData);
+    }
+  }
+}
+
+/**
+ * Estimates the maximum number of elements in any intermediate tensor of the model.
+ * @param {tf.LayersModel} model The TensorFlow.js model.
+ * @param {number[]} inputShape The shape of the input tensor (including batch size).
+ * @returns {number} The maximum number of elements.
+ */
+export function estimateMaxIntermediateTensorSize(model, inputShape) {
+  let maxElements = 0;
+
+  // Calculate spatial volume from input (assuming [Batch, D, H, W] or [Batch, D, H, W, C])
+  // We assume the input spatial dimensions are the upper bound for the model (U-Net).
+  // inputShape from worker is [1, D, H, W] (from slices_3d).
+  // We want D*H*W.
+  let spatialVol = 1;
+  for (let i = 0; i < inputShape.length; i++) {
+    if (inputShape[i] > 1) spatialVol *= inputShape[i];
+  }
+
+  // Iterate through layers to find the largest output tensor
+  if (model && model.layers) {
+    for (const layer of model.layers) {
+      // layer.outputShape is usually [null, d, h, w, c]
+      let shape = layer.outputShape;
+
+      // Handle array of shapes (though unlikely for simple layers)
+      if (Array.isArray(shape) && Array.isArray(shape[0])) {
+        shape = shape[0];
+      }
+
+      if (Array.isArray(shape)) {
+        // Get channels (last dim)
+        const channels = shape[shape.length - 1];
+
+        if (typeof channels === 'number') {
+          // Estimate size: SpatialVolume * Channels
+          // This assumes spatial dims are preserved (padding='same').
+          // Even if downsampled, this is a safe upper bound.
+          const size = spatialVol * channels;
+          if (size > maxElements) {
+            maxElements = size;
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback if model traversal failed
+  if (maxElements === 0) {
+    maxElements = spatialVol * 32; // Default heuristic
+  }
+
+  return maxElements;
+}
+
+/**
+ * Proactively checks if a tensor of the specified size can be allocated on the GPU.
+ * @param {number} numElements Number of elements to allocate.
+ * @returns {boolean} True if allocation succeeded, false otherwise.
+ */
+export function checkMemoryAllocation(numElements) {
+  // 1. Check Texture Size Limits (Heuristic for WebGL)
+  try {
+    const backend = tf.backend();
+    if (backend && backend.gpgpu && backend.gpgpu.gl) {
+      const maxTextureSize = backend.gpgpu.gl.getParameter(backend.gpgpu.gl.MAX_TEXTURE_SIZE);
+
+      // TFJS WebGL backend typically packs 4 float32 elements into one RGBA pixel (if WEBGL_PACK is true).
+      // We check the flag to be precise.
+      const isPacked = tf.env().getBool('WEBGL_PACK');
+      const elementsPerPixel = isPacked ? 4 : 1;
+
+      // Calculate needed pixels
+      const neededPixels = Math.ceil(numElements / elementsPerPixel);
+
+      // In the worst case (unpacked or simple packing), needed dimension is sqrt(neededPixels).
+      const neededDim = Math.ceil(Math.sqrt(neededPixels));
+
+      if (neededDim > maxTextureSize) {
+        console.warn(`Proactive check: Tensor size ${numElements} (packed: ${isPacked}) requires approx ${neededDim}x${neededDim} texture. Exceeds MAX_TEXTURE_SIZE ${maxTextureSize}`);
+        return false;
+      }
+    }
+  } catch (e) {
+    console.warn("Could not check texture size limits:", e);
+  }
+
+  // 2. Check Total Memory (Chunked Allocation)
+  const tensors = [];
+  try {
+    // Allocate in chunks to avoid CPU OOM (RangeError) for large contiguous arrays.
+    // 10 million elements * 4 bytes = ~40MB per chunk. Safe for CPU.
+    const CHUNK_SIZE = 10 * 1000 * 1000;
+    let allocated = 0;
+
+    while (allocated < numElements) {
+      const size = Math.min(CHUNK_SIZE, numElements - allocated);
+
+      // tf.zeros is safer than randomUniform for CPU allocation overhead in some TFJS versions
+      const t = tf.zeros([size]);
+
+      // Force GPU allocation by running a lightweight op
+      // We keep the result to prevent GC/cleanup, ensuring we test total capacity
+      const t_gpu = t.add(0);
+      tensors.push(t_gpu);
+
+      // Dispose the initial CPU-backed tensor immediately
+      t.dispose();
+
+      allocated += size;
+    }
+    return true;
+  } catch (e) {
+    console.warn("Proactive memory check failed:", e);
+    return false;
+  } finally {
+    // Clean up everything
+    for (const t of tensors) {
+      t.dispose();
     }
   }
 }

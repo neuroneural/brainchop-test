@@ -6,7 +6,7 @@ import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
 
 // --- Backend State ---
-let selectedBackend = "tfjs_worker"; // Default backend
+// --- Backend State ---
 let gpuDevice = null;
 let isWebGpuAvailable = false;
 
@@ -14,40 +14,33 @@ let isWebGpuAvailable = false;
  * Detects WebGPU support, initializes the device, and populates the backend UI selector.
  */
 // In main.js
+/**
+ * Detects WebGPU support and initializes the device.
+ */
 async function initializeBackend() {
-  const backendSelect = document.getElementById("backendSelect");
-  let options = '<option value="tfjs_worker">WebGL Worker (tf.js)</option><option value="tfjs_main">WebGL Main (tf.js)</option>';
-
   if ('gpu' in navigator) {
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (adapter) {
-          // --- FIX IS HERE: Request BOTH maxBufferSize and maxStorageBufferBindingSize ---
-          const requiredLimits = {
-            maxBufferSize: adapter.limits.maxBufferSize,
-            maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
-          };
-          const requiredFeatures = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
-          
-          gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
-          
-          isWebGpuAvailable = true;
-          const f16Status = requiredFeatures.length > 0 ? " (f16)" : "";
-          // Prepend WebGPU option if available
-          options = `<option value="webgpu">WebGPU${f16Status}</option>` + options;
-          selectedBackend = "webgpu"; // Set WebGPU as default
-          console.log(`WebGPU is available. F16 support: ${f16Status !== ""}`);
+        const requiredLimits = {
+          maxBufferSize: adapter.limits.maxBufferSize,
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
+        };
+        const requiredFeatures = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
+
+        gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+
+        isWebGpuAvailable = true;
+        const f16Status = requiredFeatures.length > 0 ? " (f16)" : "";
+        console.log(`WebGPU is available. F16 support: ${f16Status !== ""}`);
       }
-    } catch(e) {
+    } catch (e) {
       console.error("WebGPU initialization failed.", e);
     }
   }
-  
-  backendSelect.innerHTML = options;
+
   if (!isWebGpuAvailable) {
-      console.log("WebGPU not available, falling back to WebGL.");
-      backendSelect.value = "tfjs_worker"; // Ensure a fallback is selected
-      selectedBackend = "tfjs_worker";
+    console.log("WebGPU not available, falling back to WebGL.");
   }
 }
 
@@ -55,7 +48,7 @@ async function main() {
   let diagnosticsString = "";
   let missingLabelStatus = "";
   let chopWorker;
-  
+
   dragMode.onchange = async function () {
     nv1.opts.dragMode = this.selectedIndex;
   };
@@ -137,7 +130,7 @@ async function main() {
     const nii = nv1.volumes[0];
     let isConformed =
       nii.dims[1] === 256 && nii.dims[2] === 256 && nii.dims[3] === 256
-        && nii.img instanceof Uint8Array && nii.img.length === 256 * 256 * 256;
+      && nii.img instanceof Uint8Array && nii.img.length === 256 * 256 * 256;
     if (
       nii.permRAS[0] !== -1 ||
       nii.permRAS[1] !== 3 ||
@@ -156,10 +149,10 @@ async function main() {
       await nv1.removeVolume(nv1.volumes[1]);
     }
   }
-  
+
   async function runSelectedInference() {
     if (modelSelect.selectedIndex < 0) return;
-    
+
     await closeAllOverlays();
     await ensureConformed();
 
@@ -167,61 +160,155 @@ async function main() {
     const opts = { ...brainChopOpts };
     opts.rootURL = window.location.origin;
 
-    selectedBackend = document.getElementById("backendSelect").value;
-    
     const niftiImage = nv1.volumes[0].img;
 
-    switch (selectedBackend) {
-        case 'webgpu':
-            if (!isWebGpuAvailable) {
-                window.alert("WebGPU is not available on this browser/device.");
-                return;
-            }
-            if (!modelEntry.webgpu_safetensor) {
-                window.alert("The selected model does not have a WebGPU implementation.");
-                return;
-            }
-            runInferenceWebGpu(gpuDevice, opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
-            break;
-        
-        case 'tfjs_worker':
-            if (typeof chopWorker !== "undefined") {
-              console.log("Worker is busy. Please wait.");
-              return;
-            }
-            
-            const plainNiftiHeader = {
-                dims: nv1.volumes[0].hdr.dims,
-                datatypeCode: nv1.volumes[0].hdr.datatypeCode,
-            };
+    // 1. Try WebGPU
+    if (isWebGpuAvailable && modelEntry.webgpu_safetensor) {
+      console.log("Attempting WebGPU backend...");
+      try {
+        runInferenceWebGpu(gpuDevice, opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+        return; // Success
+      } catch (e) {
+        console.error("WebGPU inference failed, falling back to WebWorker.", e);
+      }
+    }
 
-            chopWorker = new MyWorker({ type: "module" });
-            chopWorker.postMessage({ opts, modelEntry, niftiHeader: plainNiftiHeader, niftiImage });
-            chopWorker.onmessage = function (event) {
-              const { cmd, message, progressFrac, modalMessage, statData, img, opts, modelEntry } = event.data;
-              if (cmd === "ui") {
-                if (modalMessage) {
-                  chopWorker.terminate();
-                  chopWorker = undefined;
-                }
-                callbackUI(message, progressFrac, modalMessage, statData);
-              }
-              if (cmd === "img") {
-                chopWorker.terminate();
-                chopWorker = undefined;
-                callbackImg(img, opts, modelEntry);
-              }
-            };
-            break;
+    // 2. Try WebWorker (WebGL)
+    console.log("Attempting WebWorker backend...");
+    if (typeof chopWorker !== "undefined") {
+      console.log("Worker is busy. Please wait.");
+      return;
+    }
 
-        case 'tfjs_main':
-            runInferenceTfjsMain(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
-            break;
+    const plainNiftiHeader = {
+      dims: nv1.volumes[0].hdr.dims,
+      datatypeCode: nv1.volumes[0].hdr.datatypeCode,
+    };
+
+    const runWorker = (useSeqConv) => {
+      return new Promise((resolve, reject) => {
+        const currentOpts = { ...opts, enableSeqConv: useSeqConv };
+        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv };
+
+        chopWorker = new MyWorker({ type: "module" });
+        chopWorker.postMessage({ opts: currentOpts, modelEntry: currentModelEntry, niftiHeader: plainNiftiHeader, niftiImage });
+
+        chopWorker.onmessage = function (event) {
+          const { cmd, message, progressFrac, modalMessage, statData, img, opts, modelEntry } = event.data;
+          if (cmd === "ui") {
+            if (modalMessage) {
+              chopWorker.terminate();
+              chopWorker = undefined;
+              // Check for failure status or error message
+              if (statData && statData.Status === 'Fail') {
+                reject(new Error(statData.Error_Type || modalMessage));
+                return;
+              }
+              // Some errors might be passed as modalMessage without statData
+              if (typeof modalMessage === 'string' && (modalMessage.toLowerCase().includes('fail') || modalMessage.toLowerCase().includes('error') || modalMessage.toLowerCase().includes('compatible') || modalMessage.toLowerCase().includes('texture') || modalMessage.toLowerCase().includes('maximum'))) {
+                reject(new Error(modalMessage));
+                return;
+              }
+            }
+            callbackUI(message, progressFrac, modalMessage, statData);
+          }
+          if (cmd === "img") {
+            chopWorker.terminate();
+            chopWorker = undefined;
+            callbackImg(img, opts, modelEntry);
+            resolve();
+          }
+        };
+        chopWorker.onerror = function (e) {
+          console.error("WebWorker failed", e);
+          chopWorker.terminate();
+          chopWorker = undefined;
+          reject(e);
+        };
+      });
+    };
+
+    try {
+      console.log("Attempting WebWorker with enableSeqConv: false");
+      await runWorker(false);
+      return;
+    } catch (e) {
+      console.warn("WebWorker (fast) failed, retrying with enableSeqConv: true", e);
+
+      // Explicitly terminate worker if it's still around
+      if (typeof chopWorker !== "undefined") {
+        chopWorker.terminate();
+        chopWorker = undefined;
+      }
+
+      // Delay to allow WebGL context cleanup
+      console.log("Waiting 1000ms for WebGL context cleanup...");
+      await new Promise(r => setTimeout(r, 1000));
+
+      try {
+        console.log("Attempting WebWorker with enableSeqConv: true");
+        await runWorker(true); // Retry with seqConv
+        return;
+      } catch (e2) {
+        console.error("WebWorker (slow) failed, falling back to Main Thread.", e2);
+      }
+    }
+
+    // 3. Fallback to Main Thread
+    console.log("Attempting Main Thread backend...");
+
+    const runMainThread = (useSeqConv) => {
+      return new Promise((resolve, reject) => {
+        const currentOpts = { ...opts, enableSeqConv: useSeqConv };
+        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv };
+
+        // Proxy callbackUI to intercept errors
+        const proxyCallbackUI = (message, progressFrac, modalMessage, statData) => {
+          if (statData && statData.Status === 'Fail') {
+            reject(new Error(statData.Error_Type || modalMessage || "Inference Failed"));
+            // We still call original callback to show error to user? 
+            // Actually if we are falling back, we might NOT want to show the error yet?
+            // But the existing code shows it. Let's let it show for now, or maybe suppress if we are going to retry.
+            // For now, let's just reject.
+          } else if (modalMessage && typeof modalMessage === 'string' && (modalMessage.toLowerCase().includes('fail') || modalMessage.toLowerCase().includes('error') || modalMessage.toLowerCase().includes('compatible') || modalMessage.toLowerCase().includes('texture') || modalMessage.toLowerCase().includes('maximum'))) {
+            reject(new Error(modalMessage));
+          }
+
+          // If we are rejecting, we might want to prevent the UI from showing the error if we are going to retry.
+          // But modifying callbackUI logic deeply is risky. 
+          // Let's just pass it through. The user might see "Error" then "Retrying..."
+          callbackUI(message, progressFrac, modalMessage, statData);
+        };
+
+        // Proxy callbackImg to resolve
+        const proxyCallbackImg = (img, opts, modelEntry) => {
+          callbackImg(img, opts, modelEntry);
+          resolve();
+        };
+
+        runInferenceTfjsMain(currentOpts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, proxyCallbackImg, proxyCallbackUI)
+          .catch(e => reject(e));
+      });
+    };
+
+    try {
+      console.log("Attempting Main Thread with enableSeqConv: false");
+      await runMainThread(false);
+    } catch (e) {
+      console.warn("Main Thread (fast) failed, retrying with enableSeqConv: true", e);
+      await new Promise(r => setTimeout(r, 100)); // Small delay
+      try {
+        console.log("Attempting Main Thread with enableSeqConv: true");
+        await runMainThread(true);
+      } catch (e2) {
+        console.error("Main Thread (slow) failed.", e2);
+        window.alert("Inference failed on all backends.");
+      }
     }
   }
 
   modelSelect.onchange = runSelectedInference;
-  backendSelect.onchange = runSelectedInference;
+  // backendSelect.onchange = runSelectedInference; // Removed
 
   saveImgBtn.onclick = function () {
     if (nv1.volumes.length < 2) {
@@ -274,7 +361,7 @@ async function main() {
     overlayVolume.zeroImage();
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
     overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
-    
+
     if (modelEntry.colormapPath) {
       const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
       const cmap = await fetchJSON(modelEntry.colormapPath);
@@ -292,12 +379,12 @@ async function main() {
 
   async function reportTelemetry(statData) {
     if (typeof statData === "string") {
-        try {
-            statData = JSON.parse(statData);
-        } catch(e) {
-            console.error("Failed to parse telemetry data", e);
-            return;
-        }
+      try {
+        statData = JSON.parse(statData);
+      } catch (e) {
+        console.error("Failed to parse telemetry data", e);
+        return;
+      }
     }
     statData = await localSystemDetails(statData, nv1.gl);
     diagnosticsString = ":: Diagnostics https://github.com/neuroneural/brainchop/issues ::\n";
@@ -337,7 +424,7 @@ async function main() {
     show3Dcrosshair: true,
     onLocationChange: handleLocationChange,
   };
-  
+
   const nv1 = new Niivue(defaults);
   await nv1.attachTo("gl1");
   Object.assign(nv1.opts, {
@@ -348,7 +435,7 @@ async function main() {
   });
   nv1.setInterpolation(true);
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
-  
+
   for (let i = 0; i < inferenceModelsList.length; i++) {
     const option = document.createElement("option");
     option.text = inferenceModelsList[i].modelName;
@@ -358,9 +445,9 @@ async function main() {
   nv1.onImageLoaded = doLoadImage;
   modelSelect.selectedIndex = -1;
   drawDrop.selectedIndex = -1;
-  
+
   await initializeBackend();
-  
+
   // --- FIX IS HERE ---
   // Use URLSearchParams to correctly parse the query string.
   const urlParams = new URLSearchParams(window.location.search);
@@ -385,4 +472,3 @@ async function updateStarCount() {
   await main();
   await updateStarCount();
 })();
-

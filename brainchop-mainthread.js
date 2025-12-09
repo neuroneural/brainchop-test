@@ -3,14 +3,16 @@ import { inferenceModelsList } from './brainchop-parameters.js'
 import { runFullVolumeInference } from './inference-logic.js'
 
 import {
-    generateBrainMask,
-    getAllSlicesDataAsTF3D,
-    getModelNumLayers,
-    getModelNumParameters,
-    isModelChnlLast,
-    load_model,
-    minMaxNormalizeVolumeData,
-    quantileNormalizeVolumeData,
+  generateBrainMask,
+  getAllSlicesDataAsTF3D,
+  getModelNumLayers,
+  getModelNumParameters,
+  isModelChnlLast,
+  load_model,
+  minMaxNormalizeVolumeData,
+  quantileNormalizeVolumeData,
+  checkMemoryAllocation,
+  estimateMaxIntermediateTensorSize
 } from './tensor-utils.js';
 
 
@@ -325,17 +327,30 @@ async function inferenceFullVolumePhase1(
             // --slices_3d_mask.dispose()
 
             if (isModelFullVol) {
-                runFullVolumeInference(
-                    opts,
-                    modelEntry,
-                    model,
-                    slices_3d,
-                    slices_3d_mask,
-                    statData,
-                    callbackImg,
-                    callbackUI,
-                    niftiImage
-                );
+              // Proactive Memory Check
+              if (!modelEntry.enableSeqConv) {
+                const inputShape = [1, ...slices_3d.shape];
+                const estimatedSize = estimateMaxIntermediateTensorSize(model, inputShape);
+                console.log(`Proactive Memory Check (Phase 1): Estimated Max Tensor Size: ${estimatedSize} elements`);
+
+                if (!checkMemoryAllocation(estimatedSize)) {
+                  console.warn("Proactive memory check failed. Switching to enableSeqConv: true");
+                  modelEntry.enableSeqConv = true;
+                }
+              }
+
+              await runFullVolumeInference(
+                opts,
+                modelEntry,
+                model,
+                slices_3d,
+                slices_3d_mask,
+                statData,
+                callbackImg,
+                callbackUI,
+                niftiImage
+              );
+              return 0;
             } else {
               // -- In version 3.0.0 this function not used
               window.alert('inferenceSubVolumes() is not dead code?')
@@ -348,7 +363,7 @@ async function inferenceFullVolumePhase1(
       callbackUI(err.message, -1, err.message)
       console.log(
         'If webgl context is lost, try to restore webgl context by visit the link ' +
-          '<a href="https://support.biodigital.com/hc/en-us/articles/218322977-How-to-turn-on-WebGL-in-my-browser">here</a>'
+        '<a href="https://support.biodigital.com/hc/en-us/articles/218322977-How-to-turn-on-WebGL-in-my-browser">here</a>'
       )
 
       // document.getElementById("webGl2Status").style.backgroundColor =  isWebGL2ContextLost() ? "Red" : "Green"
@@ -367,17 +382,17 @@ async function inferenceFullVolumePhase1(
     // -- mask_3d = slices_3d.greater([0]).asType('bool')
 
     if (isModelFullVol) {
-        runFullVolumeInference(
-            opts,
-            modelEntry,
-            model,
-            slices_3d,
-            null,
-            statData,
-            callbackImg,
-            callbackUI,
-            niftiImage
-        );
+      runFullVolumeInference(
+        opts,
+        modelEntry,
+        model,
+        slices_3d,
+        null,
+        statData,
+        callbackImg,
+        callbackUI,
+        niftiImage
+      );
     } else {
       // -- In version 3.0.0 this function not used
       window.alert('inferenceSubVolumes() is not dead code?')
@@ -516,14 +531,48 @@ export async function runInference(opts, modelEntry, niftiHeader, niftiImage, ca
         console.log('Transpose NOT Enabled')
       }
 
-      const enableSeqConv = modelEntry.enableSeqConv
+      let enableSeqConv = modelEntry.enableSeqConv
+
+      if (!enableSeqConv) {
+        // Proactive Memory Check
+        const inputShape = [1, ...slices_3d.shape];
+        const estimatedSize = estimateMaxIntermediateTensorSize(model, inputShape);
+
+        console.log(`Proactive Memory Check: Estimated Max Tensor Size: ${estimatedSize} elements`);
+
+        if (!checkMemoryAllocation(estimatedSize)) {
+          console.warn("Proactive memory check failed. Switching to enableSeqConv: true");
+          enableSeqConv = true;
+          modelEntry.enableSeqConv = true;
+        }
+      }
 
       if (enableSeqConv) {
         console.log('Seq Convoluton Enabled')
-        window.alert('inferenceFullVolumeSeqCovLayer() is not dead code?')
+        runFullVolumeInference(
+          opts,
+          modelEntry,
+          model,
+          slices_3d,
+          null,
+          statData,
+          callbackImg,
+          callbackUI,
+          niftiImage
+        );
       } else {
         console.log('Seq Convoluton Disabled')
-        window.alert('inferenceFullVolume() is not dead code?')
+        runFullVolumeInference(
+          opts,
+          modelEntry,
+          model,
+          slices_3d,
+          null,
+          statData,
+          callbackImg,
+          callbackUI,
+          niftiImage
+        );
       }
     }
   }
