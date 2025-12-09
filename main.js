@@ -167,7 +167,7 @@ async function main() {
     if (isWebGpuAvailable && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
       try {
-        runInferenceWebGpu(gpuDevice, opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+        await runInferenceWebGpu(gpuDevice, opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
         return; // Success
       } catch (e) {
         console.error("WebGPU inference failed, falling back to WebWorker.", e);

@@ -175,7 +175,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             console.log('Segmentation volume sum:', sum);
 
             if (sum === 0) {
-                console.warn('Warning: Segmentation resulted in all zeros');
+                throw new Error("Segmentation resulted in all zeros (empty volume).");
             }
 
             return volume;
@@ -210,6 +210,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         statData.Error_Type = errorMessage;
 
         callbackUI('', -1, `WebGPU Error: ${errorMessage}`, statData);
+        throw error; // Re-throw to trigger fallback in main.js
     } finally {
         // Clean up tensor
         if (outLabelVolume) {
