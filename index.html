@@ -4,17 +4,20 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  
+
   <!-- DNS prefetch for external resources -->
   <link rel="dns-prefetch" href="//cdnjs.cloudflare.com" />
-  
+
   <!-- Preconnect to external domains -->
   <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin />
-  
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/x-icon" href="favicon.ico" />
+
   <!-- Preload critical CSS -->
   <link rel="preload" href="./niivue.css" as="style" />
   <link rel="stylesheet" href="./niivue.css" />
-  
+
   <title>AI powered brain segmentation</title>
   <script type="module" crossorigin src="/brainchop-test/assets/index-BAthSPbo.js"></script>
   <link rel="modulepreload" crossorigin href="/brainchop-test/assets/vendor-D2xTqb6C.js">
@@ -33,7 +36,7 @@
     <label for="opacitySlider1">Overlay Opacity</label>
     <input type="range" min="0" max="255" value="128" class="slider" id="opacitySlider1" />
     &nbsp;
-      <!-- Backend selection is now automatic -->
+    <!-- Backend selection is now automatic -->
     <select id="modelSelect">
     </select>
     &nbsp;
