@@ -11,36 +11,141 @@ let gpuDevice = null;
 let isWebGpuAvailable = false;
 
 /**
- * Detects WebGPU support, initializes the device, and populates the backend UI selector.
- */
-// In main.js
-/**
  * Detects WebGPU support and initializes the device.
+ * Provides detailed diagnostics for troubleshooting.
  */
 async function initializeBackend() {
+  const diagnostics = {
+    secureContext: window.isSecureContext,
+    navigatorGpuExists: 'gpu' in navigator,
+    adapterObtained: false,
+    deviceObtained: false,
+    f16Support: false,
+    error: null
+  };
+
+  // Check secure context first
+  if (!window.isSecureContext) {
+    console.warn('WebGPU requires a secure context (HTTPS or localhost).');
+    console.warn('Current origin:', window.location.origin);
+  }
+
   if ('gpu' in navigator) {
     try {
+      console.log('Requesting WebGPU adapter...');
       const adapter = await navigator.gpu.requestAdapter();
+
       if (adapter) {
+        diagnostics.adapterObtained = true;
+        console.log('WebGPU adapter obtained:', adapter);
+
+        // Log adapter info if available
+        if (adapter.info) {
+          console.log('Adapter info:', adapter.info);
+        }
+
+        // Log adapter limits
+        console.log('Adapter limits:', {
+          maxBufferSize: adapter.limits.maxBufferSize,
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+          maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
+        });
+
         const requiredLimits = {
           maxBufferSize: adapter.limits.maxBufferSize,
           maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
         };
-        const requiredFeatures = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
+        const hasF16 = adapter.features.has("shader-f16");
+        diagnostics.f16Support = hasF16;
+        const requiredFeatures = hasF16 ? ["shader-f16"] : [];
 
         gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+        diagnostics.deviceObtained = true;
 
         isWebGpuAvailable = true;
-        const f16Status = requiredFeatures.length > 0 ? " (f16)" : "";
-        console.log(`WebGPU is available. F16 support: ${f16Status !== ""}`);
+        const f16Status = hasF16 ? "enabled" : "not available";
+        console.log(`✓ WebGPU initialized successfully. F16: ${f16Status}`);
+      } else {
+        console.warn('WebGPU adapter request returned null.');
+        console.warn('This typically means:');
+        console.warn('  - Safari: WebGPU feature flags not enabled in Settings > Feature Flags');
+        console.warn('  - Unsupported GPU hardware');
+        console.warn('  - GPU drivers need updating');
+        diagnostics.error = 'Adapter returned null';
       }
     } catch (e) {
-      console.error("WebGPU initialization failed.", e);
+      diagnostics.error = e.message;
+      console.error('WebGPU initialization error:', e);
+
+      // Provide Safari-specific guidance
+      if (navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome')) {
+        console.warn('Safari detected. To enable WebGPU:');
+        console.warn('  1. Open Safari Settings/Preferences');
+        console.warn('  2. Go to Advanced tab, enable "Show features for web developers"');
+        console.warn('  3. Go to Feature Flags tab');
+        console.warn('  4. Enable: WebGPU, GPU Process: DOM Rendering, GPU Process: Canvas Rendering');
+        console.warn('  5. Restart Safari');
+      }
+    }
+  } else {
+    console.warn('navigator.gpu not found. WebGPU API is not available in this browser.');
+    diagnostics.error = 'navigator.gpu not found';
+
+    // Provide Firefox-specific guidance
+    if (navigator.userAgent.includes('Firefox')) {
+      console.warn('Firefox detected. To enable WebGPU in about:config:');
+      console.warn('  1. Set dom.webgpu.enabled = true');
+      console.warn('  2. Set gfx.webgpu.ignore-blocklist = true');
+      console.warn('  3. Restart Firefox');
     }
   }
 
+  // Update UI with backend status
+  updateBackendStatusUI(isWebGpuAvailable, diagnostics);
+
   if (!isWebGpuAvailable) {
-    console.log("WebGPU not available, falling back to WebGL.");
+    console.log('Falling back to WebGL backend.');
+  }
+
+  // Store diagnostics for later access
+  window.webgpuDiagnostics = diagnostics;
+  return diagnostics;
+}
+
+/**
+ * Updates the UI to display the current backend status.
+ */
+function updateBackendStatusUI(webgpuAvailable, diagnostics) {
+  const statusEl = document.getElementById('backendStatus');
+  if (!statusEl) {
+    console.log('Backend status element not found in DOM');
+    return;
+  }
+
+  if (webgpuAvailable) {
+    const f16Text = diagnostics.f16Support ? ' (F16)' : '';
+    statusEl.textContent = `WebGPU${f16Text}`;
+    statusEl.style.color = '#4CAF50'; // Green
+    statusEl.title = 'WebGPU backend active - fastest performance';
+  } else {
+    statusEl.textContent = 'WebGL';
+    statusEl.style.color = '#FF9800'; // Orange
+
+    // Build helpful tooltip
+    let tooltip = 'WebGL backend (fallback)';
+    if (diagnostics.error) {
+      tooltip += `\nReason: ${diagnostics.error}`;
+    }
+    if (!diagnostics.secureContext) {
+      tooltip += '\n⚠ Not a secure context (HTTPS required)';
+    }
+    if (navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome')) {
+      tooltip += '\n\nTo enable WebGPU in Safari:\n1. Settings > Feature Flags\n2. Enable WebGPU flags\n3. Restart Safari';
+    }
+    if (navigator.userAgent.includes('Firefox')) {
+      tooltip += '\n\nTo enable WebGPU in Firefox:\n1. about:config > dom.webgpu.enabled = true\n2. gfx.webgpu.ignore-blocklist = true\n3. Restart Firefox';
+    }
+    statusEl.title = tooltip;
   }
 }
 
