@@ -19,89 +19,109 @@
   <link rel="stylesheet" href="./niivue.css" />
 
   <title>AI powered brain segmentation</title>
-  <script type="module" crossorigin src="/brainchop-test/assets/index-DkwlWh3S.js"></script>
+  <script type="module" crossorigin src="/brainchop-test/assets/index-BY2DxXrB.js"></script>
   <link rel="modulepreload" crossorigin href="/brainchop-test/assets/vendor-Da8HlJrh.js">
   <link rel="modulepreload" crossorigin href="/brainchop-test/assets/vendor-math-CA38DMGy.js">
   <link rel="modulepreload" crossorigin href="/brainchop-test/assets/vendor-niivue-CgtaimhT.js">
   <link rel="modulepreload" crossorigin href="/brainchop-test/assets/vendor-tf-D5AIKiWq.js">
+  <link rel="stylesheet" crossorigin href="/brainchop-test/assets/index-CB1Z9x6y.css">
 </head>
 
 <body>
   <header>
-    <label for="clipCheck">Clip Plane</label>
-    <input type="checkbox" id="clipCheck" unchecked />
-    <label for="opacitySlider0">Background Opacity</label>
-    <input type="range" min="0" max="255" value="255" class="slider" id="opacitySlider0" />
-    &nbsp;
-    <label for="opacitySlider1">Overlay Opacity</label>
-    <input type="range" min="0" max="255" value="128" class="slider" id="opacitySlider1" />
-    &nbsp;
+    <div class="control-group">
+      <input type="checkbox" id="clipCheck" unchecked />
+      <label for="clipCheck">Clip Plane</label>
+    </div>
+
+    <div class="control-group">
+      <label for="opacitySlider0">BG Opacity</label>
+      <input type="range" min="0" max="255" value="255" class="slider" id="opacitySlider0" />
+    </div>
+
+    <div class="control-group">
+      <label for="opacitySlider1">Overlay</label>
+      <input type="range" min="0" max="255" value="128" class="slider" id="opacitySlider1" />
+    </div>
+
     <!-- Backend selection is now automatic -->
     <select id="modelSelect">
+      <option value="-1" disabled selected>Loading models...</option>
     </select>
-    &nbsp;
-    <button id="saveImgBtn">Save Segmentation</button>
-    &nbsp;
-    <button id="saveSceneBtn">Save Scene</button>
-    &nbsp;
-    <label for="penDrop">Draw</label>
-    <select id="penDrop">
-      <option value="-1">Off</option>
-      <option value="2">On</option>
-      <option value="10">Filled</option>
-      <option value="0">Erase</option>
-    </select>
-    <select id="drawDrop">
-      <option value="0">Undo</option>
-      <option value="1">Append</option>
-      <option value="2">Remove</option>
-    </select>
-    &nbsp;
-    <label for="dragMode">Drag Mode</label>
-    <select id="dragMode">
-      <option>none</option>
-      <option>contrast</option>
-      <option>measurement</option>
-      <option selected>pan/zoom</option>
-      <option>slicer3D</option>
-    </select>
-    &nbsp;
+
+    <div class="button-group">
+      <button id="saveImgBtn">Save Seg</button>
+      <button id="saveSceneBtn">Save Scene</button>
+    </div>
+
+    <div class="control-group">
+      <label for="penDrop">Draw</label>
+      <select id="penDrop">
+        <option value="-1">Off</option>
+        <option value="2">On</option>
+        <option value="10">Filled</option>
+        <option value="0">Erase</option>
+      </select>
+      <select id="drawDrop">
+        <option value="0">Undo</option>
+        <option value="1">Append</option>
+        <option value="2">Remove</option>
+      </select>
+    </div>
+
+    <div class="control-group">
+      <label for="dragMode">Drag</label>
+      <select id="dragMode">
+        <option>none</option>
+        <option>contrast</option>
+        <option>measurement</option>
+        <option selected>pan/zoom</option>
+        <option>slicer3D</option>
+      </select>
+    </div>
+
     <button id="diagnosticsBtn">Diagnostics</button>
-    &nbsp;
     <button id="aboutBtn">About</button>
   </header>
+
   <main id="canvas-container">
     <canvas id="gl1"></canvas>
   </main>
+
   <footer>
-    <div class="footer">
-      <table class="footer">
-        <tr>
-          <th id="location">Drag and Drop any NIfTI image</th>
-          <th><progress id="modelProgress" value="0" max="100"> 32% </progress></th>
-          <th>
-            <!-- important to use class footer here -->
-            <div class="footer" id="memstatus" style="color: green">Memory OK</div>
-          </th>
-          <th>
-            <div class="footer" id="backendStatus" style="color: gray; cursor: help" title="Detecting backend...">⏳
-            </div>
-          </th>
-          <th>
-            <a href="https://github.com/neuroneural/brainchop" target="_blank" style="text-decoration:none">
-              <div class="github-star">
-                <div class="star-button">
-                  <i class="fa-brands fa-github" style="color: #000000;"></i>
-                  <span>Star</span>
-                </div>
-                <div id="star-count">0</div>
-              </div>
-            </a>
-          </th>
-        </tr>
-      </table>
+    <div class="footer-content">
+      <div class="footer-item" id="location">Drag and Drop any NIfTI image</div>
+
+      <div class="footer-item">
+        <progress id="modelProgress" value="0" max="100"> 0% </progress>
+      </div>
+
+      <div class="footer-item" id="memstatus" style="color: green">Memory OK</div>
+
+      <div class="footer-item">
+        <div id="backendStatus" style="color: gray; cursor: help" title="Detecting backend...">⏳ Checking Backend...
+        </div>
+      </div>
+
+      <div class="footer-item">
+        <a href="https://github.com/neuroneural/brainchop" target="_blank" style="text-decoration:none">
+          <div class="github-star" style="display: flex; align-items: center; gap: 5px; color: black;">
+            <i class="fa-brands fa-github"></i>
+            <span>Star</span>
+            <span id="star-count" style="background: #eee; padding: 0 4px; border-radius: 4px;">0</span>
+          </div>
+        </a>
+      </div>
     </div>
   </footer>
+
+  <!-- Custom Modal Dialog -->
+  <dialog id="appDialog">
+    <h3 id="dialogTitle">Message</h3>
+    <p id="dialogMessage"></p>
+    <button id="dialogCloseBtn">Close</button>
+  </dialog>
+
 </body>
 
 </html>
