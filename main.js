@@ -199,27 +199,52 @@ async function main() {
   };
 
   aboutBtn.onclick = function () {
-    window.alert(
-      "Drag and drop NIfTI images. Use pulldown menu to choose brainchop model",
-    );
+    showModal("About BrainChop", "Drag and drop NIfTI images. Use pulldown menu to choose brainchop model.");
   };
 
   diagnosticsBtn.onclick = function () {
-    if (diagnosticsString.length < 1) {
-      window.alert(
-        "No diagnostic string generated: run a model to create diagnostics",
-      );
+    let msg = diagnosticsString;
+
+    // If no inference run yet, show startup diagnostics
+    if (msg.length < 1 && window.webgpuDiagnostics) {
+      const d = window.webgpuDiagnostics;
+      msg = ":: Startup Diagnostics ::\n";
+      msg += `Secure Context: ${d.secureContext}\n`;
+      msg += `WebGPU Enabled: ${isWebGpuAvailable}\n`;
+      msg += `F16 Support: ${d.f16Support}\n`;
+      if (d.error) msg += `Error: ${d.error}\n`;
+
+      // Add browser info
+      msg += `User Agent: ${navigator.userAgent}\n`;
+    }
+
+    // If no inference run yet, show startup diagnostics
+    if (msg.length < 1 && window.webgpuDiagnostics) {
+      // ... (existing logic to build msg)
+    }
+
+    if (msg.length < 1) {
+      showModal("Diagnostics", "No diagnostic string generated: run a model to create diagnostics");
       return;
     }
+
+    // Logic for missing labels
+    let statusMsg = msg;
     missingLabelStatus = missingLabelStatus.slice(0, -2);
     if (missingLabelStatus !== "") {
-      if (diagnosticsString.includes('Status: OK')) {
-        diagnosticsString = diagnosticsString.replace('Status: OK', `Status: ${missingLabelStatus}`);
+      if (statusMsg.includes('Status: OK')) {
+        statusMsg = statusMsg.replace('Status: OK', `Status: ${missingLabelStatus}`);
       }
     }
-    missingLabelStatus = ""
-    navigator.clipboard.writeText(diagnosticsString);
-    window.alert("Diagnostics copied to clipboard\n" + diagnosticsString);
+    missingLabelStatus = "";
+
+    // ^ note: clipboard write is async but often works without await in loose contexts. 
+    // Ideally we catch errors.
+    navigator.clipboard.writeText(statusMsg).then(() => {
+      showModal("Diagnostics", "Diagnostics copied to clipboard\n\n" + statusMsg);
+    }).catch(err => {
+      showModal("Diagnostics", "Failed to copy to clipboard.\n\n" + statusMsg);
+    });
   };
 
   opacitySlider0.oninput = function () {
@@ -477,6 +502,12 @@ async function main() {
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
     } else {
       let colormap = opts.atlasSelectedColorTable.toLowerCase();
+
+      // Custom: Use copper2 for Brain Extraction models
+      if (modelEntry.type === 'Brain_Extraction') {
+        colormap = 'copper2';
+      }
+
       if (!nv1.colormaps().includes(colormap)) colormap = "actc";
       overlayVolume.colormap = colormap;
     }
@@ -543,7 +574,10 @@ async function main() {
   nv1.setInterpolation(true);
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
 
-  // Add placeholder option
+  // Clear loading placeholder
+  modelSelect.innerHTML = "";
+
+  // Add default placeholder
   const placeholderOption = document.createElement("option");
   placeholderOption.text = "Run Segmentation Model";
   placeholderOption.value = "-1";
@@ -553,6 +587,7 @@ async function main() {
   modelSelect.appendChild(placeholderOption);
 
   for (let i = 0; i < inferenceModelsList.length; i++) {
+    console.log(`Adding model option: ${inferenceModelsList[i].modelName}`);
     const option = document.createElement("option");
     option.text = inferenceModelsList[i].modelName;
     option.value = i;
@@ -580,6 +615,22 @@ async function main() {
     modelSelect.value = modelParam;
     runSelectedInference();
   }
+}
+
+// Helper to show custom modal
+function showModal(title, message) {
+  const dialog = document.getElementById("appDialog");
+  const titleEl = document.getElementById("dialogTitle");
+  const msgEl = document.getElementById("dialogMessage");
+  const closeBtn = document.getElementById("dialogCloseBtn");
+
+  if (!dialog) return;
+
+  titleEl.textContent = title;
+  msgEl.textContent = message;
+
+  closeBtn.onclick = () => dialog.close();
+  dialog.showModal();
 }
 
 async function updateStarCount() {

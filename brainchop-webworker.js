@@ -401,7 +401,7 @@ async function inferenceFullVolumePhase1(
     // -- mask_3d = slices_3d.greater([0]).asType('bool')
 
     if (isModelFullVol) {
-      runFullVolumeInference(
+      await runFullVolumeInference(
         opts,
         modelEntry,
         model,
@@ -573,7 +573,7 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
       }
 
       if (enableSeqConv) {
-        runFullVolumeInference(
+        await runFullVolumeInference(
           opts,
           modelEntry,
           model,
@@ -585,7 +585,7 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
           niftiImage
         );
       } else {
-        runFullVolumeInference(
+        await runFullVolumeInference(
           opts,
           modelEntry,
           model,
@@ -599,6 +599,7 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
       }
     }
   }
+  tf.engine().endScope();
 }
 
 self.addEventListener(
