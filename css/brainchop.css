@@ -50,7 +50,8 @@ header {
 
 header label {
   font-weight: 500;
-  font-size: 0.9rem;
+  font-size: 14px;
+  /* Normalized to match buttons */
   white-space: nowrap;
   color: var(--text-color);
 }
@@ -59,10 +60,14 @@ header label {
 select,
 button,
 input[type="text"] {
-  padding: 0.3rem 0.6rem;
-  border: 1px solid #555;
-  border-radius: var(--border-radius);
-  font-size: 0.9rem;
+  padding: 5px 12px;
+  /* Tighter */
+  border: 1px solid #d1d5da;
+  /* Subtle border like GitHub star */
+  border-radius: 6px;
+  /* Slightly more rounded */
+  font-size: 14px;
+  /* Standard readable size */
   background-color: var(--input-bg);
   color: var(--input-text);
 }
@@ -122,7 +127,10 @@ footer {
   margin: 0;
   background-color: var(--footer-bg);
   padding: var(--spacing);
-  font-size: 0.85rem;
+  font-size: 14px;
+  /* Normalized to match header */
+  font-weight: bold;
+  /* Make footer text bold */
   border-top: 1px solid #555;
   flex-shrink: 0;
   color: var(--text-color);
@@ -147,7 +155,8 @@ footer {
 #location {
   flex-direction: column;
   align-items: flex-start;
-  font-size: 0.8rem;
+  font-size: 14px;
+  /* Normalized */
   line-height: 1.2;
   /* Stabilize layout: Fixed width prevent jitter when text changes */
   width: 260px;
