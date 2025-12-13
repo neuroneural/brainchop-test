@@ -494,7 +494,14 @@ async function main() {
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
     overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
 
-    if (modelEntry.colormapPath) {
+    if (modelEntry.type === 'Brain_Masking') {
+      const newLabels = ["Background", "Brain Mask"];
+      const newR = [0, 217];
+      const newG = [0, 119];
+      const newB = [0, 33];
+      overlayVolume.setColormapLabel({ R: newR, G: newG, B: newB, labels: newLabels });
+      overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
+    } else if (modelEntry.colormapPath) {
       const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
       const cmap = await fetchJSON(modelEntry.colormapPath);
       const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"]);
