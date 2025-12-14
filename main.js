@@ -281,13 +281,15 @@ async function main() {
   }
 
   async function runSelectedInference() {
-    if (modelSelect.value === "-1") return;
+    const selectedModelIndex = modelSelect.value;
+    if (selectedModelIndex === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
 
     await closeAllOverlays();
     await ensureConformed();
 
-    const modelEntry = inferenceModelsList[modelSelect.value];
+    const modelEntry = inferenceModelsList[selectedModelIndex];
+
     const opts = { ...brainChopOpts };
     opts.rootURL = window.location.origin + import.meta.env.BASE_URL;
 

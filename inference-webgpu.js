@@ -138,7 +138,35 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         // --- DYNAMIC RUNNER & INFERENCE ---
         callbackUI('Loading model runner...', 0.4);
 
-        const execute = await setupNetwork(device, modelEntry, callbackUI);
+        // Track resources for cleanup
+        const resources = [];
+
+        // Proxy the device to intercept createBuffer calls
+        const proxyDevice = new Proxy(device, {
+            get(target, prop, receiver) {
+                // FIX: Access property directly on target to satisfy native getters
+                const value = target[prop];
+
+                // Intercept createBuffer
+                if (prop === 'createBuffer' && typeof value === 'function') {
+                    return function (...args) {
+                        // FIX: Use 'target' (the actual device) as 'this', not the proxy
+                        const buffer = value.apply(target, args);
+                        resources.push(buffer);
+                        return buffer;
+                    };
+                }
+
+                // Bind other functions to the original device
+                if (typeof value === 'function') {
+                    return value.bind(target);
+                }
+
+                return value;
+            }
+        });
+
+        const execute = await setupNetwork(proxyDevice, modelEntry, callbackUI);
 
         if (typeof execute !== 'function') {
             throw new Error(
@@ -212,9 +240,18 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         callbackUI('', -1, `WebGPU Error: ${errorMessage}`, statData);
         throw error; // Re-throw to trigger fallback in main.js
     } finally {
-        // Clean up tensor
+        // Clean up input tensor (it was disposed earlier but let's be safe if logic changes)
+        // Clean up output tensor
         if (outLabelVolume) {
             outLabelVolume.dispose();
+        }
+
+        // Clean up WebGPU resources
+        if (typeof resources !== 'undefined' && resources.length > 0) {
+            console.log(`Cleaning up ${resources.length} WebGPU buffers...`);
+            for (const buffer of resources) {
+                buffer.destroy();
+            }
         }
     }
 }
