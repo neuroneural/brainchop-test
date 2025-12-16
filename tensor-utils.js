@@ -810,79 +810,170 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
  * @param {number[]} inputShape The shape of the input tensor (including batch size).
  * @returns {number} The maximum number of elements.
  */
-export function estimateMaxIntermediateTensorSize(model, inputShape) {
+/**
+ * Estimates the maximum number of elements in any intermediate tensor of the model.
+ * Performs a precise calculation of peak memory usage by summing Input and Output sizes
+ * for each layer invocation, assuming sequential execution.
+ * 
+ * @param {tf.LayersModel} model The TensorFlow.js model.
+ * @param {number[]} inputShape The shape of the input tensor (including batch size).
+ * @param {boolean} isChannelLast Whether the model uses channels-last data format.
+ * @returns {number} The maximum number of elements.
+ */
+export function estimateMaxIntermediateTensorSize(model, inputShape, isChannelLast) {
   let maxElements = 0;
 
-  // Calculate spatial volume from input (assuming [Batch, D, H, W] or [Batch, D, H, W, C])
-  // We assume the input spatial dimensions are the upper bound for the model (U-Net).
-  // inputShape from worker is [1, D, H, W] (from slices_3d).
-  // We want D*H*W.
+  // 1. Calculate Spatial Volume (assumed constant/upper-bound size 256^3)
   let spatialVol = 1;
-  for (let i = 0; i < inputShape.length; i++) {
-    if (inputShape[i] > 1) spatialVol *= inputShape[i];
-  }
-
-  // Iterate through layers to find the largest output tensor
-  if (model && model.layers) {
-    for (const layer of model.layers) {
-      // layer.outputShape is usually [null, d, h, w, c]
-      let shape = layer.outputShape;
-
-      // Handle array of shapes (though unlikely for simple layers)
-      if (Array.isArray(shape) && Array.isArray(shape[0])) {
-        shape = shape[0];
+  // Heuristic: multiply the middle dimensions.
+  if (isChannelLast) {
+    // Expected: [Batch, D, H, W, C]
+    if (inputShape.length === 5) {
+      spatialVol = inputShape[1] * inputShape[2] * inputShape[3];
+    } else {
+      // Fallback usually [1, D, H, W]
+      for (let i = 0; i < inputShape.length; i++) {
+        if (inputShape[i] > 1) spatialVol *= inputShape[i];
       }
-
-      if (Array.isArray(shape)) {
-        // Get channels (last dim)
-        const channels = shape[shape.length - 1];
-
-        if (typeof channels === 'number') {
-          // Estimate size: SpatialVolume * Channels
-          // This assumes spatial dims are preserved (padding='same').
-          // Even if downsampled, this is a safe upper bound.
-          const size = spatialVol * channels;
-          if (size > maxElements) {
-            maxElements = size;
-          }
-        }
+    }
+  } else {
+    // Expected: [Batch, C, D, H, W]
+    if (inputShape.length === 5) {
+      spatialVol = inputShape[2] * inputShape[3] * inputShape[4];
+    } else {
+      for (let i = 0; i < inputShape.length; i++) {
+        if (inputShape[i] > 32) spatialVol *= inputShape[i];
       }
     }
   }
 
-  // Fallback if model traversal failed
-  if (maxElements === 0) {
-    maxElements = spatialVol * 32; // Default heuristic
+  // 2. Iterate Layers to find Peak Memory (Input + Output) and Max Output
+  // checkMemoryAllocation tests both packed (peak) and unpacked (maxOutput).
+  let maxOutputElements = 0;
+
+  if (model && model.layers) {
+    for (const layer of model.layers) {
+      // A. Calculate Output Channels
+      let outputChannels = 0;
+      let outputShape = layer.outputShape;
+      // Normalize outputShape to array
+      if (Array.isArray(outputShape) && Array.isArray(outputShape[0])) {
+        outputShape = outputShape[0];
+      }
+      if (Array.isArray(outputShape)) {
+        if (isChannelLast) {
+          outputChannels = outputShape[outputShape.length - 1];
+        } else {
+          // [Null, C, D, H, W]
+          outputChannels = outputShape[1];
+        }
+      }
+
+      // B. Calculate Input Channels (Robust)
+      let inputChannels = 0;
+
+      // B1. Try batchInputShape
+      const inputShapes = layer.batchInputShape;
+      const getChannelsFromShape = (s) => {
+        if (!Array.isArray(s)) return 0;
+        if (isChannelLast) return s[s.length - 1];
+        return s[1];
+      };
+
+      if (inputShapes) {
+        if (Array.isArray(inputShapes) && Array.isArray(inputShapes[0])) {
+          // Array of shapes (e.g. Concatenate layer inputs)
+          for (const s of inputShapes) {
+            inputChannels += getChannelsFromShape(s);
+          }
+        } else if (Array.isArray(inputShapes)) {
+          // Single shape
+          inputChannels = getChannelsFromShape(inputShapes);
+        }
+      }
+
+      // B2. Fallback: Try Weights (Kernels)
+      // Conv3D kernel: [D, H, W, In, Out]
+      if (inputChannels === 0 && layer.weights && layer.weights.length > 0) {
+        // We assume the first weight is the kernel.
+        // Warning: Accessing .val or .tensor might be expensive? 
+        // layer.weights is array of LayerVariable. variable.shape is available.
+        const w = layer.weights[0];
+        if (w && w.shape) {
+          if (w.shape.length === 5) { // Conv3D
+            // Kernel layout is channel selection logic dependent?
+            // TF.js Conv3D kernel is [D, H, W, In, Out] usually.
+            inputChannels = w.shape[3];
+          } else if (w.shape.length === 4) { // Conv2D
+            // [H, W, In, Out]
+            inputChannels = w.shape[2];
+          }
+        }
+      }
+
+      // B3. Final Fallback: Assume Input = Output (e.g. Activation layers)
+      if (inputChannels === 0) {
+        inputChannels = outputChannels;
+      }
+
+      // C. Calculate Peak and Update Max
+      if (typeof outputChannels === 'number' && typeof inputChannels === 'number') {
+        const currentPeakElements = spatialVol * (inputChannels + outputChannels);
+        const currentOutputElements = spatialVol * outputChannels;
+
+        if (currentPeakElements > maxElements) {
+          maxElements = currentPeakElements;
+        }
+        // Track output of LAST layer (overwrite each iteration)
+        // Only the FINAL output is unpacked for argmax. Intermediates are packed.
+        maxOutputElements = currentOutputElements;
+      }
+    }
   }
 
-  return maxElements;
+  // Fallback
+  if (maxElements === 0) {
+    maxElements = spatialVol * 32 * 2;
+  }
+
+  // Return BOTH peak (In+Out) and max output separately
+  // This allows checkMemoryAllocation to test packed (peak) and unpacked (maxOutput)
+  console.log(`[Estimator] Total Layers: ${model?.layers?.length}, Peak: ${maxElements}, Final Output: ${maxOutputElements}`);
+  return { peak: maxElements, maxOutput: maxOutputElements };
 }
 
 /**
  * Proactively checks if a tensor of the specified size can be allocated on the GPU.
- * @param {number} numElements Number of elements to allocate.
- * @returns {boolean} True if allocation succeeded, false otherwise.
+ * @param {number} peakElements Total elements for peak allocation (In+Out) - used for packed check.
+ * @param {number} maxOutputElements Elements for largest single output - used for unpacked check.
+ * @returns {boolean} True if allocation is likely to succeed, false otherwise.
  */
-export function checkMemoryAllocation(numElements) {
-  // 1. Check Texture Size Limits (Heuristic for WebGL)
+export function checkMemoryAllocation(peakElements, maxOutputElements) {
   try {
     const backend = tf.backend();
     if (backend && backend.gpgpu && backend.gpgpu.gl) {
       const maxTextureSize = backend.gpgpu.gl.getParameter(backend.gpgpu.gl.MAX_TEXTURE_SIZE);
 
-      // TFJS WebGL backend typically packs 4 float32 elements into one RGBA pixel (if WEBGL_PACK is true).
-      // We check the flag to be precise.
-      const isPacked = tf.env().getBool('WEBGL_PACK');
-      const elementsPerPixel = isPacked ? 4 : 1;
+      // TF.js WebGL uses PACKED textures (4 elem/pixel) for INTERMEDIATE layers.
+      // However, the FINAL OUTPUT (e.g., class logits before argmax) is UNPACKED (1 elem/pixel).
 
-      // Calculate needed pixels
-      const neededPixels = Math.ceil(numElements / elementsPerPixel);
+      // Check for PACKED intermediates (4 elements per pixel)
+      const packedNeededPixels = Math.ceil(peakElements / 4);
+      const packedNeededDim = Math.ceil(Math.sqrt(packedNeededPixels));
 
-      // In the worst case (unpacked or simple packing), needed dimension is sqrt(neededPixels).
-      const neededDim = Math.ceil(Math.sqrt(neededPixels));
+      // Check for UNPACKED final output (1 element per pixel)
+      const unpackedNeededPixels = maxOutputElements; // 1 elem/pixel
+      const unpackedNeededDim = Math.ceil(Math.sqrt(unpackedNeededPixels));
 
-      if (neededDim > maxTextureSize) {
-        console.warn(`Proactive check: Tensor size ${numElements} (packed: ${isPacked}) requires approx ${neededDim}x${neededDim} texture. Exceeds MAX_TEXTURE_SIZE ${maxTextureSize}`);
+      console.log(`[Memory Check] Peak: ${peakElements}, MaxOutput: ${maxOutputElements}, Packed Dim: ${packedNeededDim}, Unpacked Dim: ${unpackedNeededDim}, MaxTextureSize: ${maxTextureSize}`);
+
+      if (packedNeededDim > maxTextureSize) {
+        console.warn(`Proactive check (PACKED): Tensor size ${peakElements} requires approx ${packedNeededDim}x${packedNeededDim} texture. Exceeds MAX_TEXTURE_SIZE ${maxTextureSize}`);
+        return false;
+      }
+
+      if (unpackedNeededDim > maxTextureSize) {
+        console.warn(`Proactive check (UNPACKED): Max output ${maxOutputElements} requires approx ${unpackedNeededDim}x${unpackedNeededDim} texture. Exceeds MAX_TEXTURE_SIZE ${maxTextureSize}`);
         return false;
       }
     }
@@ -890,38 +981,6 @@ export function checkMemoryAllocation(numElements) {
     console.warn("Could not check texture size limits:", e);
   }
 
-  // 2. Check Total Memory (Chunked Allocation)
-  const tensors = [];
-  try {
-    // Allocate in chunks to avoid CPU OOM (RangeError) for large contiguous arrays.
-    // 10 million elements * 4 bytes = ~40MB per chunk. Safe for CPU.
-    const CHUNK_SIZE = 10 * 1000 * 1000;
-    let allocated = 0;
-
-    while (allocated < numElements) {
-      const size = Math.min(CHUNK_SIZE, numElements - allocated);
-
-      // tf.zeros is safer than randomUniform for CPU allocation overhead in some TFJS versions
-      const t = tf.zeros([size]);
-
-      // Force GPU allocation by running a lightweight op
-      // We keep the result to prevent GC/cleanup, ensuring we test total capacity
-      const t_gpu = t.add(0);
-      tensors.push(t_gpu);
-
-      // Dispose the initial CPU-backed tensor immediately
-      t.dispose();
-
-      allocated += size;
-    }
-    return true;
-  } catch (e) {
-    console.warn("Proactive memory check failed:", e);
-    return false;
-  } finally {
-    // Clean up everything
-    for (const t of tensors) {
-      t.dispose();
-    }
-  }
+  // If we reach here, texture size check passed (or no backend available)
+  return true;
 }

@@ -1,5 +1,5 @@
-import * as tf from '@tensorflow/tfjs'
-import { inferenceModelsList } from './brainchop-parameters.js'
+import * as tf from '@tensorflow/tfjs';
+import { inferenceModelsList } from './brainchop-parameters.js';
 import { runFullVolumeInference } from './inference-logic.js';
 
 import {
@@ -10,9 +10,7 @@ import {
   isModelChnlLast,
   load_model,
   minMaxNormalizeVolumeData,
-  quantileNormalizeVolumeData,
-  checkMemoryAllocation,
-  estimateMaxIntermediateTensorSize
+  quantileNormalizeVolumeData
 } from './tensor-utils.js';
 
 
@@ -346,18 +344,6 @@ async function inferenceFullVolumePhase1(
             // --slices_3d_mask.dispose()
 
             if (isModelFullVol) {
-              // Proactive Memory Check
-              if (!modelEntry.enableSeqConv) {
-                const inputShape = [1, ...slices_3d.shape];
-                const estimatedSize = estimateMaxIntermediateTensorSize(model, inputShape);
-                console.log(`Proactive Memory Check (Phase 1): Estimated Max Tensor Size: ${estimatedSize} elements`);
-
-                if (!checkMemoryAllocation(estimatedSize)) {
-                  console.warn("Proactive memory check failed. Switching to enableSeqConv: true");
-                  modelEntry.enableSeqConv = true;
-                }
-              }
-
               await runFullVolumeInference(
                 opts,
                 modelEntry,
@@ -370,7 +356,6 @@ async function inferenceFullVolumePhase1(
                 niftiImage
               );
               return 0;
-
             } else {
               // -- In version 3.0.0 this function not used
               callbackUI('', -1, 'inferenceSubVolumes() is not dead code?')
@@ -545,32 +530,6 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
       }
 
       let enableSeqConv = modelEntry.enableSeqConv
-
-      if (!enableSeqConv) {
-        // Proactive Memory Check
-        // Estimate size based on input volume. 
-        // We use a heuristic: Input Volume * 32 (filters) * 2 (safety factor)
-        // Actually, let's just try to allocate a tensor of size [Batch, D, H, W, 32] which is typical for first layer output.
-        // If that fails, we definitely can't run the model.
-
-        // Using the helper from tensor-utils
-        // We need input shape. slices_3d shape is [D, H, W] (or transposed).
-        // Let's assume batch=1.
-        const inputShape = [1, ...slices_3d.shape];
-
-        // Use the improved estimation function that iterates model layers
-        const estimatedSize = estimateMaxIntermediateTensorSize(model, inputShape);
-
-        console.log(`Proactive Memory Check: Estimated Max Tensor Size: ${estimatedSize} elements`);
-
-        if (!checkMemoryAllocation(estimatedSize)) {
-          console.warn("Proactive memory check failed. Switching to enableSeqConv: true");
-          enableSeqConv = true;
-
-          // Update modelEntry for consistency in downstream functions
-          modelEntry.enableSeqConv = true;
-        }
-      }
 
       if (enableSeqConv) {
         await runFullVolumeInference(

@@ -12,7 +12,9 @@ import {
   minMaxNormalizeVolumeData,
   quantileNormalizeVolumeData,
   processSegmentationVolume,
-  SequentialConvLayer
+  SequentialConvLayer,
+  checkMemoryAllocation,
+  estimateMaxIntermediateTensorSize
 } from './tensor-utils.js';
 
 
@@ -85,6 +87,39 @@ export async function runFullVolumeInference(
 
   let currentOutputTensor = cropped_slices_3d_w_pad.reshape(adjusted_input_shape);
 
+  // --- PROACTIVE MEMORY CHECK (Centralized) ---
+  // Check for two conditions:
+  // 1. PACKED check fails (intermediates too large) → full SeqConv fallback
+  // 2. UNPACKED check fails (final output too large) → use chunkedArgMax
+  let useChunkedArgMax = false;
+
+  if (!modelEntry.enableSeqConv) {
+    const { peak, maxOutput } = estimateMaxIntermediateTensorSize(res, adjusted_input_shape, isChannelLast);
+    console.log(`[Centralized Check] Peak (In+Out): ${peak}, Max Output: ${maxOutput}`);
+
+    const backend = tf.backend();
+    const maxTextureSize = (backend && backend.gpgpu && backend.gpgpu.gl)
+      ? backend.gpgpu.gl.getParameter(backend.gpgpu.gl.MAX_TEXTURE_SIZE)
+      : 16384;
+
+    console.log(`[Memory Check] MAX_TEXTURE_SIZE from WebGL context: ${maxTextureSize}`);
+
+    // Check PACKED (intermediates) - if this fails, need full SeqConv
+    const packedDim = Math.ceil(Math.sqrt(Math.ceil(peak / 4)));
+    // Check UNPACKED (final output) - if only this fails, use chunked argmax
+    const unpackedDim = Math.ceil(Math.sqrt(maxOutput));
+
+    if (packedDim > maxTextureSize) {
+      console.warn(`[Memory Check] PACKED intermediates too large (${packedDim} > ${maxTextureSize}). Using full SeqConv.`);
+      modelEntry.enableSeqConv = true;
+    } else if (unpackedDim > maxTextureSize) {
+      console.warn(`[Memory Check] UNPACKED output too large (${unpackedDim} > ${maxTextureSize}). Using chunkedArgMax.`);
+      useChunkedArgMax = true;
+    } else {
+      console.log(`[Memory Check] All checks passed. Using fast path.`);
+    }
+  }
+
   // --- 3. MAIN INFERENCE LOOP with ROBUST MEMORY MANAGEMENT ---
   let i = 1;
   const startTime = performance.now();
@@ -99,7 +134,9 @@ export async function runFullVolumeInference(
   console.log(`Syncing GPU every ${SYNC_GPU_EVERY_N_LAYERS} layers.`);
 
   // The loop termination condition depends on the strategy
-  const loopEnd = modelEntry.enableSeqConv ? layersLength - 2 : layersLength - 1;
+  // Skip the final layer if enableSeqConv OR useChunkedArgMax (both need chunked final processing)
+  const skipFinalLayer = modelEntry.enableSeqConv || useChunkedArgMax;
+  const loopEnd = skipFinalLayer ? layersLength - 2 : layersLength - 1;
 
   while (i <= loopEnd) {
     try {
@@ -179,6 +216,19 @@ export async function runFullVolumeInference(
     seqConvResult.dispose();
     currentOutputTensor.dispose(); // Dispose the input to the final layer
     console.log('SequentialConvLayer output shape:', outLabelVolume.shape);
+
+  } else if (useChunkedArgMax) {
+    // --- FINAL PROCESSING WITH CHUNKED FINAL LAYER (Fast Path + Safe Final Conv/ArgMax) ---
+    // The final conv layer (e.g., 30→50 channels) would create a 50-channel output
+    // that exceeds texture limits when unpacked for argmax. Use SequentialConvLayer
+    // for ONLY the final layer, which chunks both conv and argmax operations.
+    console.log('Applying SequentialConvLayer for final layer only (fast path for layers 1-18)...');
+    const seqConvLayer = new SequentialConvLayer(res, 10, isChannelLast, callbackUI);
+    const seqConvResult = await seqConvLayer.apply(currentOutputTensor);
+    outLabelVolume = seqConvResult.asType('int32');
+    seqConvResult.dispose();
+    currentOutputTensor.dispose();
+    console.log('SequentialConvLayer (final only) output shape:', outLabelVolume.shape);
 
   } else {
     // --- FINAL PROCESSING FOR STANDARD METHOD ---
