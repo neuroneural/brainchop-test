@@ -17,6 +17,12 @@ import {
   estimateMaxIntermediateTensorSize
 } from './tensor-utils.js';
 
+import {
+  markSuccess,
+  markFailure,
+  addLabelStats
+} from './diagnostic-stats.js';
+
 
 export async function runFullVolumeInference(
   opts,
@@ -179,11 +185,7 @@ export async function runFullVolumeInference(
       tf.engine().endScope()
       tf.engine().disposeVariables()
 
-      statData.Inference_t = Infinity
-      statData.Postprocess_t = Infinity
-      statData.Status = 'Fail'
-      statData.Error_Type = err.message
-      statData.Extra_Err_Info = 'Failed while model layer ' + i + ' apply'
+      markFailure(statData, err, 'Failed while model layer ' + i + ' apply')
 
       callbackUI('', -1, '', statData)
       return 0;
@@ -276,9 +278,13 @@ export async function runFullVolumeInference(
   // --- Log the total execution time ---
   console.log(`---- Total Execution Time: ${totalExecutionTime} seconds ----`);
 
-  statData.Inference_t = Inference_t;
-  statData.Postprocess_t = Postprocess_t;
-  statData.Status = 'OK';
+  // Calculate label stats before disposal
+  const uniqueLabels = new Set(outimg);
+  const actualLabels = uniqueLabels.size;
+  const expectedLabels = modelEntry.numClasses || actualLabels;
+  addLabelStats(statData, expectedLabels, actualLabels);
+
+  markSuccess(statData, Inference_t, Postprocess_t);
   callbackUI(modelEntry.modelName + '<br>Segmentation finished', 0);
   callbackUI('', -1, '', statData);
   callbackImg(outimg, opts, modelEntry);

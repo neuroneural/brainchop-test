@@ -13,6 +13,15 @@ import {
   quantileNormalizeVolumeData
 } from './tensor-utils.js';
 
+import {
+  createStatData,
+  addModelInfo,
+  addLabelStats,
+  markSuccess,
+  markFailure,
+  ExecutionModes
+} from './diagnostic-stats.js';
+
 
 function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData = []) {
   let statStr = []
@@ -164,11 +173,7 @@ async function inferenceFullVolumePhase1(
           tf.engine().endScope()
           tf.engine().disposeVariables()
 
-          statData.Inference_t = Infinity
-          statData.Postprocess_t = Infinity
-          statData.Status = 'Fail'
-          statData.Error_Type = err.message
-          statData.Extra_Err_Info = 'PreModel Failed while model layer ' + i + ' apply'
+          markFailure(statData, err, 'PreModel Failed while model layer ' + i + ' apply')
 
           callbackUI('', -1, '', statData)
 
@@ -271,9 +276,7 @@ async function inferenceFullVolumePhase1(
           const numSegClasses = maxLabelPredicted + 1
           console.log('Pre-model numSegClasses', numSegClasses)
 
-          statData.Actual_Labels = numSegClasses
-          statData.Expect_Labels = expected_Num_labels
-          statData.NumLabels_Match = numSegClasses === expected_Num_labels
+          addLabelStats(statData, expected_Num_labels, numSegClasses)
 
           // -- Transpose back to original unpadded size
           let outLabelVolume = await prediction_argmax.reshape([num_of_slices, slice_height, slice_width])
@@ -311,10 +314,8 @@ async function inferenceFullVolumePhase1(
             callbackUI(errTxt, -1, errTxt)
 
             statData.Inference_t = Inference_t
-            statData.Postprocess_t = Infinity
-            statData.Status = 'Fail'
-            statData.Error_Type = error.message
-            statData.Extra_Err_Info = 'Pre-model failed while generating output'
+            markFailure(statData, error, 'Pre-model failed while generating output')
+            statData.Inference_t = Inference_t // Preserve partial inference time
 
             callbackUI('', -1, '', statData)
 
@@ -327,9 +328,7 @@ async function inferenceFullVolumePhase1(
           )
 
           // -- Timing data to collect
-          statData.Inference_t = Inference_t
-          statData.Postprocess_t = Postprocess_t
-          statData.Status = 'OK'
+          markSuccess(statData, Inference_t, Postprocess_t)
 
           callbackUI('', -1, '', statData)
 
@@ -426,9 +425,9 @@ async function enableProductionMode(textureF16Flag = true) {
 }
 
 async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
-
-  const statData = []
-  statData.startTime = Date.now() // for common webworker/mainthread do not use performance.now()
+  // Determine execution mode based on sequential convolution setting
+  const executionMode = modelEntry.enableSeqConv ? ExecutionModes.WEBGL_SEQUENTIAL : ExecutionModes.WEBGL_WEBWORKER
+  const statData = createStatData(modelEntry, executionMode)
   callbackUI('Segmentation started', 0)
   const batchSize = opts.batchSize
   const numOfChan = opts.numOfChan
@@ -449,6 +448,17 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
   await enableProductionMode(true)
   statData.TF_Backend = tf.getBackend()
   const modelObject = model
+
+  // Add model architecture info
+  await addModelInfo(
+    statData,
+    modelObject,
+    modelObject.layers[0].batchInputShape,
+    await isModelChnlLast(modelObject),
+    getModelNumParameters,
+    getModelNumLayers
+  )
+
   let batchInputShape = []
   // free global variable of 16777216 voxel
   // allOutputSlices3DCC1DimArray = []

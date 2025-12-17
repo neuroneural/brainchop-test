@@ -4,6 +4,13 @@ import {
     minMaxNormalizeVolumeData,
     processSegmentationVolume
 } from './tensor-utils.js';
+import {
+    createStatData,
+    addLabelStats,
+    markSuccess,
+    markFailure,
+    ExecutionModes
+} from './diagnostic-stats.js';
 
 // Use relative paths and eager loading for better error detection
 const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js', { eager: true });
@@ -93,9 +100,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
 export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
     callbackUI('Starting WebGPU inference...', 0);
     const inferenceStartTime = performance.now();
-    const statData = {};
-    statData.startTime = Date.now();
-    statData.TF_Backend = 'webgpu';
+    const statData = createStatData(modelEntry, ExecutionModes.WEBGPU);
     statData.isModelFullVol = true;
 
     let outLabelVolume; // To hold the tensor for final disposal
@@ -215,9 +220,13 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         callbackImg(finalImage, opts, modelEntry);
 
-        statData.Inference_t = Inference_t;
-        statData.Postprocess_t = Postprocess_t;
-        statData.Status = 'OK';
+        // Add label statistics from output
+        const uniqueLabels = new Set(finalImage);
+        const actualLabels = uniqueLabels.size;
+        const expectedLabels = modelEntry.numClasses || actualLabels;
+        addLabelStats(statData, expectedLabels, actualLabels);
+
+        markSuccess(statData, Inference_t, Postprocess_t);
 
         callbackUI(modelEntry.modelName + '<br>Segmentation finished.', 1, '', statData);
 
@@ -232,10 +241,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             errorMessage += '. Check network connection and file paths.';
         }
 
-        statData.Inference_t = Infinity;
-        statData.Postprocess_t = Infinity;
-        statData.Status = 'Fail';
-        statData.Error_Type = errorMessage;
+        markFailure(statData, errorMessage, 'WebGPU inference failed');
 
         callbackUI('', -1, `WebGPU Error: ${errorMessage}`, statData);
         throw error; // Re-throw to trigger fallback in main.js

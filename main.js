@@ -536,7 +536,9 @@ async function main() {
     statData = await localSystemDetails(statData, nv1.gl);
     diagnosticsString = ":: Diagnostics https://github.com/neuroneural/brainchop/issues ::\n";
     for (const key in statData) {
-      diagnosticsString += `${key}: ${statData[key]}\n`;
+      if (statData[key] !== null && statData[key] !== undefined) {
+        diagnosticsString += `${key}: ${statData[key]}\n`;
+      }
     }
   }
 
