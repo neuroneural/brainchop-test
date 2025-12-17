@@ -199,7 +199,25 @@ async function main() {
   };
 
   aboutBtn.onclick = function () {
-    showModal("About BrainChop", "Drag and drop NIfTI images. Use pulldown menu to choose brainchop model.");
+    const aboutContent = `
+      <div style="text-align: left; font-size: 0.95em;">
+        <p><strong>🔒 Privacy First</strong><br>
+        BrainChop runs entirely <strong>locally in your browser</strong>. Your imaging data never leaves your device, and no server-side processing is involved.</p>
+
+        <p><strong>⌨️ Controls</strong><br>
+        • <strong>Drag & Drop</strong> any NIfTI file to open.
+        • Press <strong>C</strong> to toggle/cycle the clip-plane.
+        • Press <strong>V</strong> repeatedly to cycle through views.</p>
+
+        <p><strong>🧠 AI Models</strong><br>
+        <strong>⚡ Flash Filet:</strong> Small, lightning fast, resource-friendly. Best for HCP-like structural MRIs ("Tissue GWM (light)").<br>
+        <strong>🔪 Thin Slice:</strong> High quality but potentially fragile. Best for standard healthy adult data.<br>
+        <strong>🪓 Rough Chop:</strong> New & robust! Works on a wide variety of data qualities (clinical, infant). May be less refined than "Thin slice" on perfect data but tougher on real-world data.</p>
+        
+        <p><em>Note: Models may run slower on limited devices to ensure memory safety.</em></p>
+      </div>
+    `;
+    showModal("About BrainChop", aboutContent);
   };
 
   diagnosticsBtn.onclick = function () {
@@ -638,7 +656,7 @@ function showModal(title, message) {
   if (!dialog) return;
 
   titleEl.textContent = title;
-  msgEl.textContent = message;
+  msgEl.innerHTML = message;
 
   closeBtn.onclick = () => dialog.close();
   dialog.showModal();
