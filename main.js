@@ -473,9 +473,7 @@ async function main() {
     nv1.saveDocument("brainchop.nvd");
   };
 
-  clipCheck.onchange = function () {
-    nv1.setClipPlane(clipCheck.checked ? [0, 0, 90] : [2, 0, 90]);
-  };
+
 
   function doLoadImage() {
     opacitySlider0.oninput();
