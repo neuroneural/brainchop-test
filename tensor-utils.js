@@ -108,34 +108,42 @@ export async function binarizeVolumeDataTensor(volumeDataTensor) {
 }
 
 async function calculateQuantiles(tensor, lowerQuantile = 0.01, upperQuantile = 0.99) {
-  // Flatten the tensor
+  // OPTIMIZED: Download flat tensor to CPU, then sample and sort on CPU.
+  // This avoids tf.gather on large tensors which causes memory issues in WebGL.
+  // Still much faster than sorting all 16M+ elements since we only sort the sample.
   const flatTensor = tensor.flatten()
+  const totalSize = flatTensor.shape[0]
 
-  // Convert the flattened tensor to an array to sort it
-  const flatArray = await flatTensor.array()
-  flatArray.sort((a, b) => a - b) // Sort the array in ascending order
-
-  // Convert the sorted array back to a tensor
-  const sortedTensor = tf.tensor1d(flatArray)
-
-  // Calculate the indices for the quantiles
-  const numElements = sortedTensor.shape[0]
-  const lowIndex = Math.floor(numElements * lowerQuantile)
-  const highIndex = Math.ceil(numElements * upperQuantile) - 1 // Subtract 1 because indices are 0-based
-
-  // Slice the sorted tensor to get qmin and qmax
-  const qmin = sortedTensor.slice(lowIndex, 1) // Get the value at the low index
-  const qmax = sortedTensor.slice(highIndex, 1) // Get the value at the high index
-
-  // Get the actual values from the tensors
-  const qminValue = (await qmin.array())[0]
-  const qmaxValue = (await qmax.array())[0]
-
-  // Clean up tensors to free memory
+  // Download tensor data to CPU (TypedArray, not JS Array - much faster)
+  const flatData = await flatTensor.data()
   flatTensor.dispose()
-  sortedTensor.dispose()
-  qmin.dispose()
-  qmax.dispose()
+
+  // Sample on CPU - no GPU memory issues
+  const sampleSize = Math.min(100000, totalSize)
+  let sampleArray
+
+  if (sampleSize >= totalSize) {
+    // Use all elements
+    sampleArray = Array.from(flatData)
+  } else {
+    // Random sampling on CPU
+    sampleArray = new Array(sampleSize)
+    for (let i = 0; i < sampleSize; i++) {
+      const randomIndex = Math.floor(Math.random() * totalSize)
+      sampleArray[i] = flatData[randomIndex]
+    }
+  }
+
+  // Sort only the sample on CPU (100k elements is fast)
+  sampleArray.sort((a, b) => a - b)
+
+  // Calculate quantile indices on the sample
+  const numElements = sampleArray.length
+  const lowIndex = Math.floor(numElements * lowerQuantile)
+  const highIndex = Math.ceil(numElements * upperQuantile) - 1
+
+  const qminValue = sampleArray[lowIndex]
+  const qmaxValue = sampleArray[highIndex]
 
   return { qmin: qminValue, qmax: qmaxValue }
 }
@@ -615,18 +623,14 @@ export async function quantileNormalizeVolumeData(tensor, lowerQuantile = 0.05, 
   // Call calculateQuantiles and wait for the result
   const { qmin, qmax } = await calculateQuantiles(tensor, lowerQuantile, upperQuantile)
 
-  // Convert qmin and qmax back to scalars
-  const qminScalar = tf.scalar(qmin)
-  const qmaxScalar = tf.scalar(qmax)
-
   // Perform the operation: (tensor - qmin) / (qmax - qmin)
-  const resultTensor = tensor.sub(qminScalar).div(qmaxScalar.sub(qminScalar))
+  // Break up chained operations to properly dispose intermediate tensors
+  const range = qmax - qmin
+  const shifted = tensor.sub(qmin)
+  const resultTensor = shifted.div(range)
+  shifted.dispose() // Dispose intermediate tensor to prevent memory leak
 
-  // Dispose of the created scalars to free memory
-  qminScalar.dispose()
-  qmaxScalar.dispose()
-
-  // Return the resulting tensor
+  // Return the resulting tensor (caller is responsible for disposing input tensor)
   return resultTensor
 }
 
