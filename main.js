@@ -259,9 +259,9 @@ async function main() {
     // ^ note: clipboard write is async but often works without await in loose contexts. 
     // Ideally we catch errors.
     navigator.clipboard.writeText(statusMsg).then(() => {
-      showModal("Diagnostics", "Diagnostics copied to clipboard\n\n" + statusMsg);
+      showModal("Diagnostics", `<p>Diagnostics copied to clipboard</p><pre style="white-space: pre-wrap; font-family: monospace; font-size: 0.9em; overflow-x: auto;">${statusMsg}</pre>`);
     }).catch(err => {
-      showModal("Diagnostics", "Failed to copy to clipboard.\n\n" + statusMsg);
+      showModal("Diagnostics", `<p>Failed to copy to clipboard.</p><pre style="white-space: pre-wrap; font-family: monospace; font-size: 0.9em; overflow-x: auto;">${statusMsg}</pre>`);
     });
   };
 
