@@ -475,7 +475,7 @@ export async function generateOutputSlicesV2(
   if (opts.isPostProcessEnable) {
     const BWInstance = new BWLabeler()
     const dim = new Uint32Array(OutVolumeTensorShape)
-    const conn = 26 // Example connectivity
+    const conn = 6 // Example connectivity
     const binarize = true
     const onlyLargestClusterPerClass = true
     const [_labelCount, labeledImage] = BWInstance.bwlabel(img, dim, conn, binarize, onlyLargestClusterPerClass)
