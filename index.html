@@ -19,12 +19,12 @@
   <link rel="stylesheet" href="./niivue.css" />
 
   <title>AI powered brain segmentation</title>
-  <script type="module" crossorigin src="/assets/index-X4b-JdN0.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/vendor-MRJhgBmu.js">
-  <link rel="modulepreload" crossorigin href="/assets/vendor-math-CA38DMGy.js">
-  <link rel="modulepreload" crossorigin href="/assets/vendor-niivue-zW9nGonb.js">
-  <link rel="modulepreload" crossorigin href="/assets/vendor-tf-BGSqDGHJ.js">
-  <link rel="stylesheet" crossorigin href="/assets/index-WO84sWVv.css">
+  <script type="module" crossorigin src="./assets/index-CNUv1HGl.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/vendor-DLc_gxcK.js">
+  <link rel="modulepreload" crossorigin href="./assets/vendor-math-CA38DMGy.js">
+  <link rel="modulepreload" crossorigin href="./assets/vendor-niivue-uevEgbiD.js">
+  <link rel="modulepreload" crossorigin href="./assets/vendor-tf-CeU-O0Uy.js">
+  <link rel="stylesheet" crossorigin href="./assets/index-WO84sWVv.css">
 </head>
 
 <body>
@@ -75,6 +75,11 @@
         <option selected>pan/zoom</option>
         <option>slicer3D</option>
       </select>
+    </div>
+
+    <div class="control-group">
+      <label for="ttaCheck" title="Test Time Augmentation (Average with flipped input)">TTA</label>
+      <input type="checkbox" id="ttaCheck" style="margin: auto;" />
     </div>
 
     <button id="diagnosticsBtn">Diagnostics</button>
