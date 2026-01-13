@@ -239,6 +239,141 @@ export class BWLabeler {
     return [mxbw, vxs]
   }
 
+  // Filter clusters based on target classes rules
+  // targetClasses: 'all', or Set of class IDs.
+  // If 'all' or class in targetClasses: keep only largest component of that class.
+  // Else: keep all components of that class.
+  filter_clusters(bw, cl, ls, targetClasses) {
+    const nvox = bw.length
+    const ls2bw = new Uint32Array(cl + 1).fill(0)
+    const sumls = new Uint32Array(cl + 1).fill(0)
+
+    // 1. Map labels to original classes and count sizes
+    for (let i = 0; i < nvox; i++) {
+      const bwVal = bw[i]
+      const lsVal = ls[i]
+      // Only track if non-background (assuming 0 is bg)
+      if (lsVal > 0) {
+        ls2bw[lsVal] = bwVal
+        sumls[lsVal]++
+      }
+    }
+
+    // 2. Determine which components to keep
+    const keepLabel = new Uint8Array(cl + 1).fill(1) // Default keep
+
+    // For each component i
+    for (let i = 1; i <= cl; i++) {
+      const bwVal = ls2bw[i]
+
+      // Check if we should filter this class
+      const shouldFilter = (targetClasses === 'all') || (targetClasses.has && targetClasses.has(bwVal));
+
+      if (shouldFilter) {
+        // Check if there is a larger component j with same bwVal
+        for (let j = 1; j <= cl; j++) {
+          if (i === j) continue;
+          if (ls2bw[j] !== bwVal) continue;
+
+          if (sumls[j] > sumls[i]) {
+            keepLabel[i] = 0; // Suppress smaller
+            break;
+          } else if (sumls[j] === sumls[i] && j < i) { // Tie-break
+            // maintain strictly one
+            // Convention: keep lower index if sizes equal? 
+            // Logic in original was: if (i < j) zero out i? No.
+            // Original: if (sumls[i] == sumls[j] && i < j) ls2bw[i] = 0.
+            // This means if i < j, i is removed. So j is kept. larger index wins?
+            // Let's stick to original logic:
+            // "if (sumls[i] === sumls[j] && i < j) { ls2bw[i] = 0 }"
+            // Wait, if i < j, loop reaches j later.
+            // When checking i: compare with j. if equal and i < j, kill i.
+            // When checking j: compare with i. if equal and j > i, (j !< i) so don't kill j?
+            // Correct. Larger index keeps.
+            keepLabel[i] = 0;
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Reconstruct
+    const vxs = new Uint32Array(nvox).fill(0) // Default 0
+    let mxbw = 0
+    for (let i = 0; i < nvox; i++) {
+      // If we keep the label, restore original value
+      // ls[i] is component label
+      const comp = ls[i]
+      if (comp > 0 && keepLabel[comp]) {
+        vxs[i] = ls2bw[comp]
+        if (ls2bw[comp] > mxbw) mxbw = ls2bw[comp]
+      }
+    }
+    return [mxbw, vxs]
+  }
+
+  /**
+   * Filter clusters based on a size ratio threshold relative to the largest cluster for that class.
+   * Logic:
+   * 1. Find max size for each class.
+   * 2. Keep component if size >= max_size_of_class * minRatio.
+   * @param {Uint32Array} bw - Original voxel values (unused directly for filtering decision logic but used for return)
+   * @param {number} cl - Number of regions
+   * @param {Uint32Array} ls - Label map
+   * @param {number} minRatio - Threshold (e.g. 0.3)
+   */
+  filter_clusters_by_ratio(bw, cl, ls, minRatio) {
+    const nvox = bw.length
+    const ls2bw = new Uint32Array(cl + 1).fill(0)
+    const sumls = new Uint32Array(cl + 1).fill(0)
+
+    // 1. Map labels to original classes and count sizes
+    for (let i = 0; i < nvox; i++) {
+      // ls[i] is component label
+      const comp = ls[i]
+      if (comp > 0) {
+        // Mapping check (assuming consistent labeling)
+        if (ls2bw[comp] === 0) ls2bw[comp] = bw[i];
+        sumls[comp]++;
+      }
+    }
+
+    // 2. Determine Max Size per Class
+    // Map: ClassID -> MaxSize
+    const classMaxSize = new Map();
+    for (let i = 1; i <= cl; i++) {
+      const classID = ls2bw[i];
+      const size = sumls[i];
+      if (!classMaxSize.has(classID) || size > classMaxSize.get(classID)) {
+        classMaxSize.set(classID, size);
+      }
+    }
+
+    // 3. Determine validity
+    const keepLabel = new Uint8Array(cl + 1).fill(0);
+    for (let i = 1; i <= cl; i++) {
+      const classID = ls2bw[i];
+      const size = sumls[i];
+      const maxSize = classMaxSize.get(classID) || 0;
+
+      if (size >= maxSize * minRatio) {
+        keepLabel[i] = 1;
+      }
+    }
+
+    // 4. Reconstruct
+    const vxs = new Uint32Array(nvox).fill(0)
+    let mxbw = 0
+    for (let i = 0; i < nvox; i++) {
+      const comp = ls[i]
+      if (comp > 0 && keepLabel[comp]) {
+        vxs[i] = ls2bw[comp] // Restore Class Value
+        if (ls2bw[comp] > mxbw) mxbw = ls2bw[comp]
+      }
+    }
+    return [mxbw, vxs]
+  }
+
   // given a 3D image, return a clustered label map
   // for an explanation and optimized C code see
   // https://github.com/seung-lab/connected-components-3d
@@ -275,4 +410,63 @@ export class BWLabeler {
     }
     return [cl, ls]
   } // bwlabel()
+
+  /**
+   * Filter clusters based on rank (keep top K largest per class).
+   * @param {Uint32Array} bw - Original voxel values (unused directly for filtering decision logic but used for return)
+   * @param {number} cl - Number of regions
+   * @param {Uint32Array} ls - Label map
+   * @param {number} maxRank - Max number of components to keep per class (e.g. 2)
+   */
+  filter_clusters_by_rank(bw, cl, ls, maxRank) {
+    const nvox = bw.length
+    const ls2bw = new Uint32Array(cl + 1).fill(0)
+    const sumls = new Uint32Array(cl + 1).fill(0)
+
+    // 1. Map labels to original classes and count sizes
+    for (let i = 0; i < nvox; i++) {
+      const comp = ls[i]
+      if (comp > 0) {
+        if (ls2bw[comp] === 0) ls2bw[comp] = bw[i];
+        sumls[comp]++;
+      }
+    }
+
+    // 2. Group components by Class ID
+    const classComponents = new Map(); // ClassID -> [{compID, size}, ...]
+    for (let i = 1; i <= cl; i++) {
+      const classID = ls2bw[i];
+      const size = sumls[i];
+      if (!classComponents.has(classID)) {
+        classComponents.set(classID, []);
+      }
+      classComponents.get(classID).push({ i, size });
+    }
+
+    // 3. Mark which components to keep
+    const keepLabel = new Uint8Array(cl + 1).fill(0);
+
+    for (const [classID, components] of classComponents.entries()) {
+      // Sort descending by size
+      components.sort((a, b) => b.size - a.size);
+
+      // Keep top K
+      const count = Math.min(components.length, maxRank);
+      for (let k = 0; k < count; k++) {
+        keepLabel[components[k].i] = 1;
+      }
+    }
+
+    // 4. Reconstruct
+    const vxs = new Uint32Array(nvox).fill(0)
+    let mxbw = 0
+    for (let i = 0; i < nvox; i++) {
+      const comp = ls[i]
+      if (comp > 0 && keepLabel[comp]) {
+        vxs[i] = ls2bw[comp] // Restore Class Value
+        if (ls2bw[comp] > mxbw) mxbw = ls2bw[comp]
+      }
+    }
+    return [mxbw, vxs]
+  }
 }

@@ -53,7 +53,8 @@ const inferenceModelsList = [
     path: '/models/mindgrab/model.json',
     modelName: '\u{1FA93}\u{1F9E0} omnimodal Skull Stripping',
     webgpu_safetensor: './models/mindgrab/model.safetensors',
-    webgpu_runner: 'mindgrab',
+      webgpu_runner: 'mindgrab',
+      webgpuTTArunner: true,      
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -79,7 +80,8 @@ const inferenceModelsList = [
     path: '/models/model30chan18cls/model.json',
     modelName: '\u{1FA93} Subcortical + GWM',
     colormapPath: './models/model30chan18cls/colormap.json',
-    webgpu_safetensor: './models/model30chan18cls/model.safetensors', webgpu_runner: 'model30chan18cls',
+      webgpu_safetensor: './models/model30chan18cls/model.safetensors', webgpu_runner: 'model30chan18cls',
+      webgpuTTArunner: true,      
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -104,7 +106,8 @@ const inferenceModelsList = [
     path: '/models/model30chan50cls/model.json',
     modelName: '\u{1F52A} Aparc+Aseg 50',
     colormapPath: './models/model30chan50cls/colormap.json',
-    webgpu_safetensor: './models/model30chan50cls/model.safetensors', webgpu_runner: 'model30chan50cls',
+      webgpu_safetensor: './models/model30chan50cls/model.safetensors', webgpu_runner: 'model30chan50cls',
+          webgpuTTArunner: true,      
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -129,14 +132,15 @@ const inferenceModelsList = [
     path: '/models/model21_104class/model.json',
     modelName: '\u{1F52A} Aparc+Aseg 104',
     colormapPath: './models/model21_104class/colormap.json',
-    webgpu_safetensor: './models/model21_104class/model.safetensors', webgpu_runner: 'model21', // 'model21_104class',
+      webgpu_safetensor: './models/model21_104class/model.safetensors', webgpu_runner: 'model21', // 'model21_104class',
     preModelId: 1, // model run first e.g.  Brain_Extraction  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
     numOverlapBatches: 200, // Number of extra overlap batches for inference
     enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
     enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
-    cropPadding: 0, // Padding size add to cropped brain
+      cropPadding: 0, // Padding size add to cropped brain
+      ttaFlipAxis: 2, // Axis to flip for TTA (1 = Depth/Width depending on transpose)
     autoThreshold: 0, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
     enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
     filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas

@@ -799,23 +799,71 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
   if (opts.isPostProcessEnable) {
     console.log('Applying CPU-based connected-component labeling...');
     const bwStartTime = performance.now();
-
     const BWInstance = new BWLabeler();
-    const [_labelCount, labeledImage] = BWInstance.bwlabel(
-      segmentationData,
-      Vshape,
-      26,    // conn
-      true,  // binarize
-      true   // onlyLargestClusterPerClass
-    );
 
-    // This loop applies the mask IN-PLACE, which is very efficient.
-    for (let i = 0; i < segmentationData.length; i++) {
-      segmentationData[i] *= labeledImage[i];
+    let binarize = false;
+    let onlyLargest = false;
+    // Determine strategy based on model ID
+    if ([1, 7].includes(modelEntry.id)) {
+      // 3-class (1, 7): Use Ratio logic (0.2) to keep significant disconnected components
+      binarize = false;
+      onlyLargest = false; // We handle filtering manually
+    } else if (modelEntry.id === 5) {
+      // 104-class (5): Use Strict Largest (as before)
+      binarize = false;
+      onlyLargest = true;
+    } else if ([3, 8, 9].includes(modelEntry.id)) {
+      // 18-class: Mixed logic (targets only)
+      binarize = false;
+      onlyLargest = false;
+    } else {
+      // 50-class (4), Brain Extractions, Masks, etc.
+      // Default legacy behavior: Binarize first, then keep largest blob.
+      binarize = true;
+      onlyLargest = true;
+    }
+
+    if ([1, 7].includes(modelEntry.id)) {
+      // 3-Class Rank Logic (Keep top 2 components per class)
+      const [cl, ls] = BWInstance.bwlabel(segmentationData, Vshape, 6, false, false);
+      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2);
+      segmentationData.set(filtered);
+    } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
+      // Mixed case (18-class)
+      // Get raw components
+      const [cl, ls] = BWInstance.bwlabel(segmentationData, Vshape, 6, false, false);
+
+      // Calculate targets (Explicit IDs for 18-class model)
+      // 1: Cerebral-White-Matter
+      // 2: Cerebral-Cortex
+      // 5: Cerebellum-White-Matter
+      // 6: Cerebellum-Cortex
+      // 13: Brain-Stem
+      const targetClasses = new Set([1, 2, 5, 6, 13]);
+
+      // Apply mixed filter
+      const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses);
+      segmentationData.set(filtered);
+
+    } else {
+      // Standard cases (Legacy or Per-Class Strict)
+      const [_res1, res2] = BWInstance.bwlabel(segmentationData, Vshape, 6, binarize, onlyLargest);
+
+      if (binarize) {
+        // res2 is binary mask (0/1). Apply to segmentationData to clean it.
+        // This preserves original classes inside the mask.
+        for (let i = 0; i < segmentationData.length; i++) {
+          segmentationData[i] *= res2[i];
+        }
+      } else {
+        // res2 contains the filtered class IDs directly.
+        // We replace segmentationData with it.
+        segmentationData.set(res2);
+      }
     }
 
     const bwTime = ((performance.now() - bwStartTime) / 1000).toFixed(4);
-    console.log(`Connected-component labeling took: ${bwTime} seconds.`); // <-- This will likely show ~0.5 seconds.
+    console.log(`Connected-component labeling took: ${bwTime} seconds.`);
   }
 
   // --- Step 3: Apply Final Model Logic on the CPU ---
@@ -836,7 +884,10 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       return maskedData;
     }
     default: {
-      // For other cases, return the (potentially modified) segmentation data.
+      // For other cases, return the (potentially modified) segmentationData.
+      // Make sure to return correct TypedArray (Uint8Array usually expected by display)
+      // Original code returned Uint8Array. 
+      // segmentationData is Int32Array (from tensor download).
       return new Uint8Array(segmentationData);
     }
   }
