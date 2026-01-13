@@ -24,27 +24,61 @@ export async function cropAndGetCorner(tensor3d, mask_3d, userPadding) {
   const [safeDepthStart, safeDepthEnd] = adjustCorner(depth_min, depth_max, depth, userPadding);
 
   // Extract cropped brain with safe bounds
-  const cropped = tensor3d.slice(
+  let cropped = tensor3d.slice(
     [safeRowStart, safeColStart, safeDepthStart],
     [safeRowEnd - safeRowStart + 1, safeColEnd - safeColStart + 1, safeDepthEnd - safeDepthStart + 1]
   );
 
-  return { cropped, corner: [safeRowStart, safeColStart, safeDepthStart] };
+  // Ensure dimensions are even for stride-2 alignment (important for SpatialAE models)
+  // Use zero-padding at the END, matching run_inference.py logic
+  const shape = cropped.shape;
+  const padRow = shape[0] % 2;
+  const padCol = shape[1] % 2;
+  const padDepth = shape[2] % 2;
+
+  if (padRow || padCol || padDepth) {
+    cropped = cropped.pad([
+      [0, padRow],
+      [0, padCol],
+      [0, padDepth]
+    ]);
+    console.log(`Padded to even dims: [${shape}] -> [${cropped.shape}]`);
+  } else {
+    console.log(`Crop dimensions (already even): [${shape}]`);
+  }
+
+  return { cropped, corner: [safeRowStart, safeColStart, safeDepthStart], padding: [padRow, padCol, padDepth] };
 }
 
 
-export async function restoreTo256Cube(tensor3d, corner) {
+
+
+export async function restoreToOriginalSize(tensor3d, corner, targetShape, shift = [0, 0, 0]) {
   const [row_min, col_min, depth_min] = corner;
+  const [targetHeight, targetWidth, targetDepth] = targetShape;
   const [height, width, depth] = tensor3d.shape;
+  const [sRow, sCol, sDepth] = shift || [0, 0, 0];
+
+  const padRow = Math.max(0, row_min + sRow);
+  const padCol = Math.max(0, col_min + sCol);
+  const padDepth = Math.max(0, depth_min + sDepth);
 
   const paddings = [
-    [row_min, Math.max(0, 256 - height - row_min)],
-    [col_min, Math.max(0, 256 - width - col_min)],
-    [depth_min, Math.max(0, 256 - depth - depth_min)]
+    [padRow, Math.max(0, targetHeight - height - padRow)],
+    [padCol, Math.max(0, targetWidth - width - padCol)],
+    [padDepth, Math.max(0, targetDepth - depth - padDepth)]
   ];
 
-  return tensor3d.pad(paddings);
+  const padded = tensor3d.pad(paddings);
+  // Ensure we enforce the target shape (truncate if padding exceeded dimensions)
+  if (padded.shape[0] > targetHeight || padded.shape[1] > targetWidth || padded.shape[2] > targetDepth) {
+    const sliced = padded.slice([0, 0, 0], [targetHeight, targetWidth, targetDepth]);
+    padded.dispose();
+    return sliced;
+  }
+  return padded;
 }
+
 
 export async function addZeroPaddingTo3dTensor(tensor3d, rowPadArr = [1, 1], colPadArr = [1, 1], depthPadArr = [1, 1]) {
   if (tensor3d.rank !== 3) {

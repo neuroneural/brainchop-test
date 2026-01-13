@@ -316,8 +316,13 @@ async function main() {
     // 1. Try WebGPU
     if (isWebGpuAvailable && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
+
+      // Get UI state for TTA
+      const useTTA = document.getElementById('ttaCheck') ? document.getElementById('ttaCheck').checked : false;
+      const currentModelEntry = { ...modelEntry, enableTTA: useTTA };
+
       try {
-        await runInferenceWebGpu(gpuDevice, opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+        await runInferenceWebGpu(gpuDevice, opts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
         return; // Success
       } catch (e) {
         console.error("WebGPU inference failed, falling back to WebWorker.", e);
@@ -338,8 +343,9 @@ async function main() {
 
     const runWorker = (useSeqConv) => {
       return new Promise((resolve, reject) => {
+        const useTTA = document.getElementById('ttaCheck').checked;
         const currentOpts = { ...opts, enableSeqConv: useSeqConv };
-        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv };
+        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv, enableTTA: useTTA };
 
         chopWorker = new MyWorker({ type: "module" });
         chopWorker.postMessage({ opts: currentOpts, modelEntry: currentModelEntry, niftiHeader: plainNiftiHeader, niftiImage });

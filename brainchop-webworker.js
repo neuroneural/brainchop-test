@@ -445,7 +445,8 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
   console.log('Batch size: ', batchSize)
   console.log('Num of Channels: ', numOfChan)
   const model = await load_model(opts.rootURL + modelEntry.path)
-  await enableProductionMode(true)
+  const useF16 = modelEntry.forceFP32 ? false : true;
+  await enableProductionMode(useF16)
   statData.TF_Backend = tf.getBackend()
   const modelObject = model
 

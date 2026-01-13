@@ -7,7 +7,7 @@ import {
   LayerNormInPlace,
   firstLastNonZero3D,
   cropAndGetCorner,
-  restoreTo256Cube,
+  restoreToOriginalSize,
   isModelChnlLast,
   minMaxNormalizeVolumeData,
   quantileNormalizeVolumeData,
@@ -61,13 +61,47 @@ export async function runFullVolumeInference(
     mask_3d = await pipeline1_out.greater([0]).asType('bool');
   }
 
+  // Capture original dimensions for restoration
+  const originalVolumeShape = slices_3d.shape;
+
+  // Cropping and Padding
   // Cropping and Padding
   const pad = modelEntry.cropPadding;
-  let { cropped: cropped_slices_3d_w_pad, corner: refVoxel } = await cropAndGetCorner(slices_3d, mask_3d, pad);
-  slices_3d.dispose();
+  let cropped_slices_3d_w_pad, refVoxel, padInfo;
+
+  if (modelEntry.enableCrop) {
+    const cropResult = await cropAndGetCorner(slices_3d, mask_3d, pad);
+    cropped_slices_3d_w_pad = cropResult.cropped;
+    refVoxel = cropResult.corner;
+    padInfo = cropResult.padding;
+    slices_3d.dispose();
+  } else {
+    console.log('Skipping cropping (enableCrop: false)');
+    // Enforce Even Dimensions (Model Requirement)
+    const shape = slices_3d.shape;
+    const padRow = shape[0] % 2;
+    const padCol = shape[1] % 2;
+    const padDepth = shape[2] % 2;
+
+    if (padRow || padCol || padDepth) {
+      console.log(`Padding standard input to even: ${shape} -> +[${padRow}, ${padCol}, ${padDepth}]`);
+      cropped_slices_3d_w_pad = slices_3d.pad([[0, padRow], [0, padCol], [0, padDepth]]);
+      padInfo = [padRow, padCol, padDepth]; // Scalars, compatible with unpadding logic
+      slices_3d.dispose();
+    } else {
+      cropped_slices_3d_w_pad = slices_3d;
+      padInfo = null;
+    }
+    refVoxel = [0, 0, 0];
+    // Do NOT dispose slices_3d if took ownership
+  }
+
   mask_3d.dispose();
 
-  if (modelEntry.enableTranspose) {
+  if (modelEntry.inputPermutation) {
+    console.log(`Permuting Input: ${modelEntry.inputPermutation}`);
+    cropped_slices_3d_w_pad = cropped_slices_3d_w_pad.transpose(modelEntry.inputPermutation);
+  } else if (modelEntry.enableTranspose) {
     cropped_slices_3d_w_pad = cropped_slices_3d_w_pad.transpose();
     console.log('Input transposed for pre-model');
   }
@@ -76,6 +110,18 @@ export async function runFullVolumeInference(
   const res = await model;
   const layersLength = res.layers.length;
   const isChannelLast = isModelChnlLast(res);
+
+  // Debug: Log Activations
+  console.log("--- Model Architecture Debug ---");
+  res.layers.forEach((l, idx) => {
+    let act = "unknown";
+    try {
+      act = l.activation ? l.activation.getClassName() : (l.activation === null ? "null (linear?)" : "none");
+      // Some layers like InputLayer don't have activation
+    } catch (e) { }
+    console.log(`Layer ${idx}: ${l.name} (${l.getClassName()}) -> Activation: ${act}`);
+  });
+  console.log("--------------------------------");
 
   // Adjust model input shape (common logic)
   let adjusted_input_shape;
@@ -126,84 +172,119 @@ export async function runFullVolumeInference(
     }
   }
 
-  // --- 3. MAIN INFERENCE LOOP with ROBUST MEMORY MANAGEMENT ---
-  let i = 1;
-  const startTime = performance.now();
+  async function runModelInferenceLoop(res, inputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI) {
+    let i = 1;
+    let currentOutputTensor = inputTensor;
 
-  // GPU Sync Tuning (applies to both strategies)
-  const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-  const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
-  let SYNC_GPU_EVERY_N_LAYERS = (isSafari || isFirefox) ? 10 : 15;
-  if (modelEntry.enableSeqConv) {
-    SYNC_GPU_EVERY_N_LAYERS = 1;
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
+    let SYNC_GPU_EVERY_N_LAYERS = (isSafari || isFirefox) ? 10 : 15;
+    if (modelEntry.enableSeqConv) {
+      SYNC_GPU_EVERY_N_LAYERS = 1;
+    }
+    console.log(`Syncing GPU every ${SYNC_GPU_EVERY_N_LAYERS} layers.`);
+
+    while (i <= loopEnd) {
+      try {
+        let nextTensor;
+        if (modelEntry.enableSeqConv && res.layers[i].activation.getClassName() === 'linear') {
+          const convFunction = res.layers[i].name.endsWith('_gn')
+            ? gn_convByOutputChannelAndInputSlicing
+            : convByOutputChannelAndInputSlicing;
+
+          nextTensor = await convFunction(
+            currentOutputTensor,
+            res.layers[i].getWeights()[0],
+            res.layers[i].getWeights()[1],
+            res.layers[i].strides,
+            res.layers[i].padding,
+            res.layers[i].dilationRate,
+            3
+          );
+        } else {
+          nextTensor = tf.tidy(() => {
+            let resultTensor = res.layers[i].apply(currentOutputTensor);
+            if (res.layers[i].name.endsWith('_gn')) {
+              resultTensor = LayerNormInPlace(resultTensor);
+            }
+            return resultTensor;
+          });
+        }
+
+        currentOutputTensor.dispose();
+        currentOutputTensor = nextTensor;
+
+      } catch (err) {
+        callbackUI(err.message, -1, err.message);
+        tf.engine().endScope();
+        tf.engine().disposeVariables();
+        markFailure(statData, err, 'Failed while model layer ' + i + ' apply');
+        callbackUI('', -1, '', statData);
+        throw err;
+      }
+
+      if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
+        console.log(`Layer ${i}... (Syncing GPU)`);
+        callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
+        const firstElement = currentOutputTensor.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]);
+        await firstElement.data();
+        firstElement.dispose();
+      } else {
+        callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
+      }
+
+      console.log(`Layer ${i} output shape: `, currentOutputTensor.shape);
+      i++;
+    }
+    return currentOutputTensor;
   }
-  console.log(`Syncing GPU every ${SYNC_GPU_EVERY_N_LAYERS} layers.`);
 
-  // The loop termination condition depends on the strategy
-  // Skip the final layer if enableSeqConv OR useChunkedArgMax (both need chunked final processing)
+  // --- 3. MAIN INFERENCE (TTA Enabled) ---
+  const startTime = performance.now();
   const skipFinalLayer = modelEntry.enableSeqConv || useChunkedArgMax;
   const loopEnd = skipFinalLayer ? layersLength - 2 : layersLength - 1;
 
-  while (i <= loopEnd) {
-    try {
-      // --- STRATEGY SELECTION ---
-      let nextTensor;
-      if (modelEntry.enableSeqConv && res.layers[i].activation.getClassName() === 'linear') {
-        // The fix is to await the async function directly, without a tidy() wrapper.
-        const convFunction = res.layers[i].name.endsWith('_gn')
-          ? gn_convByOutputChannelAndInputSlicing
-          : convByOutputChannelAndInputSlicing;
 
-        nextTensor = await convFunction(
-          currentOutputTensor,
-          res.layers[i].getWeights()[0],
-          res.layers[i].getWeights()[1],
-          res.layers[i].strides,
-          res.layers[i].padding,
-          res.layers[i].dilationRate,
-          3
-        );
 
-      } else {
-        // STRATEGY 1: Standard Layer Apply
-        nextTensor = tf.tidy(() => {
-          let resultTensor = res.layers[i].apply(currentOutputTensor);
-          if (res.layers[i].name.endsWith('_gn')) {
-            resultTensor = LayerNormInPlace(resultTensor);
-          }
-          return resultTensor;
-        });
-      }
+  if (modelEntry.enableTTA) {
+    console.log('--- Running TTA Pass 1 (Original) ---');
+    // input1 is the reshaped 5D tensor from line 97
+    const input1 = currentOutputTensor;
+    // Note: runModelInferenceLoop disposes input1.
+    const logits1 = await runModelInferenceLoop(res, input1, loopEnd, layersLength, modelEntry, statData, callbackUI);
 
-      // Universal memory management for the loop
-      currentOutputTensor.dispose();
-      currentOutputTensor = nextTensor;
+    if (!logits1) throw new Error("TTA Error: logits1 is null or undefined");
 
-    } catch (err) {
-      // Universal error handling
-      callbackUI(err.message, -1, err.message);
-      tf.engine().endScope()
-      tf.engine().disposeVariables()
+    console.log('--- Running TTA Pass 2 (Flipped) ---');
+    const flipAxis = modelEntry.ttaFlipAxis || 1;
+    // input2 must be 5D. Reverse 3D then reshape.
+    const input2 = cropped_slices_3d_w_pad.clone().reverse(flipAxis).reshape(adjusted_input_shape);
+    const logits2 = await runModelInferenceLoop(res, input2, loopEnd, layersLength, modelEntry, statData, callbackUI);
 
-      markFailure(statData, err, 'Failed while model layer ' + i + ' apply')
+    if (!logits2) throw new Error("TTA Error: logits2 is null or undefined");
 
-      callbackUI('', -1, '', statData)
-      return 0;
-    }
+    console.log('--- Averaging TTA Results ---');
+    // WebGL cannot reverse rank-5 tensors. Reshape to 4D -> Reverse -> Reshape back.
+    const logits2_flipped = tf.tidy(() => {
+      const shape = logits2.shape; // [B, D, H, W, C]
+      // Flatten B and D to create 4D [B*D, H, W, C]. Axis mapping works for 0,1,2.
+      return logits2.reshape([shape[0] * shape[1], shape[2], shape[3], shape[4]])
+        .reverse(flipAxis)
+        .reshape(shape);
+    });
 
-    // Universal GPU Sync and UI Callback
-    if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
-      console.log(`Layer ${i}... (Syncing GPU)`);
-      callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
-      const firstElement = currentOutputTensor.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]);
-      await firstElement.data();
-      firstElement.dispose();
-    } else {
-      callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
-    }
+    // Use instance method to avoid potential issue with tf.add shim
+    currentOutputTensor = logits1.add(logits2_flipped).div(2.0);
 
-    console.log(`Layer ${i} output shape: `, currentOutputTensor.shape);
-    i++;
+    logits1.dispose();
+    logits2.dispose();
+    logits2_flipped.dispose();
+    // input1/input2 disposed by loop logic
+    cropped_slices_3d_w_pad.dispose();
+  } else {
+    // Standard execution: Use the 5D tensor prepared at line 97
+    currentOutputTensor = await runModelInferenceLoop(res, currentOutputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI);
+    cropped_slices_3d_w_pad.dispose();
   }
 
   // --- 4. FINAL PROCESSING (Conditional based on strategy) ---
@@ -250,18 +331,35 @@ export async function runFullVolumeInference(
   console.log(`---- Inference Time: ${Inference_t} seconds ----`);
 
   // Transpose back if needed
-  if (modelEntry.enableTranspose) {
+  if (modelEntry.outputPermutation) {
+    console.log(`Permuting Output: ${modelEntry.outputPermutation}`);
+    outLabelVolume = outLabelVolume.transpose(modelEntry.outputPermutation);
+  } else if (modelEntry.enableTranspose) {
     console.log('outLabelVolume transposed');
     outLabelVolume = outLabelVolume.transpose();
   }
 
   //Restore to original volume size
   const PaddingStartTime = performance.now();
+  // Remove padding if it was added for even dimensions
+  if (padInfo && (padInfo[0] || padInfo[1] || padInfo[2])) {
+    const shape = outLabelVolume.shape;
+    const newShape = [
+      shape[0] - padInfo[0],
+      shape[1] - padInfo[1],
+      shape[2] - padInfo[2]
+    ];
+    const unpadded = outLabelVolume.slice([0, 0, 0], newShape);
+    outLabelVolume.dispose();
+    outLabelVolume = unpadded;
+    console.log(`Removed padding: [${shape}] -> [${outLabelVolume.shape}]`);
+  }
+
   console.log('outLabelVolume without padding shape: ', outLabelVolume.shape);
-  outLabelVolume = await restoreTo256Cube(outLabelVolume, refVoxel);
-  console.log('outLabelVolume final shape after padding to 256: ', outLabelVolume.shape);
+  outLabelVolume = await restoreToOriginalSize(outLabelVolume, refVoxel, originalVolumeShape, modelEntry.outputShift);
+  console.log('outLabelVolume final shape after restoration: ', outLabelVolume.shape);
   const Padding_t = ((performance.now() - PaddingStartTime) / 1000).toFixed(4);
-  console.log(`---- Padding back to 256^3 Time: ${Padding_t} seconds ----`);
+  console.log(`---- Restoration Time: ${Padding_t} seconds ----`);
 
   const postProcessStartTime = performance.now();
   const outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);

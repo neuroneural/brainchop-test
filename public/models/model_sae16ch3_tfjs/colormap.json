@@ -1,0 +1,6 @@
+{
+    "R": [ 0, 205, 255],
+    "G": [ 0, 62, 255],
+    "B": [ 0, 78, 255],
+    "labels": [ "background", "Grey Matter", "White Matter"]
+}

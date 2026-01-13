@@ -51,12 +51,23 @@ function findRunnerModule(runnerName) {
 
 // Helper to safely setup the network
 async function setupNetwork(device, modelEntry, callbackUI) {
-    const runnerModule = findRunnerModule(modelEntry.webgpu_runner);
+    let runnerName = modelEntry.webgpu_runner;
+    let weightsPath = modelEntry.webgpu_safetensor;
+
+    // --- TTA SUPPORT LOGIC ---
+    if (modelEntry.enableTTA && modelEntry.webgpuTTArunner) {
+        console.log(`[WebGPU] TTA Enabled: Switching to TTA runner and weights.`);
+        runnerName = `${runnerName}_tta`;
+        // Assumption: TTA weights are in the same folder with '_tta' suffix before .safetensors
+        weightsPath = weightsPath.replace('.safetensors', '_tta.safetensors');
+    }
+
+    const runnerModule = findRunnerModule(runnerName);
 
     if (!runnerModule) {
         const available = getAvailableRunners();
         throw new Error(
-            `Runner '${modelEntry.webgpu_runner}' not found. ` +
+            `Runner '${runnerName}' not found. ` +
             `Available runners: ${available.join(', ') || 'none'}. ` +
             `Looking in: ./webgpu_runners/`
         );
@@ -65,7 +76,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     // Validate the module has the expected export
     if (!runnerModule.setupNet && !runnerModule.default?.setupNet) {
         throw new Error(
-            `Runner module '${modelEntry.webgpu_runner}' doesn't export 'setupNet'. ` +
+            `Runner module '${runnerName}' doesn't export 'setupNet'. ` +
             `Exported keys: ${Object.keys(runnerModule).join(', ')}`
         );
     }
@@ -73,14 +84,14 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     // Try to fetch the weights file with error handling
     let weightsBuffer;
     try {
-        const response = await fetch(modelEntry.webgpu_safetensor);
+        const response = await fetch(weightsPath);
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         weightsBuffer = await response.arrayBuffer();
     } catch (error) {
         throw new Error(
-            `Failed to load weights from '${modelEntry.webgpu_safetensor}': ${error.message}`
+            `Failed to load weights from '${weightsPath}': ${error.message}`
         );
     }
 
@@ -92,7 +103,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         return await setupNet(device, new Uint8Array(weightsBuffer), callbackUI);
     } catch (error) {
         throw new Error(
-            `Failed to setup network for '${modelEntry.webgpu_runner}': ${error.message}`
+            `Failed to setup network for '${runnerName}': ${error.message}`
         );
     }
 }

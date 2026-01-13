@@ -28,7 +28,8 @@ const inferenceModelsList = [
     path: '/models/model5_gw_ae/model.json',
     modelName: '\u26A1 Tissue GWM (light)',
     colormapPath: './models/model5_gw_ae/colormap3.json',
-    webgpu_safetensor: './models/model5_gw_ae/model.safetensors', webgpu_runner: 'model5', //'model5_gw_ae',
+      webgpu_safetensor: './models/model5_gw_ae/model.safetensors', webgpu_runner: 'model5', //'model5_gw_ae',
+          webgpuTTArunner: true,
     preModelId: null, // Model run first e.g.  crop the brain   { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -156,16 +157,23 @@ const inferenceModelsList = [
   {
     id: 7,
     type: 'Segmentation',
-    path: '/models/model20chan3cls/model.json',
-    modelName: '\u{1F52A} Tissue GWM (High Acc)',
-    colormapPath: './models/model20chan3cls/colormap.json',
+    path: '/models/model_sae16ch3_tfjs/model.json',
+    modelName: '\u{1FA93} Tissue GWM',
+    colormapPath: './models/model_sae16ch3_tfjs/colormap.json',
+    webgpu_safetensor: './models/model_sae16ch3_tfjs/model.safetensors', webgpu_runner: 'robust_tissue', // 'model21_104class',
+    webgpuTTArunner: true,
     preModelId: null, // Model run first e.g.  crop the brain   { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
     numOverlapBatches: 0, // Number of extra overlap batches for inference
-    enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
-    enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
+    enableTranspose: false, // Keras and tfjs input orientation may need a tranposing step to be matched
+    enableCrop: false, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
     cropPadding: 0, // Padding size add to cropped brain
+    inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
+    outputPermutation: null, // Inverse of inputPermutation.
+    outputShift: [0, 0, 1], // Manual shift correction [Row, Col, Depth]
+    forceFP32: false, // Force float32 precision for better quality
+    ttaFlipAxis: 0, // Axis to flip for TTA (1 = Depth/Width depending on transpose)
     autoThreshold: 0.2, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
     enableQuantileNorm: true, // Some models needs Quantile Normaliztion.
     filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
@@ -175,7 +183,7 @@ const inferenceModelsList = [
       "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
     inferenceDelay: 100, // Delay in ms time while looping layers applying.
     description:
-      'Gray and white matter segmentation model. Operates on full T1 image in a single pass but needs a dedicated graphics card to operate. Provides the best accuracy with hard cropping for better speed'
+      'Omnimodal gray and white matter segmentation model using SpatialAE architecture with swish activation. Operates on full T1 image in a single pass but needs a dedicated graphics card to operate.'
   },
   {
     id: 8,
@@ -204,6 +212,37 @@ const inferenceModelsList = [
   },
   {
     id: 9,
+    type: 'Atlas',
+    path: '/models/model_sae32ch18_tfjs/model.json',
+    modelName: '\u{1FA93} Subcortical + GWM (Large Model)',
+    colormapPath: './models/model_sae32ch18_tfjs/colormap.json',
+    webgpu_safetensor: './models/model_sae32ch18_tfjs/model.safetensors', webgpu_runner: 'robust_subcortical',
+    webgpuTTArunner: true,
+    preModelId: null, // model run first e.g.  Brain_Extraction  { null, 1, 2, ..  }
+    preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
+    isBatchOverlapEnable: false, // create extra overlap batches for inference
+    numOverlapBatches: 200, // Number of extra overlap batches for inference
+    enableTranspose: false, // Keras and tfjs input orientation may need a tranposing step to be matched
+    enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
+    cropPadding: 0, // Padding size add to cropped brain
+    inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
+    outputPermutation: null, // Inverse of inputPermutation.
+    outputShift: [0, 0, 1], // Manual shift correction [Row, Col, Depth]
+    forceFP32: false, // Force float32 precision for better quality
+    ttaFlipAxis: 0, // Axis to flip for TTA (1 = Depth/Width depending on transpose)      
+    autoThreshold: 0.2, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
+    enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
+    filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
+    enableSeqConv: false, // For low memory system and low configuration, enable sequential convolution instead of last layer
+    textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
+    warning:
+      "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.", // Warning message to show when select the model.
+    inferenceDelay: 100, // Delay in ms time while looping layers applying.
+    description:
+      'Parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. This is a larger capacity version of the 18-class model for potentially better robustness.'
+  },
+  {
+    id: 10,
     type: 'Brain_Extraction',
     path: '/models/model5_gw_ae/model.json',
     modelName: '\u26A1 Extract the Brain (FAST)',
@@ -225,7 +264,7 @@ const inferenceModelsList = [
       'Extract the brain fast model operates on full T1 image in a single pass, but uses only 5 filters per layer. Can work on integrated graphics cards but is barely large enough to provide good accuracy. Still more accurate than the failsafe version.'
   },
   {
-    id: 10,
+    id: 11,
     type: 'Brain_Extraction',
     path: '/models/model11_gw_ae/model.json',
     modelName: '\u{1F52A} Extract the Brain (High Acc, Slow)',
@@ -248,7 +287,7 @@ const inferenceModelsList = [
       'Extract the brain high accuracy model operates on full T1 image in a single pass, but uses only 11 filters per layer. Can work on dedicated graphics cards. Still more accurate than the fast version.'
   },
   {
-    id: 11,
+    id: 12,
     type: 'Brain_Masking',
     path: '/models/model5_gw_ae/model.json',
     modelName: '\u26A1 Brain Mask (FAST)',
@@ -271,7 +310,7 @@ const inferenceModelsList = [
       'This fast masking model operates on full T1 image in a single pass, but uses only 5 filters per layer. Can work on integrated graphics cards but is barely large enough to provide good accuracy. Still more accurate than failsafe version.'
   },
   {
-    id: 12,
+    id: 13,
     type: 'Brain_Masking',
     path: '/models/model11_gw_ae/model.json',
     modelName: '\u{1F52A} Brain Mask (High Acc, Low Mem)',
