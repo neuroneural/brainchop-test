@@ -829,8 +829,18 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2);
       segmentationData.set(filtered);
     } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
-      // Mixed case (18-class)
-      // Get raw components
+      // Mixed case (18-class) - Hierarchical approach:
+      // Step 1: Binary largest connected component to establish brain boundary
+      // This removes all disconnected noise/artifacts in one sweep
+      const [_cl1, binaryMask] = BWInstance.bwlabel(segmentationData, Vshape, 6, true, true);
+
+      // Apply binary mask to remove all disconnected voxels
+      for (let i = 0; i < segmentationData.length; i++) {
+        segmentationData[i] *= binaryMask[i];
+      }
+
+      // Step 2: Per-class filtering on the cleaned data
+      // Get raw components from the masked (cleaned) segmentation
       const [cl, ls] = BWInstance.bwlabel(segmentationData, Vshape, 6, false, false);
 
       // Calculate targets (Explicit IDs for 18-class model)
@@ -841,7 +851,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // 13: Brain-Stem
       const targetClasses = new Set([1, 2, 5, 6, 13]);
 
-      // Apply mixed filter
+      // Apply mixed filter to keep only largest component for target classes
       const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses);
       segmentationData.set(filtered);
 
