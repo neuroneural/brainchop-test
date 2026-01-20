@@ -115,6 +115,8 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
     statData.isModelFullVol = true;
 
     let outLabelVolume; // To hold the tensor for final disposal
+    let collectedBuffers = []; // Track WebGPU buffers for cleanup
+    let originalCreateBuffer = null; // To restore the original method
 
     try {
         // Validate inputs
@@ -128,6 +130,19 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         if (!modelEntry?.webgpu_safetensor) {
             throw new Error('Model entry must specify webgpu_safetensor property');
+        }
+
+        // --- MEMORY LIMIT CHECK ---
+        // Dynamically check if device supports the required storage buffer size for this model.
+        // Default to ~320MB (model5) if not specified to be safe.
+        const requiredStorageBuffer = modelEntry.webgpuStorageSize || 335544320;
+
+        if (device.limits && device.limits.maxStorageBufferBindingSize < requiredStorageBuffer) {
+            const limitMB = (device.limits.maxStorageBufferBindingSize / (1024 * 1024)).toFixed(0);
+            const requiredMB = (requiredStorageBuffer / (1024 * 1024)).toFixed(0);
+            console.warn(`[WebGPU] maxStorageBufferBindingSize (${limitMB} MB) is less than required (${requiredMB} MB). Inference may fail.`);
+            // Low memory on Windows is a common failure cause.
+            callbackUI(`Warning: Device storage buffer limit (${limitMB} MB) is low (needs ${requiredMB} MB).`, -1);
         }
 
         // --- PRE-PROCESSING: FULL VOLUME ---
@@ -159,35 +174,18 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         // --- DYNAMIC RUNNER & INFERENCE ---
         callbackUI('Loading model runner...', 0.4);
 
-        // Track resources for cleanup
-        const resources = [];
+        // Track resources for cleanup using a temporary shim
+        // We shim createBuffer to track resources without using a Proxy (which caused issues on Windows)
+        if (device) {
+            originalCreateBuffer = device.createBuffer.bind(device);
+            device.createBuffer = (descriptor) => {
+                const buffer = originalCreateBuffer(descriptor);
+                collectedBuffers.push(buffer);
+                return buffer;
+            };
+        }
 
-        // Proxy the device to intercept createBuffer calls
-        const proxyDevice = new Proxy(device, {
-            get(target, prop, receiver) {
-                // FIX: Access property directly on target to satisfy native getters
-                const value = target[prop];
-
-                // Intercept createBuffer
-                if (prop === 'createBuffer' && typeof value === 'function') {
-                    return function (...args) {
-                        // FIX: Use 'target' (the actual device) as 'this', not the proxy
-                        const buffer = value.apply(target, args);
-                        resources.push(buffer);
-                        return buffer;
-                    };
-                }
-
-                // Bind other functions to the original device
-                if (typeof value === 'function') {
-                    return value.bind(target);
-                }
-
-                return value;
-            }
-        });
-
-        const execute = await setupNetwork(proxyDevice, modelEntry, callbackUI);
+        const execute = await setupNetwork(device, modelEntry, callbackUI);
 
         if (typeof execute !== 'function') {
             throw new Error(
@@ -258,6 +256,8 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             errorMessage += '. Check that the runner file exists and the name matches.';
         } else if (error.message.includes('fetch')) {
             errorMessage += '. Check network connection and file paths.';
+        } else if (error.message.includes('binding size')) {
+            errorMessage += '. GPU memory limit exceeded.';
         }
 
         markFailure(statData, errorMessage, 'WebGPU inference failed');
@@ -272,11 +272,19 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         }
 
         // Clean up WebGPU resources
-        if (typeof resources !== 'undefined' && resources.length > 0) {
-            console.log(`Cleaning up ${resources.length} WebGPU buffers...`);
-            for (const buffer of resources) {
+        // Clean up WebGPU resources
+        // Restore original createBuffer immediately
+        if (originalCreateBuffer && device) {
+            device.createBuffer = originalCreateBuffer;
+        }
+
+        // Clean up WebGPU resources
+        if (collectedBuffers && collectedBuffers.length > 0) {
+            // console.log(`Cleaning up ${collectedBuffers.length} WebGPU buffers...`);
+            for (const buffer of collectedBuffers) {
                 buffer.destroy();
             }
+            collectedBuffers = [];
         }
     }
 }
