@@ -309,7 +309,10 @@ async function main() {
     const modelEntry = inferenceModelsList[selectedModelIndex];
 
     const opts = { ...brainChopOpts };
-    opts.rootURL = window.location.origin + import.meta.env.BASE_URL;
+    // Fix URL construction to handle './' base correctly and allow subfolders
+    const rootUrl = new URL(import.meta.env.BASE_URL, window.location.href).href;
+    // Remove trailing slash if present to avoid double slashes when appending paths starting with /
+    opts.rootURL = rootUrl.endsWith('/') ? rootUrl.slice(0, -1) : rootUrl;
 
     const niftiImage = nv1.volumes[0].img;
 
