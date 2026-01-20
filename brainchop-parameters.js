@@ -173,8 +173,8 @@ const inferenceModelsList = [
     enableTranspose: false, // Keras and tfjs input orientation may need a tranposing step to be matched
     enableCrop: false, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
     cropPadding: 0, // Padding size add to cropped brain
-    inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
-    outputPermutation: null, // Inverse of inputPermutation.
+      inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
+      outputPermutation: null, // Inverse of inputPermutation.
     outputShift: [0, 0, 1], // Manual shift correction [Row, Col, Depth]
     forceFP32: false, // Force float32 precision for better quality
     ttaFlipAxis: 0, // Axis to flip for TTA (1 = Depth/Width depending on transpose)

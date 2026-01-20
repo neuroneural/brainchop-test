@@ -140,7 +140,12 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         tensor.dispose();
         tensor = normalized_tensor;
 
-        if (modelEntry.enableTranspose) {
+        if (modelEntry.inputPermutation) {
+            console.log(`[WebGPU] Permuting Input: ${modelEntry.inputPermutation}`);
+            const permuted_tensor = tensor.transpose(modelEntry.inputPermutation);
+            tensor.dispose();
+            tensor = permuted_tensor;
+        } else if (modelEntry.enableTranspose) {
             const transposed_tensor = tensor.transpose();
             tensor.dispose();
             tensor = transposed_tensor;
@@ -210,7 +215,10 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         outLabelVolume = tf.tidy(() => {
             let volume = tf.tensor(inferenceResultArray[0], finalShape, 'int32');
 
-            if (modelEntry.enableTranspose) {
+            if (modelEntry.outputPermutation) {
+                console.log(`[WebGPU] Permuting Output: ${modelEntry.outputPermutation}`);
+                volume = volume.transpose(modelEntry.outputPermutation);
+            } else if (modelEntry.enableTranspose) {
                 volume = volume.transpose();
             }
 
