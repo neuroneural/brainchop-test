@@ -447,6 +447,19 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
   const model = await load_model(opts.rootURL + modelEntry.path)
   const useF16 = modelEntry.forceFP32 ? false : true;
   await enableProductionMode(useF16)
+  // Explicit, unambiguous confirmation of the texture precision actually in
+  // effect on the WebGL2 backend (vs. the model's requested setting). When
+  // F16 textures are active, tfjs reports WEBGL_RENDER_FLOAT32_ENABLED=false.
+  try {
+    const _env = tf.env();
+    console.log(
+      `[fp16 check] backend=${tf.getBackend()}` +
+      ` | requested useF16=${useF16} (modelEntry.forceFP32=${!!modelEntry.forceFP32})` +
+      ` | WEBGL_FORCE_F16_TEXTURES=${_env.getBool('WEBGL_FORCE_F16_TEXTURES')}` +
+      ` | WEBGL_RENDER_FLOAT32_ENABLED=${_env.getBool('WEBGL_RENDER_FLOAT32_ENABLED')}` +
+      ` | WEBGL_RENDER_FLOAT32_CAPABLE=${_env.getBool('WEBGL_RENDER_FLOAT32_CAPABLE')}`
+    );
+  } catch (e) { console.warn('[fp16 check] could not read WebGL flags', e); }
   statData.TF_Backend = tf.getBackend()
   const modelObject = model
 

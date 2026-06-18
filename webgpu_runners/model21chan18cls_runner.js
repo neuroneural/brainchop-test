@@ -47,8 +47,7 @@ const addComputePass = (device, commandEncoder, pipeline, layout, infinityUnifor
   passEncoder.end();
 };
 
-const r_7_256_32_4_8_16_3_4_3_3_3 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_7_256_32_4_8_16_3_4_3_3_3 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -193,8 +192,7 @@ var<uniform> INFINITY : f32;
   data0[(alu43+3)] = (select(0.0f,alu42,(0.0f<alu42))-select(0.0f,alu55,(0.0f<alu55)));
 }`;
 
-const r_6_3_18 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_6_3_18 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -206,8 +204,7 @@ var<uniform> INFINITY : f32;
   data0[alu0] = (select(0,-1,((alu0<16)!=true))+select(0,-1,((alu0<17)!=true))+select(0,-1,((gidx0<5)!=true))+select(0,-1,((alu0<14)!=true))+select(0,-1,((alu0<13)!=true))+select(0,-1,((gidx0<4)!=true))+select(0,-1,((alu0<11)!=true))+select(0,-1,((alu0<10)!=true))+select(0,-1,((gidx0<3)!=true))+select(0,-1,((alu0<8)!=true))+select(0,-1,((alu0<7)!=true))+select(0,-1,((gidx0<2)!=true))+select(0,-1,((alu0<5)!=true))+select(0,-1,((alu0<4)!=true))+select(0,-1,((gidx0<1)!=true))+select(0,-1,((alu0<2)!=true))+select(0,-1,(((gidx0+lidx0)<1)!=true))+18);
 }`;
 
-const r_7_256_32_4_8_16_21_3_4_3_3_3 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_7_256_32_4_8_16_21_3_4_3_3_3 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -362,8 +359,7 @@ var<uniform> INFINITY : f32;
   data0[(alu46+3)] = (select(0.0f,alu45,(0.0f<alu45))-select(0.0f,alu58,(0.0f<alu58)));
 }`;
 
-const r_7_256_32_4_8_16_21_3_4_3_3_3n1 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_7_256_32_4_8_16_21_3_4_3_3_3n1 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -534,8 +530,7 @@ var<uniform> INFINITY : f32;
   data0[(alu50+3)] = (select(0.0f,alu49,(0.0f<alu49))-select(0.0f,alu62,(0.0f<alu62)));
 }`;
 
-const r_7_256_32_4_8_16_21_3_4_3_3_3n2 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_7_256_32_4_8_16_21_3_4_3_3_3n2 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -704,8 +699,7 @@ var<uniform> INFINITY : f32;
   data0[(alu48+3)] = (select(0.0f,alu47,(0.0f<alu47))-select(0.0f,alu60,(0.0f<alu60)));
 }`;
 
-const r_7_256_32_4_8_16_21_3_4_3_3_3n3 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_7_256_32_4_8_16_21_3_4_3_3_3n3 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -874,8 +868,7 @@ var<uniform> INFINITY : f32;
   data0[(alu48+3)] = (select(0.0f,alu47,(0.0f<alu47))-select(0.0f,alu60,(0.0f<alu60)));
 }`;
 
-const r_7_256_32_4_8_16_21_3_4_3_3_3n4 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_7_256_32_4_8_16_21_3_4_3_3_3n4 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -1022,8 +1015,7 @@ var<uniform> INFINITY : f32;
   data0[(alu44+3)] = (select(0.0f,alu43,(0.0f<alu43))-select(0.0f,alu56,(0.0f<alu56)));
 }`;
 
-const r_2_32768_8_3_16_4_3_21 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_2_32768_8_3_16_4_3_21 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -1208,8 +1200,7 @@ var<uniform> INFINITY : f32;
   data0[alu6] = (val0+(val70*val4)+(val66*val3)+(val74*val5)+(val78*val6)+(val82*val7)+(val86*val8)+(val90*val9)+(val94*val10)+(val98*val11)+(val102*val12)+(val106*val13)+(val110*val14)+(val114*val15)+(val118*val16)+(val122*val17)+(val126*val18)+(val130*val19)+(val134*val20)+(val138*val21)+(val142*val22)+(val146*val23));
 }`;
 
-const r_32768_16_1_32_18 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_32768_16_1_32_18 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -1257,8 +1248,7 @@ var<uniform> INFINITY : f32;
   data0[alu0] = select(val17,alu16,(val17<alu16));
 }`;
 
-const r_32768_4_1_32_4_18 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_32768_4_1_32_4_18 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;

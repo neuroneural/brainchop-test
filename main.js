@@ -10,6 +10,14 @@ import MyWorker from "./brainchop-webworker.js?worker";
 let gpuDevice = null;
 let isWebGpuAvailable = false;
 
+// --- DEBUG OVERRIDE -------------------------------------------------------
+// Normally false: WebGPU is used when available, WebGL2 is the fallback.
+// Set true to force every model through the WebGL2 (WebWorker / tfjs) backend
+// for debugging/benchmarking the fallback path. See the
+// `isWebGpuAvailable && !FORCE_WEBGL2_TESTING` guard in runSelectedInference().
+const FORCE_WEBGL2_TESTING = false;
+// --------------------------------------------------------------------------
+
 /**
  * Detects WebGPU support and initializes the device.
  * Provides detailed diagnostics for troubleshooting.
@@ -51,9 +59,20 @@ async function initializeBackend() {
           maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
         });
 
+        // Request the adapter's full limits. The default device limits cap
+        // maxComputeInvocationsPerWorkgroup at 256, but BEAM-tuned runners
+        // (e.g. dkatlas24) emit workgroups of 512-1024 invocations, which fail
+        // to create a ComputePipeline unless we opt into the higher limit here.
+        // Requesting the adapter's reported maximum is always valid.
         const requiredLimits = {
           maxBufferSize: adapter.limits.maxBufferSize,
-          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+          maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+          maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+          maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
+          maxComputeWorkgroupSizeZ: adapter.limits.maxComputeWorkgroupSizeZ,
+          maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+          maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
         };
         const hasF16 = adapter.features.has("shader-f16");
         diagnostics.f16Support = hasF16;
@@ -101,7 +120,9 @@ async function initializeBackend() {
   }
 
   // Update UI with backend status
-  updateBackendStatusUI(isWebGpuAvailable, diagnostics);
+  // While FORCE_WEBGL2_TESTING is on, report WebGL even if WebGPU initialized,
+  // so the indicator matches the path actually used.
+  updateBackendStatusUI(isWebGpuAvailable && !FORCE_WEBGL2_TESTING, diagnostics);
 
   if (!isWebGpuAvailable) {
     console.log('Falling back to WebGL backend.');
@@ -316,8 +337,8 @@ async function main() {
 
     const niftiImage = nv1.volumes[0].img;
 
-    // 1. Try WebGPU
-    if (isWebGpuAvailable && modelEntry.webgpu_safetensor) {
+    // 1. Try WebGPU  (skipped while FORCE_WEBGL2_TESTING is true)
+    if (isWebGpuAvailable && !FORCE_WEBGL2_TESTING && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
 
       // Get UI state for TTA

@@ -23,6 +23,18 @@ import {
   addLabelStats
 } from './diagnostic-stats.js';
 
+// --- PROFILING TOGGLE -----------------------------------------------------
+// When true, force a GPU readback + wall-clock log after EVERY layer so we can
+// see the real per-layer cost (which layers dominate) and rule the GPU sync in
+// or out. This itself adds a sync per layer, so only use it for a measurement
+// run; set back to false for normal use.
+const DEBUG_LAYER_TIMING = false;
+
+// Per-layer console logging is surprisingly expensive in the hot loop when
+// devtools is open (each call serializes a tensor shape). Keep it off for
+// normal/fast runs; flip on only when debugging correctness.
+const VERBOSE_LAYER_LOGGING = false;
+// --------------------------------------------------------------------------
 
 export async function runFullVolumeInference(
   opts,
@@ -111,17 +123,19 @@ export async function runFullVolumeInference(
   const layersLength = res.layers.length;
   const isChannelLast = isModelChnlLast(res);
 
-  // Debug: Log Activations
-  console.log("--- Model Architecture Debug ---");
-  res.layers.forEach((l, idx) => {
-    let act = "unknown";
-    try {
-      act = l.activation ? l.activation.getClassName() : (l.activation === null ? "null (linear?)" : "none");
-      // Some layers like InputLayer don't have activation
-    } catch (e) { }
-    console.log(`Layer ${idx}: ${l.name} (${l.getClassName()}) -> Activation: ${act}`);
-  });
-  console.log("--------------------------------");
+  // Debug: Log Activations (one-time; gated to avoid console overhead)
+  if (VERBOSE_LAYER_LOGGING) {
+    console.log("--- Model Architecture Debug ---");
+    res.layers.forEach((l, idx) => {
+      let act = "unknown";
+      try {
+        act = l.activation ? l.activation.getClassName() : (l.activation === null ? "null (linear?)" : "none");
+        // Some layers like InputLayer don't have activation
+      } catch (e) { }
+      console.log(`Layer ${idx}: ${l.name} (${l.getClassName()}) -> Activation: ${act}`);
+    });
+    console.log("--------------------------------");
+  }
 
   // Adjust model input shape (common logic)
   let adjusted_input_shape;
@@ -172,6 +186,17 @@ export async function runFullVolumeInference(
     }
   }
 
+  // --- ONE-LINE PATH SUMMARY (always logged) ---------------------------------
+  // Read this single line to know exactly what is about to run. If PATH=SeqConv
+  // (or you see a later "retrying with enableSeqConv: true" from main.js), that
+  // is the 80s+ crawl. Fast path should read PATH=fast(+chunkedArgMax).
+  const _pathName = modelEntry.enableSeqConv
+    ? 'SeqConv (SLOW: per-channel conv + sync every layer)'
+    : (useChunkedArgMax ? 'fast + chunkedArgMax (final layer only)' : 'fast (dense)');
+  console.log(`%c[PATH] ${_pathName}  | crop=${cropped_slices_3d_w_pad.shape}  | enableCrop=${modelEntry.enableCrop} cropPadding=${modelEntry.cropPadding}`,
+    'font-weight:bold;color:#0a0');
+  // ---------------------------------------------------------------------------
+
   async function runModelInferenceLoop(res, inputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI) {
     let i = 1;
     let currentOutputTensor = inputTensor;
@@ -185,9 +210,20 @@ export async function runFullVolumeInference(
     console.log(`Syncing GPU every ${SYNC_GPU_EVERY_N_LAYERS} layers.`);
 
     while (i <= loopEnd) {
+      const _layerStart = performance.now();
+      let _splitMsg = '';
       try {
         let nextTensor;
-        if (modelEntry.enableSeqConv && res.layers[i].activation.getClassName() === 'linear') {
+        // Only linear Conv3D layers may use the memory-frugal slice-conv path.
+        // In the affine-GN models a 1x1x1 Conv3D ("affine_*") carries the learned
+        // per-channel gamma*x+beta and GELU is a separate Activation layer. Both are
+        // handled fine here (the affine conv is a real linear Conv3D; activations
+        // fall through to layer.apply). Guarding on getClassName()==='Conv3D' also
+        // avoids reading `.activation` on layers that don't define it.
+        const _layer = res.layers[i];
+        const _act = _layer.activation;
+        const _isLinearConv = _layer.getClassName() === 'Conv3D' && _act && _act.getClassName() === 'linear';
+        if (modelEntry.enableSeqConv && _isLinearConv) {
           const convFunction = res.layers[i].name.endsWith('_gn')
             ? gn_convByOutputChannelAndInputSlicing
             : convByOutputChannelAndInputSlicing;
@@ -201,6 +237,21 @@ export async function runFullVolumeInference(
             res.layers[i].dilationRate,
             3
           );
+        } else if (DEBUG_LAYER_TIMING && res.layers[i].name.endsWith('_gn')) {
+          // Timed split: isolate the dilated conv from the manual per-channel
+          // z-score (LayerNormInPlace). Forces a GPU sync after each so the ms
+          // reflect real compute. Use only for a measurement run.
+          const _c0 = performance.now();
+          const convOut = tf.tidy(() => res.layers[i].apply(currentOutputTensor));
+          { const _fe = convOut.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]); await _fe.data(); _fe.dispose(); }
+          const _convMs = (performance.now() - _c0).toFixed(1);
+
+          const _n0 = performance.now();
+          nextTensor = LayerNormInPlace(convOut);
+          convOut.dispose();
+          { const _fe = nextTensor.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]); await _fe.data(); _fe.dispose(); }
+          const _normMs = (performance.now() - _n0).toFixed(1);
+          _splitMsg = `  [conv=${_convMs}ms  norm=${_normMs}ms]`;
         } else {
           nextTensor = tf.tidy(() => {
             let resultTensor = res.layers[i].apply(currentOutputTensor);
@@ -223,8 +274,18 @@ export async function runFullVolumeInference(
         throw err;
       }
 
-      if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
-        console.log(`Layer ${i}... (Syncing GPU)`);
+      if (DEBUG_LAYER_TIMING) {
+        // Force this layer to finish so the elapsed time reflects real compute.
+        const firstElement = currentOutputTensor.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]);
+        await firstElement.data();
+        firstElement.dispose();
+        const _ms = (performance.now() - _layerStart).toFixed(1);
+        const _l = res.layers[i];
+        const _dil = _l.dilationRate ? `dil=${Array.isArray(_l.dilationRate) ? _l.dilationRate[0] : _l.dilationRate}` : '';
+        console.log(`[layer-timing] L${i} ${_l.name} ${_dil} -> ${_ms} ms${_splitMsg}  shape=${currentOutputTensor.shape}`);
+        callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
+      } else if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
+        if (VERBOSE_LAYER_LOGGING) console.log(`Layer ${i}... (Syncing GPU)`);
         callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
         const firstElement = currentOutputTensor.slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]);
         await firstElement.data();
@@ -233,7 +294,7 @@ export async function runFullVolumeInference(
         callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
       }
 
-      console.log(`Layer ${i} output shape: `, currentOutputTensor.shape);
+      if (VERBOSE_LAYER_LOGGING) console.log(`Layer ${i} output shape: `, currentOutputTensor.shape);
       i++;
     }
     return currentOutputTensor;

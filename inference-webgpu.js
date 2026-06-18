@@ -54,6 +54,16 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     let runnerName = modelEntry.webgpu_runner;
     let weightsPath = modelEntry.webgpu_safetensor;
 
+    // --- FP32 / FP16 SELECTION ---
+    // Default WebGPU runners are fp16 (smaller weights, lower peak memory, faster).
+    // When a model entry sets forceFP32:true, switch to the fp32 runner + fp32
+    // weights, which are exported alongside the fp16 ones as `<name>_f32`.
+    if (modelEntry.forceFP32) {
+        console.log('[WebGPU] forceFP32: switching to fp32 runner and weights.');
+        runnerName = `${runnerName}_f32`;
+        weightsPath = weightsPath.replace('.safetensors', '_f32.safetensors');
+    }
+
     // --- TTA SUPPORT LOGIC ---
     if (modelEntry.enableTTA && modelEntry.webgpuTTArunner) {
         console.log(`[WebGPU] TTA Enabled: Switching to TTA runner and weights.`);

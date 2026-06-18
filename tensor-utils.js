@@ -340,10 +340,41 @@ export async function gn_convByOutputChannelAndInputSlicing(input, filter, biase
  * @returns {tf.Tensor} The new, normalized tensor.
  */
 export function LayerNormInPlace(x, epsilon = 1e-5) {
+  // Per-channel z-score over the spatial axes (NDHWC: reduce D,H,W; keep N,C).
+  //
+  // The straightforward `tf.moments(x, [1,2,3])` is expensive on WebGL: because
+  // the channel axis is innermost and is KEPT, each of its two internal
+  // reductions (mean, then mean-of-squared-deviations) transposes the full
+  // ~256M-element volume, and it also materializes a full (x - mean) volume.
+  // That cost ~965 ms/layer x 13 layers in profiling.
+  //
+  // Here we transpose ONCE to channel-first, take both reductions over the now
+  // innermost (contiguous) spatial block -- so they need no further transpose --
+  // and compute variance in a single pass as E[x^2] - E[x]^2. The per-channel
+  // [C] stats then broadcast directly over the innermost axis of the original
+  // NDHWC tensor, so the final normalize needs no transpose either. Result is
+  // numerically equivalent (variance clamped >= 0 to absorb fp round-off).
+  // IMPORTANT: use the CENTERED two-pass variance (mean of (x-mean)^2), NOT the
+  // one-pass E[x^2]-E[x]^2. The one-pass form is mathematically identical but in
+  // fp16 textures it cancels catastrophically (E[x^2] ~ E[x]^2, both large), which
+  // produced pure-noise segmentations (~1.5M connected components instead of ~2.5k).
   return tf.tidy(() => {
-    const { mean, variance } = tf.moments(x, [1, 2, 3], true);
-    const invStd = tf.rsqrt(tf.add(variance, epsilon));
-    return tf.mul(tf.sub(x, mean), invStd);
+    const rank = x.shape.length;            // expected 5: [1, D, H, W, C]
+    const C = x.shape[rank - 1];
+    const N = x.shape[1] * x.shape[2] * x.shape[3]; // D * H * W
+
+    // One transpose to channel-first, then both reductions run over the now
+    // innermost (contiguous) spatial axis -- no further transpose. tf.moments
+    // would transpose the full volume twice (once per internal reduction).
+    const flatCN = x.transpose([0, 4, 1, 2, 3]).reshape([C, N]); // [C, N]
+    const mean = flatCN.mean(1);                       // E[x]            [C]
+    const centered = flatCN.sub(mean.reshape([C, 1]));  // x - mean        [C, N]
+    const variance = centered.square().mean(1);        // E[(x-mean)^2]   [C]
+    const invStd = tf.rsqrt(tf.add(variance, epsilon)); // [C]
+
+    const meanB = mean.reshape([1, 1, 1, 1, C]);
+    const invStdB = invStd.reshape([1, 1, 1, 1, C]);
+    return x.sub(meanB).mul(invStdB);
   });
 }
 
@@ -808,8 +839,11 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // 3-class (1, 7): Use Ratio logic (0.2) to keep significant disconnected components
       binarize = false;
       onlyLargest = false; // We handle filtering manually
-    } else if (modelEntry.id === 5) {
-      // 104-class (5): Use Strict Largest (as before)
+    } else if ([5, 14].includes(modelEntry.id)) {
+      // 104-class (5 = old, 14 = new deep DK-atlas): Use Strict Largest.
+      // binarize=false + onlyLargest=true keeps the largest connected component
+      // PER CLASS (not a single binarized blob), which is what a multi-region
+      // atlas parcellation needs.
       binarize = false;
       onlyLargest = true;
     } else if ([3, 8, 9].includes(modelEntry.id)) {
@@ -951,7 +985,10 @@ export function estimateMaxIntermediateTensorSize(model, inputShape, isChannelLa
   let maxOutputElements = 0;
 
   if (model && model.layers) {
-    for (const layer of model.layers) {
+    const _numLayers = model.layers.length;
+    for (let _li = 0; _li < _numLayers; _li++) {
+      const layer = model.layers[_li];
+      const _isFinalLayer = (_li === _numLayers - 1);
       // A. Calculate Output Channels
       let outputChannels = 0;
       let outputShape = layer.outputShape;
@@ -1020,7 +1057,14 @@ export function estimateMaxIntermediateTensorSize(model, inputShape, isChannelLa
         const currentPeakElements = spatialVol * (inputChannels + outputChannels);
         const currentOutputElements = spatialVol * outputChannels;
 
-        if (currentPeakElements > maxElements) {
+        // The FINAL layer (e.g. 24->104) is never run densely in the fast loop:
+        // it is always handled separately by chunkedArgMax / SequentialConvLayer.
+        // So its large channel count must NOT inflate the "peak intermediate"
+        // used to decide full SeqConv -- otherwise any head cropping above
+        // ~205^3 wrongly trips full SeqConv (24 sliced conv3d + concats per
+        // layer) and the model crawls. The unpacked maxOutput check below still
+        // accounts for the final layer and routes it to chunkedArgMax.
+        if (!_isFinalLayer && currentPeakElements > maxElements) {
           maxElements = currentPeakElements;
         }
         // Track output of LAST layer (overwrite each iteration)

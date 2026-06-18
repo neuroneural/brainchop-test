@@ -50,8 +50,7 @@ const addComputePass = (device, commandEncoder, pipeline, layout, infinityUnifor
   passEncoder.end();
 };
 
-const r_5_256_32_4_8_16_4_3_3_3_3 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_5_256_32_4_8_16_4_3_3_3_3 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -128,8 +127,7 @@ var<uniform> INFINITY : f32;
 }`;
 
 
-const r_5_256_32_4_8_16_4_3_15_3_3_3 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_5_256_32_4_8_16_4_3_15_3_3_3 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -483,8 +481,7 @@ var<uniform> INFINITY : f32;
   data0_251658240[alu4] = ((1/(1.0f+exp2(((alu11+(0.044715f*alu11*alu11*alu11))*-2.302208198144325f))))*alu11);
 }`;
 
-const r_5_256_32_4_8_16_4_3_15_3_3_3n1 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_5_256_32_4_8_16_4_3_15_3_3_3n1 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -582,8 +579,7 @@ var<uniform> INFINITY : f32;
   data0[(alu31+3)] = acc3;
 }`;
 
-const r_5_256_32_4_8_16_4_3_15_3_3_3n2 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_5_256_32_4_8_16_4_3_15_3_3_3n2 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;
@@ -684,8 +680,7 @@ var<uniform> INFINITY : f32;
   data0[(alu33+3)] = acc3;
 }`;
 
-const r_5_256_32_4_8_16_4_3_15_3_3_3n3 = `enable f16;
-fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
+const r_5_256_32_4_8_16_4_3_15_3_3_3n3 = `fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 fn is_nan(v:f32) -> bool { return min(v, 1.0) == 1.0 && max(v, -1.0) == -1.0; }
 @group(0) @binding(0)
 var<uniform> INFINITY : f32;

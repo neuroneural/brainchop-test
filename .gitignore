@@ -28,3 +28,7 @@ dist-ssr
 /playwright/.cache/
 
 timing.json
+
+# Local agent / CLI tooling (do not commit)
+.claude/
+.antigravitycli/
