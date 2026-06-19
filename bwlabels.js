@@ -418,7 +418,7 @@ export class BWLabeler {
    * @param {Uint32Array} ls - Label map
    * @param {number} maxRank - Max number of components to keep per class (e.g. 2)
    */
-  filter_clusters_by_rank(bw, cl, ls, maxRank) {
+  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -450,9 +450,21 @@ export class BWLabeler {
       // Sort descending by size
       components.sort((a, b) => b.size - a.size);
 
-      // Keep top K
+      // Optional size floor: keep a top-K component only if it is at least
+      // `minRatio` of the LARGEST component in its class. This drops tiny stray
+      // blobs that happen to land within the top-K (e.g. a misclassified chin
+      // speck) while preserving large detached structures such as a separated
+      // cerebellum, which sits far above the floor. The largest component
+      // (k=0, ratio 1.0) always passes. Components are size-sorted, so once one
+      // falls below the floor every later one does too -> break. minRatio=0
+      // (default) preserves the original rank-only behavior.
+      const largest = components.length ? components[0].size : 0;
+      const sizeFloor = minRatio > 0 ? largest * minRatio : 0;
+
+      // Keep top K (subject to the size floor)
       const count = Math.min(components.length, maxRank);
       for (let k = 0; k < count; k++) {
+        if (components[k].size < sizeFloor) break;
         keepLabel[components[k].i] = 1;
       }
     }

@@ -836,7 +836,9 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     let onlyLargest = false;
     // Determine strategy based on model ID
     if ([1, 7].includes(modelEntry.id)) {
-      // 3-class (1, 7): Use Ratio logic (0.2) to keep significant disconnected components
+      // 3-class (1, 7): keep top-2 components per class (preserves a detached
+      // cerebellum) but with a small size floor (drops tiny stray blobs).
+      // Handled manually below.
       binarize = false;
       onlyLargest = false; // We handle filtering manually
     } else if ([5, 14].includes(modelEntry.id)) {
@@ -858,9 +860,16 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     }
 
     if ([1, 7].includes(modelEntry.id)) {
-      // 3-Class Rank Logic (Keep top 2 components per class)
+      // 3-class rank logic: keep the top-2 connected components PER CLASS so a
+      // legitimately detached structure (this model sometimes segments the
+      // cerebellum separately) is preserved. The size floor then drops any
+      // kept component below SMALL_COMPONENT_MIN_RATIO of its class's largest,
+      // removing tiny stray blobs (e.g. a misclassified chin speck) without
+      // touching the much-larger cerebellum. Tune UP if noise remains; tune
+      // DOWN if a small detached cerebellum ever gets clipped.
+      const SMALL_COMPONENT_MIN_RATIO = 0.02;
       const [cl, ls] = BWInstance.bwlabel(segmentationData, Vshape, 6, false, false);
-      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2);
+      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO);
       segmentationData.set(filtered);
     } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
       // Mixed case (18-class) - Hierarchical approach:
