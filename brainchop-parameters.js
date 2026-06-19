@@ -170,10 +170,21 @@ const inferenceModelsList = [
     webgpu_runner: 'dkatlas24',
     forceFP32: false, // false -> fp16 runner (dkatlas24_runner.js + model.safetensors).
                       // true  -> fp32 runner (dkatlas24_f32_runner.js + model_f32.safetensors).
-    // Largest WebGPU storage buffer is one 24-channel activation volume at fp16
-    // (24 * 256^3 * 2 = 768 MiB); the final 24->104 conv is chunked at export so
-    // the 104-channel logits never materialize in full.
-    webgpuStorageSize: 805306368,
+    // Largest WebGPU storage buffer in the SHIPPED dkatlas24_runner.js is a
+    // 24-channel full-volume CONV OUTPUT kept at *fp32*: 24 * 256^3 * 4 = 1.5 GiB
+    // (buf_0 / data0_402653184:array<f32>). The fp16 export already stores the
+    // GroupNorm/GELU outputs as f16, but each conv result is the tensor GroupNorm
+    // reduces over, and tinygrad keeps that shared node at its native f32 -- so 11
+    // full-volume f32 buffers remain (verify: grep -cE '_402653184:array<f32>'). A
+    // plain re-export does NOT shrink this (the shipped runner already postdates the
+    // fp16-activation fix). Reducing it needs tiny_meshnet.py to *materialize* the
+    // conv output as f16 (cast + contiguous/realize before GroupNorm) then re-export
+    // until that grep is 0 -> peak ~768 MiB, under Firefox's 1024 MiB cap. mindgrab
+    // has the same pattern but at 15 ch (960 MiB f32) so it just fits; this 24-ch
+    // model at 1.5 GiB does not. See ADD_DKATLAS24.md. This value matches the actual
+    // allocation so the pre-emptive memory check is truthful and the OOM error-scope
+    // fallback in inference-webgpu.js kicks in cleanly.
+    webgpuStorageSize: 1610612736,
     numClasses: 104,
     // Gridding-free model: dilations ramp to 31 (RF = 255), matched to the full
     // 256^3 cube. On WebGPU it runs the full volume like brainchop-cli (no pre-model,
