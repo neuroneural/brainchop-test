@@ -1,6 +1,11 @@
 import * as tf from '@tensorflow/tfjs'
 import { BWLabeler } from './bwlabels.js'
 
+// DEBUG ONLY: set true to force the post-processing noise guard to trip on any
+// run, so you can see the "segmentation produced noise" failure path in the UI
+// without an actual garbage segmentation. Leave false for normal use.
+const FORCE_SEGMENTATION_NOISE = false;
+
 export async function cropAndGetCorner(tensor3d, mask_3d, userPadding) {
   // Find bounding box
   const [row_min, row_max, col_min, col_max, depth_min, depth_max] = await firstLastNonZero3D(mask_3d);
@@ -832,6 +837,30 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     const bwStartTime = performance.now();
     const BWInstance = new BWLabeler();
 
+    // --- Noise guard -------------------------------------------------------
+    // A garbage/noise segmentation fragments into a huge number of tiny
+    // connected components (we've seen ~1.5M). The labeling pass itself stays
+    // fast, but the per-component filtering below (O(cl^2) scans, per-class
+    // Maps and sorts) would then freeze the tab for minutes. So we run ONE
+    // cheap plain labeling pass first (no filtering), and if the component
+    // count is implausibly high we abort before any heavy work. Healthy
+    // segmentations yield hundreds-to-few-thousand components, far below the
+    // cap; noise yields ~1M+, far above it.
+    const totalVoxels = Vshape[0] * Vshape[1] * Vshape[2];
+    const NOISE_COMPONENT_CAP = Math.max(100000, Math.floor(totalVoxels * 0.01));
+    const [guardComponentCount, guardLabels] = BWInstance.bwlabel(segmentationData, Vshape, 6, false, false);
+    if (FORCE_SEGMENTATION_NOISE || guardComponentCount > NOISE_COMPONENT_CAP) {
+      const msg =
+        `Segmentation produced noise: ${guardComponentCount.toLocaleString()} ` +
+        `disconnected regions (cap ${NOISE_COMPONENT_CAP.toLocaleString()}). ` +
+        `The model output is unusable, so post-processing was aborted. ` +
+        `Try re-running, switching backend (WebGPU/WebGL2), or another model.`;
+      console.error('[postprocess] ' + msg);
+      const err = new Error(msg);
+      err.code = 'SEGMENTATION_NOISE';
+      throw err;
+    }
+
     let binarize = false;
     let onlyLargest = false;
     // Determine strategy based on model ID
@@ -868,7 +897,10 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // touching the much-larger cerebellum. Tune UP if noise remains; tune
       // DOWN if a small detached cerebellum ever gets clipped.
       const SMALL_COMPONENT_MIN_RATIO = 0.02;
-      const [cl, ls] = BWInstance.bwlabel(segmentationData, Vshape, 6, false, false);
+      // Reuse the labeling already computed by the noise guard (identical call:
+      // conn=6, binarize=false, onlyLargest=false) to avoid a redundant pass.
+      const cl = guardComponentCount;
+      const ls = guardLabels;
       const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO);
       segmentationData.set(filtered);
     } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
@@ -898,8 +930,17 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses);
       segmentationData.set(filtered);
 
+    } else if (!binarize && onlyLargest) {
+      // Per-Class Strict (e.g. 104-class DK-atlas, ids 5/14): keep the largest
+      // connected component per class. This is equivalent to
+      // bwlabel(..., binarize=false, onlyLargest=true), but we reuse the
+      // labeling already produced by the noise guard (same conn=6/binarize=false
+      // pass) and only run the largest-cluster selection, avoiding a second
+      // full relabeling of this perf-sensitive model.
+      const [_mx, res2] = BWInstance.largest_original_cluster_labels(segmentationData, guardComponentCount, guardLabels);
+      segmentationData.set(res2);
     } else {
-      // Standard cases (Legacy or Per-Class Strict)
+      // Standard cases (Legacy binarize-then-largest)
       const [_res1, res2] = BWInstance.bwlabel(segmentationData, Vshape, 6, binarize, onlyLargest);
 
       if (binarize) {

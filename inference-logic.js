@@ -423,7 +423,21 @@ export async function runFullVolumeInference(
   console.log(`---- Restoration Time: ${Padding_t} seconds ----`);
 
   const postProcessStartTime = performance.now();
-  const outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+  let outimg;
+  try {
+    outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+  } catch (err) {
+    // Postprocessing can deliberately bail out on a noise/garbage segmentation
+    // (err.code === 'SEGMENTATION_NOISE') instead of freezing the tab on the
+    // O(cl^2) component filtering. Surface it the same way layer failures are
+    // surfaced, then re-throw so the worker stops cleanly.
+    callbackUI(err.message, -1, err.message);
+    markFailure(statData, err, 'Failed during segmentation post-processing');
+    callbackUI('', -1, '', statData);
+    outLabelVolume.dispose();
+    tf.engine().disposeVariables();
+    throw err;
+  }
   const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
   console.log(`---- Postprocessing Time: ${Postprocess_t} seconds ----`);
 
