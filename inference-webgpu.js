@@ -114,8 +114,45 @@ function castSafetensorsToF16(bytes, callbackUI) {
     return out;
 }
 
+// --- SAFARI WEBGPU DIAGNOSTICS ---
+// Dumps the *granted* device's features + key limits and the UA string with a
+// greppable [SAFARI-DEBUG] tag. main.js logs the adapter at creation; this logs
+// what the device we actually run on ended up with, per model load. Purely
+// observational -- no behavior change. Pair with window.BC_WEBGPU_DEBUG=true to
+// also get the pre-argmax logits readback inside the runner (NaN/Inf/min/max),
+// which distinguishes fp16-overflow-NaN from equality-argmax fallthrough as the
+// cause of the "fully filled cube" on Safari/Tahoe.
+function logDeviceCapabilities(device, modelEntry) {
+    try {
+        const f = (name) => !!(device.features && device.features.has && device.features.has(name));
+        const lim = device.limits || {};
+        const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || 'unknown';
+        const isSafari = /Safari/.test(ua) && !/Chrome|Chromium|Android/.test(ua);
+        console.log('[SAFARI-DEBUG] ===== WebGPU device capabilities =====');
+        console.log('[SAFARI-DEBUG] model:', modelEntry?.modelName || modelEntry?.webgpu_runner || '(unknown)');
+        console.log('[SAFARI-DEBUG] userAgent:', ua, '| classified Safari:', isSafari);
+        console.log('[SAFARI-DEBUG] shader-f16:', f('shader-f16'));
+        console.log('[SAFARI-DEBUG] features:', device.features ? Array.from(device.features) : '(none)');
+        console.log('[SAFARI-DEBUG] limits:', {
+            maxBufferSize: lim.maxBufferSize,
+            maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+            maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
+            maxComputeWorkgroupSizeX: lim.maxComputeWorkgroupSizeX,
+            maxComputeWorkgroupSizeY: lim.maxComputeWorkgroupSizeY,
+            maxComputeWorkgroupSizeZ: lim.maxComputeWorkgroupSizeZ,
+            maxComputeWorkgroupsPerDimension: lim.maxComputeWorkgroupsPerDimension
+        });
+        console.log('[SAFARI-DEBUG] BC_WEBGPU_DEBUG (logits readback):',
+            (typeof window !== 'undefined' && !!window.BC_WEBGPU_DEBUG));
+        console.log('[SAFARI-DEBUG] =======================================');
+    } catch (e) {
+        console.warn('[SAFARI-DEBUG] capability dump failed:', e?.message);
+    }
+}
+
 // Helper to safely setup the network
 async function setupNetwork(device, modelEntry, callbackUI) {
+    logDeviceCapabilities(device, modelEntry);
     let runnerName = modelEntry.webgpu_runner;
     let weightsPath = modelEntry.webgpu_safetensor;
 
