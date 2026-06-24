@@ -218,6 +218,43 @@ const inferenceModelsList = [
       'Desikan-Killiany atlas parcellation into 104 regions (cortical + subcortical). A deeper 24-channel gridding-free MeshNet with affine GroupNorm and GELU that replaces the 21-channel model: more robust at the same peak activation memory. Runs on WebGL2 and WebGPU (fp16 default, fp32 selectable).'
   },
   {
+    // Synth-trained variant of the 24ch/104cls DK-atlas model. Same architecture as
+    // id 5 (dkatlas24); only the weights differ, converted from catalyst
+    // synth104_gn_hdc_deep_turbo24_fromreal. Full artifact set is present in
+    // public/models/model24chan104cls_synth/:
+    //   WebGPU fp16 : dkatlas24_synth_runner.js     + model.safetensors
+    //   WebGPU fp32 : dkatlas24_synth_f32_runner.js + model_f32.safetensors
+    //   WebGL2      : model.json (tfjs topology)     + model.bin
+    id: 14,
+    type: 'Atlas',
+    path: '/models/model24chan104cls_synth/model.json',
+    modelName: '\u{1F9EA} Aparc+Aseg 104 (synth)',
+    colormapPath: './models/model24chan104cls_synth/colormap.json',
+    webgpu_safetensor: './models/model24chan104cls_synth/model.safetensors',
+    webgpu_runner: 'dkatlas24_synth', // dedicated runner; fp16 export uses the lossless conv-weight rescale (overflow-safe fast f16 GroupNorm)
+    forceFP32: false, // false -> fp16 runner (dkatlas24_synth_runner.js + model.safetensors).
+                      // true  -> fp32 runner (dkatlas24_synth_f32_runner.js + model_f32.safetensors).
+    webgpuStorageSize: 1610612736,
+    numClasses: 104,
+    preModelId: null,
+    preModelPostProcess: false,
+    isBatchOverlapEnable: false,
+    numOverlapBatches: 0,
+    enableTranspose: true,
+    enableCrop: true, // WebGL2 fallback needs this (texture limit); WebGPU ignores it and runs full volume.
+    cropPadding: 20,
+    autoThreshold: 0,
+    enableQuantileNorm: true, // synth104 trained with quantile normalization (catalyst pipeline) -- must match at inference (inference-webgpu.js / inference-logic.js). Do NOT set false.
+    filterOutWithPreMask: false,
+    enableSeqConv: true,
+    textureSize: 0,
+    warning:
+      "Synth-trained variant. This model may need a dedicated graphics card.",
+    inferenceDelay: 100,
+    description:
+      'Synth-trained variant of the 24-channel gridding-free DK-atlas (104 region) MeshNet. Same architecture as Aparc+Aseg 104; weights converted from the catalyst synth104_gn_hdc_deep_turbo24_fromreal checkpoint. Runs on WebGL2 and WebGPU (fp16 default, fp32 selectable).'
+  },
+  {
     id: 6,
     type: 'Divider',
     modelName: '-----------------',
