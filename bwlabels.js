@@ -202,8 +202,266 @@ export class BWLabeler {
     return [cl, l]
   } // translate_labels()
 
+  /**
+   * For each SUPPRESSED component, find the most common KEPT class touching its
+   * 6-neighbourhood boundary. Used by the relabel-instead-of-zero option so a
+   * dropped blob inherits its surrounding surviving label rather than becoming
+   * background.
+   * @param {Uint32Array} ls   Component-label map (0 = background).
+   * @param {number[]} dim     [nx, ny, nz].
+   * @param {Uint32Array} kept Per-label surviving class id (>0) or 0 if suppressed.
+   * @param {number} cl        Number of components.
+   * @returns {Uint32Array}    winner[comp] = class to assign (0 = leave as bg).
+   */
+  neighbor_winners(ls, dim, kept, cl) {
+    const nx = dim[0]
+    const ny = dim[1]
+    const nz = dim[2]
+    const sliceXY = nx * ny
+    // hist: compId -> Map(class -> contact count)
+    const hist = new Map()
+    const bump = (c, klass) => {
+      let h = hist.get(c)
+      if (!h) {
+        h = new Map()
+        hist.set(c, h)
+      }
+      h.set(klass, (h.get(klass) || 0) + 1)
+    }
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        for (let x = 0; x < nx; x++) {
+          const i = z * sliceXY + y * nx + x
+          const c = ls[i]
+          if (c === 0 || kept[c]) {
+            continue
+          } // only suppressed (non-bg, not-kept) voxels
+          let k
+          if (x > 0 && (k = kept[ls[i - 1]])) bump(c, k)
+          if (x < nx - 1 && (k = kept[ls[i + 1]])) bump(c, k)
+          if (y > 0 && (k = kept[ls[i - nx]])) bump(c, k)
+          if (y < ny - 1 && (k = kept[ls[i + nx]])) bump(c, k)
+          if (z > 0 && (k = kept[ls[i - sliceXY]])) bump(c, k)
+          if (z < nz - 1 && (k = kept[ls[i + sliceXY]])) bump(c, k)
+        }
+      }
+    }
+    const winner = new Uint32Array(cl + 1).fill(0)
+    for (const [c, h] of hist) {
+      let best = 0
+      let bestN = 0
+      for (const [klass, n] of h) {
+        // most contacts wins; ties broken by lower class id for determinism
+        if (n > bestN || (n === bestN && (best === 0 || klass < best))) {
+          bestN = n
+          best = klass
+        }
+      }
+      winner[c] = best
+    }
+    return winner
+  }
+
+  /**
+   * Build the final class volume from a keep decision.
+   * @param {Uint32Array} ls   Component-label map (0 = background).
+   * @param {number[]} dim     [nx, ny, nz] (required when relabelSuppressed).
+   * @param {Uint32Array} kept Per-label surviving class id (>0) or 0 if suppressed.
+   * @param {number} cl        Number of components.
+   * @param {boolean} relabelSuppressed If true, suppressed components inherit the
+   *   most common kept neighbour class instead of becoming background. Components
+   *   touching no kept voxel (e.g. specks floating in true exterior background)
+   *   still become 0.
+   * @returns {[number, Uint32Array]} [maxClass, volume].
+   */
+  finalize_volume(ls, dim, kept, cl, relabelSuppressed) {
+    const nvox = ls.length
+    const vxs = new Uint32Array(nvox).fill(0)
+    const winner = relabelSuppressed ? this.neighbor_winners(ls, dim, kept, cl) : null
+    let mxbw = 0
+    for (let i = 0; i < nvox; i++) {
+      const c = ls[i]
+      if (c === 0) {
+        continue
+      }
+      let v = kept[c]
+      if (!v && winner) {
+        v = winner[c]
+      }
+      if (v) {
+        vxs[i] = v
+        if (v > mxbw) {
+          mxbw = v
+        }
+      }
+    }
+    return [mxbw, vxs]
+  }
+
+  /**
+   * DIAGNOSTIC ONLY — does not modify the volume. Logs, per connected component,
+   * its class id, size, whether it's the largest component of its class, how many
+   * components its class fragments into, and what its surface touches (dominant
+   * neighbouring class + how enclosed it is by that class, plus background
+   * fraction). Use it to decide whether a stray region (e.g. a red blob inside
+   * green) is a separate label swallowed by one neighbour (enclosure ~1, small,
+   * not largest-of-class) vs. a connected protrusion of a large structure
+   * (its class has 1 component / it IS the largest-of-class).
+   *
+   * @param {Uint32Array} bw   Original per-voxel class values.
+   * @param {number} cl        Number of components.
+   * @param {Uint32Array} ls   Component-label map (0 = background).
+   * @param {number[]} dim     [nx, ny, nz].
+   * @param {object} [options] { topN=50, minSize=1, label='diag' }.
+   * @returns {object[]} the per-component rows (also printed via console.table).
+   */
+  diagnose_components(bw, cl, ls, dim, options = {}) {
+    const topN = options.topN ?? 50
+    const minSize = options.minSize ?? 1
+    const tag = options.label ?? 'diag'
+    const nx = dim[0]
+    const ny = dim[1]
+    const nz = dim[2]
+    const sliceXY = nx * ny
+
+    const ls2bw = new Uint32Array(cl + 1)
+    const sumls = new Uint32Array(cl + 1)
+    for (let i = 0; i < bw.length; i++) {
+      const c = ls[i]
+      if (c) {
+        ls2bw[c] = bw[i]
+        sumls[c]++
+      }
+    }
+
+    // Per-component: histogram of FOREIGN neighbour classes, background contacts,
+    // and total boundary-voxel contacts (neighbour is a different component/bg).
+    const fhist = new Map()
+    const bgContacts = new Uint32Array(cl + 1)
+    const totalBoundary = new Uint32Array(cl + 1)
+    const bump = (c, k) => {
+      let h = fhist.get(c)
+      if (!h) {
+        h = new Map()
+        fhist.set(c, h)
+      }
+      h.set(k, (h.get(k) || 0) + 1)
+    }
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        for (let x = 0; x < nx; x++) {
+          const i = z * sliceXY + y * nx + x
+          const c = ls[i]
+          if (!c) {
+            continue
+          }
+          const myClass = ls2bw[c]
+          const check = (j) => {
+            const nc = ls[j]
+            if (nc === c) {
+              return
+            } // interior (same component) — not a boundary face
+            totalBoundary[c]++
+            const ncl = nc ? ls2bw[nc] : 0
+            if (ncl === 0) {
+              bgContacts[c]++
+            } else if (ncl !== myClass) {
+              bump(c, ncl)
+            } // foreign-class face
+          }
+          if (x > 0) check(i - 1)
+          if (x < nx - 1) check(i + 1)
+          if (y > 0) check(i - nx)
+          if (y < ny - 1) check(i + nx)
+          if (z > 0) check(i - sliceXY)
+          if (z < nz - 1) check(i + sliceXY)
+        }
+      }
+    }
+
+    const classCount = new Map()
+    const classMax = new Map()
+    for (let c = 1; c <= cl; c++) {
+      const cls = ls2bw[c]
+      classCount.set(cls, (classCount.get(cls) || 0) + 1)
+      if (!classMax.has(cls) || sumls[c] > classMax.get(cls)) {
+        classMax.set(cls, sumls[c])
+      }
+    }
+
+    const rows = []
+    for (let c = 1; c <= cl; c++) {
+      if (sumls[c] < minSize) {
+        continue
+      }
+      const cls = ls2bw[c]
+      const h = fhist.get(c)
+      let dom = 0
+      let domN = 0
+      let foreignTotal = 0
+      if (h) {
+        for (const [k, n] of h) {
+          foreignTotal += n
+          if (n > domN) {
+            domN = n
+            dom = k
+          }
+        }
+      }
+      const tb = totalBoundary[c] || 1
+      rows.push({
+        comp: c,
+        class: cls,
+        size: sumls[c],
+        largestOfClass: sumls[c] === classMax.get(cls) ? 'Y' : 'n',
+        compsInClass: classCount.get(cls),
+        domNeighbor: dom,
+        domFracForeign: foreignTotal ? +(domN / foreignTotal).toFixed(2) : 0,
+        domFracBoundary: +(domN / tb).toFixed(2),
+        bgFrac: +(bgContacts[c] / tb).toFixed(2)
+      })
+    }
+    // Islands first: most enclosed by a single foreign class, largest of those first.
+    rows.sort((a, b) => b.domFracForeign - a.domFracForeign || b.size - a.size)
+
+    // Plain-text tables via console.log: console.table does NOT render from a
+    // Web Worker (where inference may run) and is hidden when the console's
+    // "Info" level is off. Text also avoids the (slow) table-render cost.
+    const fmt = (rws, cols) => {
+      const widths = cols.map((c) => Math.max(c.h.length, ...rws.map((r) => String(r[c.k]).length)))
+      const line = (cells) => cells.map((s, i) => String(s).padStart(widths[i])).join('  ')
+      return [line(cols.map((c) => c.h)), ...rws.map((r) => line(cols.map((c) => r[c.k])))].join('\n')
+    }
+    const compCols = [
+      { k: 'comp', h: 'comp' }, { k: 'class', h: 'class' }, { k: 'size', h: 'size' },
+      { k: 'largestOfClass', h: 'lrg' }, { k: 'compsInClass', h: 'nComp' },
+      { k: 'domNeighbor', h: 'domNbr' }, { k: 'domFracForeign', h: 'encF' },
+      { k: 'domFracBoundary', h: 'encB' }, { k: 'bgFrac', h: 'bgF' }
+    ]
+    console.log(
+      `[${tag}] total components=${cl}, distinct classes=${classCount.size}\n` +
+        `[${tag}] island candidates (encF≈1 + small size + lrg=n ⇒ swallowed island):\n` +
+        fmt(rows.slice(0, topN), compCols)
+    )
+
+    const classRows = [...classCount.entries()]
+      .map(([cls, cnt]) => ({ class: cls, components: cnt, maxCompSize: classMax.get(cls) }))
+      .sort((a, b) => b.components - a.components)
+    console.log(
+      `[${tag}] per-class component counts (components=1 ⇒ fully connected):\n` +
+        fmt(classRows.slice(0, 30), [
+          { k: 'class', h: 'class' }, { k: 'components', h: 'comps' }, { k: 'maxCompSize', h: 'maxSize' }
+        ])
+    )
+
+    return rows
+  }
+
   // retain only the largest cluster for each region
-  largest_original_cluster_labels(bw, cl, ls) {
+  // dim + relabelSuppressed are optional: when relabelSuppressed is true, blobs
+  // that lose the per-class "largest" contest are repainted with their
+  // surrounding surviving label instead of background (requires dim).
+  largest_original_cluster_labels(bw, cl, ls, dim = null, relabelSuppressed = false) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -213,10 +471,8 @@ export class BWLabeler {
       ls2bw[lsVal] = bwVal
       sumls[lsVal]++
     }
-    let mxbw = 0
     for (let i = 0; i < cl + 1; i++) {
       const bwVal = ls2bw[i]
-      mxbw = Math.max(mxbw, bwVal)
       // see if this is largest cluster of this bw-value
       for (let j = 0; j < cl + 1; j++) {
         if (j === i) {
@@ -232,18 +488,16 @@ export class BWLabeler {
         } // ties: arbitrary winner
       }
     }
-    const vxs = new Uint32Array(nvox).fill(0)
-    for (let i = 0; i < nvox; i++) {
-      vxs[i] = ls2bw[ls[i]]
-    }
-    return [mxbw, vxs]
+    // ls2bw now holds the surviving class per label (0 for suppressed). Reuse it
+    // directly as the `kept` map for finalize_volume.
+    return this.finalize_volume(ls, dim, ls2bw, cl, relabelSuppressed)
   }
 
   // Filter clusters based on target classes rules
   // targetClasses: 'all', or Set of class IDs.
   // If 'all' or class in targetClasses: keep only largest component of that class.
   // Else: keep all components of that class.
-  filter_clusters(bw, cl, ls, targetClasses) {
+  filter_clusters(bw, cl, ls, targetClasses, dim = null, relabelSuppressed = false) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -297,19 +551,12 @@ export class BWLabeler {
       }
     }
 
-    // 3. Reconstruct
-    const vxs = new Uint32Array(nvox).fill(0) // Default 0
-    let mxbw = 0
-    for (let i = 0; i < nvox; i++) {
-      // If we keep the label, restore original value
-      // ls[i] is component label
-      const comp = ls[i]
-      if (comp > 0 && keepLabel[comp]) {
-        vxs[i] = ls2bw[comp]
-        if (ls2bw[comp] > mxbw) mxbw = ls2bw[comp]
-      }
+    // 3. Reconstruct: kept[c] = surviving class id, or 0 if suppressed.
+    const kept = new Uint32Array(cl + 1).fill(0)
+    for (let i = 1; i <= cl; i++) {
+      if (keepLabel[i]) kept[i] = ls2bw[i]
     }
-    return [mxbw, vxs]
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed)
   }
 
   /**
@@ -322,7 +569,7 @@ export class BWLabeler {
    * @param {Uint32Array} ls - Label map
    * @param {number} minRatio - Threshold (e.g. 0.3)
    */
-  filter_clusters_by_ratio(bw, cl, ls, minRatio) {
+  filter_clusters_by_ratio(bw, cl, ls, minRatio, dim = null, relabelSuppressed = false) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -361,17 +608,12 @@ export class BWLabeler {
       }
     }
 
-    // 4. Reconstruct
-    const vxs = new Uint32Array(nvox).fill(0)
-    let mxbw = 0
-    for (let i = 0; i < nvox; i++) {
-      const comp = ls[i]
-      if (comp > 0 && keepLabel[comp]) {
-        vxs[i] = ls2bw[comp] // Restore Class Value
-        if (ls2bw[comp] > mxbw) mxbw = ls2bw[comp]
-      }
+    // 4. Reconstruct: kept[c] = surviving class id, or 0 if suppressed.
+    const kept = new Uint32Array(cl + 1).fill(0)
+    for (let i = 1; i <= cl; i++) {
+      if (keepLabel[i]) kept[i] = ls2bw[i]
     }
-    return [mxbw, vxs]
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed)
   }
 
   // given a 3D image, return a clustered label map
@@ -418,7 +660,7 @@ export class BWLabeler {
    * @param {Uint32Array} ls - Label map
    * @param {number} maxRank - Max number of components to keep per class (e.g. 2)
    */
-  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0) {
+  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0, dim = null, relabelSuppressed = false) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -469,16 +711,11 @@ export class BWLabeler {
       }
     }
 
-    // 4. Reconstruct
-    const vxs = new Uint32Array(nvox).fill(0)
-    let mxbw = 0
-    for (let i = 0; i < nvox; i++) {
-      const comp = ls[i]
-      if (comp > 0 && keepLabel[comp]) {
-        vxs[i] = ls2bw[comp] // Restore Class Value
-        if (ls2bw[comp] > mxbw) mxbw = ls2bw[comp]
-      }
+    // 4. Reconstruct: kept[c] = surviving class id, or 0 if suppressed.
+    const kept = new Uint32Array(cl + 1).fill(0)
+    for (let i = 1; i <= cl; i++) {
+      if (keepLabel[i]) kept[i] = ls2bw[i]
     }
-    return [mxbw, vxs]
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed)
   }
 }

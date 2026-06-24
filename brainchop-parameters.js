@@ -12,6 +12,8 @@ const brainChopOpts = {
   isBrainCropMaskBased: true, // Check if brain masking will be used for cropping & optional show or brain tissue will be used
   showPhase1Output: false, // This will load to papaya the output of phase-1 (ie. brain mask or brain tissue)
   isPostProcessEnable: true, // If true 3D Connected Components filter will apply
+  fillSuppressedWithNeighborLabel: false, // If true, blobs dropped by the per-class "largest component" filter are repainted with their surrounding surviving label instead of background (adds one linear neighbour pass; applies to per-class models e.g. 3/8/9, 5/14, 1/7 — not the binary brain-mask path)
+  diagnoseEnclosedComponents: false, // DEBUG: if true, log per-component stats (class, size, largest-of-class?, dominant neighbour & enclosure) for 104-class models to the console. Output-neutral; used to tune island absorption.
   isContoursViewEnable: false, // If true 3D contours of the labeled regions will apply
   browserArrayBufferMaxZDim: 30, // This value depends on Memory available
   telemetryFlag: false, // Ethical and transparent collection of browser usage while adhering to security and privacy standards
