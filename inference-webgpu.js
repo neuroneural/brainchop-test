@@ -58,8 +58,101 @@ function runnerExists(runnerName) {
     return Object.keys(runnerModules).some(p => p.toLowerCase().endsWith(lowerSuffix));
 }
 
+// Cast any F32 tensors in a safetensors byte buffer to F16, in-memory.
+// This lets us ship a single fp32 "master" model.safetensors and still feed the
+// fp16 runner, whose weight buffers are f16-typed and f16-sized (createWeightBuf
+// copies raw bytes, so it needs f16 byte counts). The f32->f16 cast here is the
+// same round-to-nearest the exporter's model.half() applies, so fp16 inference
+// results are unchanged -- the benefit is one full-precision source of truth on
+// disk (and a true-fp32 path for the _f32 runner) instead of a baked-lossy fp16
+// file. No-op if the buffer is already fp16. Weights are small (a few MB), so the
+// conversion is negligible.
+function castSafetensorsToF16(bytes, callbackUI) {
+    if (typeof Float16Array === 'undefined') {
+        // Runners already require Float16Array (input upload); surface clearly
+        // rather than silently corrupting weights.
+        throw new Error('Float16Array unavailable: cannot cast fp32 master weights to fp16.');
+    }
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const headerLen = Number(dv.getBigUint64(0, true));
+    const header = JSON.parse(new TextDecoder('utf8').decode(bytes.subarray(8, 8 + headerLen)));
+    const dataStart = 8 + headerLen;
+
+    const hasF32 = Object.entries(header).some(([k, v]) => k !== '__metadata__' && v.dtype === 'F32');
+    if (!hasF32) return bytes; // already fp16 (or nothing to convert): use as-is
+
+    const newHeader = {};
+    const chunks = [];
+    let offset = 0;
+    for (const [name, info] of Object.entries(header)) {
+        if (name === '__metadata__') { newHeader[name] = info; continue; }
+        const [start, end] = info.data_offsets;
+        const raw = bytes.subarray(dataStart + start, dataStart + end);
+        let outBytes, dtype;
+        if (info.dtype === 'F32') {
+            const f32 = new Float32Array(raw.slice().buffer); // .slice() guarantees 4-byte alignment
+            const f16 = new Float16Array(f32);                // value-preserving f32 -> f16
+            outBytes = new Uint8Array(f16.buffer);
+            dtype = 'F16';
+        } else {
+            outBytes = raw; dtype = info.dtype;               // pass through F16/I32/etc.
+        }
+        newHeader[name] = { dtype, shape: info.shape, data_offsets: [offset, offset + outBytes.byteLength] };
+        chunks.push(outBytes);
+        offset += outBytes.byteLength;
+    }
+
+    const headerBytes = new TextEncoder().encode(JSON.stringify(newHeader));
+    const pad = (8 - (headerBytes.byteLength % 8)) % 8; // safetensors header is padded to 8 bytes
+    const out = new Uint8Array(8 + headerBytes.byteLength + pad + offset);
+    new DataView(out.buffer).setBigUint64(0, BigInt(headerBytes.byteLength + pad), true);
+    out.set(headerBytes, 8);
+    out.fill(0x20, 8 + headerBytes.byteLength, 8 + headerBytes.byteLength + pad); // pad with spaces
+    let p = 8 + headerBytes.byteLength + pad;
+    for (const c of chunks) { out.set(c, p); p += c.byteLength; }
+    if (callbackUI) callbackUI('Cast fp32 master weights -> fp16 for WebGPU.', 0.05);
+    return out;
+}
+
+// --- SAFARI WEBGPU DIAGNOSTICS ---
+// Dumps the *granted* device's features + key limits and the UA string with a
+// greppable [SAFARI-DEBUG] tag. main.js logs the adapter at creation; this logs
+// what the device we actually run on ended up with, per model load. Purely
+// observational -- no behavior change. Pair with window.BC_WEBGPU_DEBUG=true to
+// also get the pre-argmax logits readback inside the runner (NaN/Inf/min/max),
+// which distinguishes fp16-overflow-NaN from equality-argmax fallthrough as the
+// cause of the "fully filled cube" on Safari/Tahoe.
+function logDeviceCapabilities(device, modelEntry) {
+    try {
+        const f = (name) => !!(device.features && device.features.has && device.features.has(name));
+        const lim = device.limits || {};
+        const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || 'unknown';
+        const isSafari = /Safari/.test(ua) && !/Chrome|Chromium|Android/.test(ua);
+        console.log('[SAFARI-DEBUG] ===== WebGPU device capabilities =====');
+        console.log('[SAFARI-DEBUG] model:', modelEntry?.modelName || modelEntry?.webgpu_runner || '(unknown)');
+        console.log('[SAFARI-DEBUG] userAgent:', ua, '| classified Safari:', isSafari);
+        console.log('[SAFARI-DEBUG] shader-f16:', f('shader-f16'));
+        console.log('[SAFARI-DEBUG] features:', device.features ? Array.from(device.features) : '(none)');
+        console.log('[SAFARI-DEBUG] limits:', {
+            maxBufferSize: lim.maxBufferSize,
+            maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+            maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
+            maxComputeWorkgroupSizeX: lim.maxComputeWorkgroupSizeX,
+            maxComputeWorkgroupSizeY: lim.maxComputeWorkgroupSizeY,
+            maxComputeWorkgroupSizeZ: lim.maxComputeWorkgroupSizeZ,
+            maxComputeWorkgroupsPerDimension: lim.maxComputeWorkgroupsPerDimension
+        });
+        console.log('[SAFARI-DEBUG] BC_WEBGPU_DEBUG (logits readback):',
+            (typeof window !== 'undefined' && !!window.BC_WEBGPU_DEBUG));
+        console.log('[SAFARI-DEBUG] =======================================');
+    } catch (e) {
+        console.warn('[SAFARI-DEBUG] capability dump failed:', e?.message);
+    }
+}
+
 // Helper to safely setup the network
 async function setupNetwork(device, modelEntry, callbackUI) {
+    logDeviceCapabilities(device, modelEntry);
     let runnerName = modelEntry.webgpu_runner;
     let weightsPath = modelEntry.webgpu_safetensor;
 
@@ -142,7 +235,11 @@ async function setupNetwork(device, modelEntry, callbackUI) {
 
     // Setup the network with proper error context
     try {
-        return await setupNet(device, new Uint8Array(weightsBuffer), callbackUI);
+        let weights = new Uint8Array(weightsBuffer);
+        // fp16 runner: if the file holds fp32 master weights, cast to fp16 now
+        // (no-op when the file is already fp16). The fp32 runner keeps fp32 as-is.
+        if (!useF32) weights = castSafetensorsToF16(weights, callbackUI);
+        return await setupNet(device, weights, callbackUI);
     } catch (error) {
         throw new Error(
             `Failed to setup network for '${runnerName}': ${error.message}`

@@ -837,6 +837,18 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     const bwStartTime = performance.now();
     const BWInstance = new BWLabeler();
 
+    // When true, components dropped by the per-class "largest component" filters
+    // are repainted with the most common surviving label on their boundary
+    // instead of becoming background. Costs one extra linear (6-neighbour) pass
+    // over the volume; only applies to per-class filtering paths (not the binary
+    // brain-mask path, where dropped voxels are genuinely outside the brain).
+    // Default ON for the 104-class DK-atlas models (ids 5/14), where punching
+    // background holes into a dense parcellation is rarely what we want; the
+    // global opts flag can additionally enable it for other per-class models.
+    const FILL_NEIGHBOR_DEFAULT_IDS = [5, 14];
+    const relabelSuppressed =
+      !!opts.fillSuppressedWithNeighborLabel || FILL_NEIGHBOR_DEFAULT_IDS.includes(modelEntry.id);
+
     // --- Noise guard -------------------------------------------------------
     // A garbage/noise segmentation fragments into a huge number of tiny
     // connected components (we've seen ~1.5M). The labeling pass itself stays
@@ -901,7 +913,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // conn=6, binarize=false, onlyLargest=false) to avoid a redundant pass.
       const cl = guardComponentCount;
       const ls = guardLabels;
-      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO);
+      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO, Vshape, relabelSuppressed);
       segmentationData.set(filtered);
     } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
       // Mixed case (18-class) - Hierarchical approach:
@@ -927,7 +939,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       const targetClasses = new Set([1, 2, 5, 6, 13]);
 
       // Apply mixed filter to keep only largest component for target classes
-      const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses);
+      const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses, Vshape, relabelSuppressed);
       segmentationData.set(filtered);
 
     } else if (!binarize && onlyLargest) {
@@ -937,7 +949,13 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // labeling already produced by the noise guard (same conn=6/binarize=false
       // pass) and only run the largest-cluster selection, avoiding a second
       // full relabeling of this perf-sensitive model.
-      const [_mx, res2] = BWInstance.largest_original_cluster_labels(segmentationData, guardComponentCount, guardLabels);
+      // DIAGNOSTIC (opt-in, output-neutral): inspect components on the ORIGINAL
+      // segmentation (segmentationData not yet overwritten; guardLabels match it)
+      // to understand why a region survives — see diagnose_components.
+      if (opts.diagnoseEnclosedComponents) {
+        BWInstance.diagnose_components(segmentationData, guardComponentCount, guardLabels, Vshape, { label: `model${modelEntry.id}`, topN: 60 });
+      }
+      const [_mx, res2] = BWInstance.largest_original_cluster_labels(segmentationData, guardComponentCount, guardLabels, Vshape, relabelSuppressed);
       segmentationData.set(res2);
     } else {
       // Standard cases (Legacy binarize-then-largest)

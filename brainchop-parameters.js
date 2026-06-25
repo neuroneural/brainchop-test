@@ -12,6 +12,8 @@ const brainChopOpts = {
   isBrainCropMaskBased: true, // Check if brain masking will be used for cropping & optional show or brain tissue will be used
   showPhase1Output: false, // This will load to papaya the output of phase-1 (ie. brain mask or brain tissue)
   isPostProcessEnable: true, // If true 3D Connected Components filter will apply
+  fillSuppressedWithNeighborLabel: false, // If true, blobs dropped by the per-class "largest component" filter are repainted with their surrounding surviving label instead of background (adds one linear neighbour pass; applies to per-class models e.g. 3/8/9, 5/14, 1/7 — not the binary brain-mask path)
+  diagnoseEnclosedComponents: false, // DEBUG: if true, log per-component stats (class, size, largest-of-class?, dominant neighbour & enclosure) for 104-class models to the console. Output-neutral; used to tune island absorption.
   isContoursViewEnable: false, // If true 3D contours of the labeled regions will apply
   browserArrayBufferMaxZDim: 30, // This value depends on Memory available
   telemetryFlag: false, // Ethical and transparent collection of browser usage while adhering to security and privacy standards
@@ -126,94 +128,44 @@ const inferenceModelsList = [
     description:
       'This is a 50-class model, that segments the brain into the Aparc+Aseg Freesurfer Atlas but one where cortical homologues are merged into a single class.'
   },
-  /* --- Old plain 'Aparc+Aseg 104' (model21_104class) replaced by the
-     deep-robust 24-channel model promoted into this slot. Kept for
-     reference / quick rollback. ---
   {
+    // Primary 104-class DK-atlas model. Synth-trained 24ch/104cls gridding-free
+    // MeshNet (affine GroupNorm + GELU), promoted into the canonical Aparc+Aseg 104
+    // slot -- replaces the real-data model24chan104cls entry and the legacy
+    // 21-channel model21_104class. Weights converted from catalyst
+    // synth104_gn_hdc_deep_turbo24_fromreal. Full artifact set in
+    // public/models/model24chan104cls_synth/:
+    //   WebGPU fp16 : dkatlas24_synth_runner.js     + model.safetensors
+    //   WebGPU fp32 : dkatlas24_synth_f32_runner.js + model_f32.safetensors
+    //   WebGL2      : model.json (tfjs topology)     + model.bin
     id: 5,
     type: 'Atlas',
-    path: '/models/model21_104class/model.json',
-    modelName: '\u{1F52A} Aparc+Aseg 104',
-    colormapPath: './models/model21_104class/colormap.json',
-    webgpu_safetensor: './models/model21_104class/model.safetensors', webgpu_runner: 'model21', // 'model21_104class',
-    preModelId: 1, // model run first e.g.  Brain_Extraction  { null, 1, 2, ..  }
-    preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
-    isBatchOverlapEnable: false, // create extra overlap batches for inference
-    numOverlapBatches: 200, // Number of extra overlap batches for inference
-    enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
-    enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
-    cropPadding: 0, // Padding size add to cropped brain
-    autoThreshold: 0, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
-    enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
-    filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
-    enableSeqConv: false, // For low memory system and low configuration, enable sequential convolution instead of last layer
-    textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
-    warning:
-      "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.", // Warning message to show when select the model.
-    inferenceDelay: 100, // Delay in ms time while looping layers applying.
-    description:
-      'FreeSurfer aparc+aseg atlas 104 parcellate brain areas into 104 regions. It contains a combination of the Desikan-Killiany atlas for cortical area and also segmentation of subcortical regions.'
-  },
-  */
-  {
-    id: 5,
-    type: 'Atlas',
-    path: '/models/model24chan104cls/model.json',
-    modelName: '\u{1F52A} Aparc+Aseg 104',
-    colormapPath: './models/model24chan104cls/colormap.json',
-    // WebGPU (primary): fp16 runner + weights by default (dkatlas24_runner.js +
-    // model.safetensors). The fp16 export now does a true-fp16 conversion --
-    // f16-stored activations with f32 accumulators -- giving 123 compute passes and
-    // a single submit. If WebGPU is unavailable, main.js falls back to the WebGL2
-    // worker path automatically.
-    webgpu_safetensor: './models/model24chan104cls/model.safetensors',
-    webgpu_runner: 'dkatlas24',
-    forceFP32: false, // false -> fp16 runner (dkatlas24_runner.js + model.safetensors).
-                      // true  -> fp32 runner (dkatlas24_f32_runner.js + model_f32.safetensors).
-    // Largest WebGPU storage buffer in the SHIPPED dkatlas24_runner.js is a
-    // 24-channel full-volume CONV OUTPUT kept at *fp32*: 24 * 256^3 * 4 = 1.5 GiB
-    // (buf_0 / data0_402653184:array<f32>). The fp16 export already stores the
-    // GroupNorm/GELU outputs as f16, but each conv result is the tensor GroupNorm
-    // reduces over, and tinygrad keeps that shared node at its native f32 -- so 11
-    // full-volume f32 buffers remain (verify: grep -cE '_402653184:array<f32>'). A
-    // plain re-export does NOT shrink this (the shipped runner already postdates the
-    // fp16-activation fix). Reducing it needs tiny_meshnet.py to *materialize* the
-    // conv output as f16 (cast + contiguous/realize before GroupNorm) then re-export
-    // until that grep is 0 -> peak ~768 MiB, under Firefox's 1024 MiB cap. mindgrab
-    // has the same pattern but at 15 ch (960 MiB f32) so it just fits; this 24-ch
-    // model at 1.5 GiB does not. See ADD_DKATLAS24.md. This value matches the actual
-    // allocation so the pre-emptive memory check is truthful and the OOM error-scope
-    // fallback in inference-webgpu.js kicks in cleanly.
+    path: '/models/model24chan104cls_synth/model.json',
+    modelName: '\u{1FA93}\u{1F52A} Aparc+Aseg 104',
+    colormapPath: './models/model24chan104cls_synth/colormap.json',
+    webgpu_safetensor: './models/model24chan104cls_synth/model.safetensors',
+    webgpu_runner: 'dkatlas24_synth', // dedicated runner; fp16 export uses the lossless conv-weight rescale (overflow-safe fast f16 GroupNorm)
+    forceFP32: false, // false -> fp16 runner (dkatlas24_synth_runner.js + model.safetensors).
+                      // true  -> fp32 runner (dkatlas24_synth_f32_runner.js + model_f32.safetensors).
     webgpuStorageSize: 1610612736,
     numClasses: 104,
-    // Gridding-free model: dilations ramp to 31 (RF = 255), matched to the full
-    // 256^3 cube. On WebGPU it runs the full volume like brainchop-cli (no pre-model,
-    // no crop) -- cropping would starve the large-dilation layers of context and
-    // collapse the output. The WebGL2 fallback can't fit the full unpacked volume in
-    // one texture (24*256^3 = ~20066^2 > the 16384 limit), so that path crops instead
-    // (see enableCrop/cropPadding below).
     preModelId: null, // No pre-model; run the full head like the CLI.
-    preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
-    isBatchOverlapEnable: false, // create extra overlap batches for inference
-    numOverlapBatches: 0, // Number of extra overlap batches for inference
-    enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
-    // WebGL2 fallback only: must crop (texture limit above). cropPadding keeps some
-    // background so per-channel GroupNorm stats stay close to the full-volume
-    // distribution the model was trained on. WebGPU ignores crop and runs full volume.
-    enableCrop: true, // WebGL2 fallback needs this (texture limit); WebGPU ignores it.
-    cropPadding: 20, // Max practical margin: this model's RF is 255 (needs full 256^3 context), so
-                     // give the cortex as much surrounding context as fits. Cube must stay <= ~223^3
-                     // (16384^2/24 texels), so if you hit a texture error on a large head, lower this.
-    autoThreshold: 0, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
-    enableQuantileNorm: false, // This model is trained/validated with quantile normalization.
-    filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
-    enableSeqConv: false, // WebGL2 fallback: cropped volume fits the fast (dense) path.
-    textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
+    preModelPostProcess: false,
+    isBatchOverlapEnable: false,
+    numOverlapBatches: 0,
+    enableTranspose: true,
+    enableCrop: true, // WebGL2 fallback needs this (texture limit); WebGPU ignores it and runs full volume.
+    cropPadding: 20,
+    autoThreshold: 0,
+    enableQuantileNorm: true, // synth104 trained with quantile normalization (catalyst pipeline) -- must match at inference (inference-webgpu.js / inference-logic.js). Do NOT set false.
+    filterOutWithPreMask: false,
+    enableSeqConv: true,
+    textureSize: 0,
     warning:
-      "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.", // Warning message to show when select the model.
-    inferenceDelay: 100, // Delay in ms time while looping layers applying.
+      "This model may need a dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
+    inferenceDelay: 100,
     description:
-      'Desikan-Killiany atlas parcellation into 104 regions (cortical + subcortical). A deeper 24-channel gridding-free MeshNet with affine GroupNorm and GELU that replaces the 21-channel model: more robust at the same peak activation memory. Runs on WebGL2 and WebGPU (fp16 default, fp32 selectable).'
+      'Desikan-Killiany atlas parcellation into 104 regions (cortical + subcortical). A deep 24-channel gridding-free MeshNet with affine GroupNorm and GELU, synth-trained for robustness across data quality. Runs on WebGL2 and WebGPU (fp16 default, fp32 selectable).'
   },
   {
     id: 6,
@@ -233,7 +185,7 @@ const inferenceModelsList = [
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
     numOverlapBatches: 0, // Number of extra overlap batches for inference
-    enableTranspose: false, // Keras and tfjs input orientation may need a tranposing step to be matched
+    enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
     enableCrop: false, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
     cropPadding: 0, // Padding size add to cropped brain
       inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
@@ -253,60 +205,42 @@ const inferenceModelsList = [
       'Omnimodal gray and white matter segmentation model using SpatialAE architecture with swish activation. Operates on full T1 image in a single pass but needs a dedicated graphics card to operate.'
   },
   {
+    // Subcortical + GWM (Heavy): the deep gridding-free MeshNet model32chan18cls
+    // (32 channels, 13 conv + 1x1, affine GroupNorm + GELU, dilations -> 31 / RF=255),
+    // same architecture family as the Aparc+Aseg 104 model. Higher capacity than the
+    // default model30chan18cls (id 3) but much heavier: full-volume, ~2 GiB f32 conv
+    // buffer, noticeably slower in-browser -- offered as an opt-in "Heavy" choice.
+    // Assets in public/models/model32chan18cls/:
+    //   WebGPU fp16 : model32chan18cls_runner.js     + model.safetensors     (present; re-export with --beam>=2 to speed up)
+    //   WebGPU fp32 : model32chan18cls_f32_runner.js + model_f32.safetensors  (pending)
+    //   WebGL2      : model.json (tfjs topology)      + model.bin             (pending)
     id: 8,
     type: 'Atlas',
-    path: '/models/model18cls/model.json',
-    modelName: '\u{1FA93} Subcortical + GWM (Small Model)',
-    colormapPath: './models/model18cls/colormap.json',
-    webgpu_safetensor: './models/model18cls/model.safetensors', webgpu_runner: 'model21chan18cls',
-    preModelId: null, // model run first e.g.  Brain_Extraction  { null, 1, 2, ..  }
-    preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
-    isBatchOverlapEnable: false, // create extra overlap batches for inference
-    numOverlapBatches: 200, // Number of extra overlap batches for inference
-    enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
-    enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
-    cropPadding: 0, // Padding size add to cropped brain
-    autoThreshold: 0.2, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
-    enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
-    filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
-    enableSeqConv: true, // For low memory system and low configuration, enable sequential convolution instead of last layer
-    textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
+    path: '/models/model32chan18cls/model.json',
+    modelName: '\u{1FA93} Subcortical + GWM (Heavy)',
+    colormapPath: './models/model32chan18cls/colormap.json',
+    webgpu_safetensor: './models/model32chan18cls/model.safetensors',
+    webgpu_runner: 'model32chan18cls',
+    forceFP32: false, // fp16 default; fp32 auto-used only if device lacks shader-f16 AND the _f32 runner exists.
+    webgpuStorageSize: 2147483648, // 32 * 256^3 * 4 = 2 GiB largest full-volume f32 conv buffer. Exceeds Firefox's ~1 GiB cap -> WebGL2 fallback there.
+    numClasses: 18,
+    preModelId: null, // gridding-free (RF=255): full head, no pre-model/crop on WebGPU.
+    preModelPostProcess: false,
+    isBatchOverlapEnable: false,
+    numOverlapBatches: 0,
+    enableTranspose: true,
+    enableCrop: true, // WebGL2 fallback only (texture limit); WebGPU runs the full volume.
+    cropPadding: 20,
+    autoThreshold: 0,
+    enableQuantileNorm: true, // model32chan18cls trained with quantile normalization -- must match at inference. Do NOT set false.
+    filterOutWithPreMask: false,
+    enableSeqConv: true,
+    textureSize: 0,
     warning:
-      "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.", // Warning message to show when select the model.
-    inferenceDelay: 100, // Delay in ms time while looping layers applying.
+      "Heavy model: needs a dedicated graphics card and is slower than the default Subcortical + GWM. For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
+    inferenceDelay: 100,
     description:
-      'Parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. This is a robust model able to handle range of data quality, including varying saturation, and even clinical scans. It may work on infant brains, but your mileage may vary.'
-  },
-  {
-    id: 9,
-    type: 'Atlas',
-    path: '/models/model_sae32ch18_tfjs/model.json',
-    modelName: '\u{1FA93} Subcortical + GWM (Large Model)',
-    colormapPath: './models/model_sae32ch18_tfjs/colormap.json',
-    webgpu_safetensor: './models/model_sae32ch18_tfjs/model.safetensors', webgpu_runner: 'robust_subcortical',
-    webgpuTTArunner: true,
-    preModelId: null, // model run first e.g.  Brain_Extraction  { null, 1, 2, ..  }
-    preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
-    isBatchOverlapEnable: false, // create extra overlap batches for inference
-    numOverlapBatches: 200, // Number of extra overlap batches for inference
-    enableTranspose: true, // Runner was exported with SAE_PERMUTE off, so transpose the input here to match (vs re-exporting with SAE_PERMUTE=1).
-    enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
-    cropPadding: 0, // Padding size add to cropped brain
-    inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
-    outputPermutation: null, // Inverse of inputPermutation.
-    outputShift: [0, 0, 1], // Manual shift correction [Row, Col, Depth]
-    forceFP32: false, // Force float32 precision for better quality
-    ttaFlipAxis: 0, // Axis to flip for TTA (1 = Depth/Width depending on transpose)      
-    autoThreshold: 0.2, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
-    enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
-    filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
-    enableSeqConv: false, // For low memory system and low configuration, enable sequential convolution instead of last layer
-    textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
-    warning:
-      "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.", // Warning message to show when select the model.
-    inferenceDelay: 100, // Delay in ms time while looping layers applying.
-    description:
-      'Parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. This is a larger capacity version of the 18-class model for potentially better robustness.'
+      'Higher-capacity subcortical + gray/white matter parcellation (17 regions) using a deep 32-channel gridding-free MeshNet (affine GroupNorm + GELU). More robust but heavier and slower in-browser than the default Subcortical + GWM (id 3). WebGPU fp16; WebGL2 fallback and fp32 require the pending asset conversions.'
   },
   {
     id: 10,

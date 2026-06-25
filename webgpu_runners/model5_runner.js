@@ -54,6 +54,35 @@ const addComputePass = (device, commandEncoder, pipeline, layout, infinityUnifor
   passEncoder.end();
 };
 
+// --- SAFARI DEBUG: analyze the pre-argmax logits (gated by window.BC_WEBGPU_DEBUG) ---
+// The final argmax recovers the class via exact float equality with a separately
+// computed per-voxel max; if every channel fails that test (e.g. NaN from fp16
+// overflow, or precision mismatch) the output falls through to a constant index
+// -> a "fully filled cube". This scan reports, per channel, NaN/Inf counts and the
+// finite min/max so we can tell which failure we're in. f16Elems = total f16 count
+// across all channels; channels = number of output classes.
+const debugEnabled = () => (typeof window !== 'undefined' && !!window.BC_WEBGPU_DEBUG);
+const analyzeLogitsF16 = (arrayBuffer, channels, label) => {
+    const data = new Float16Array(arrayBuffer);
+    const perCh = Math.floor(data.length / channels);
+    for (let c = 0; c < channels; c++) {
+        let nan = 0, posInf = 0, negInf = 0, finite = 0;
+        let min = Infinity, max = -Infinity;
+        const base = c * perCh;
+        for (let i = 0; i < perCh; i++) {
+            const v = data[base + i];
+            if (Number.isNaN(v)) { nan++; continue; }
+            if (v === Infinity) { posInf++; continue; }
+            if (v === -Infinity) { negInf++; continue; }
+            finite++;
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+        console.log(`[SAFARI-DEBUG] ${label} ch${c}: finite=${finite} NaN=${nan} +Inf=${posInf} -Inf=${negInf} ` +
+            `min=${finite ? min : 'n/a'} max=${finite ? max : 'n/a'}`);
+    }
+};
+
 const r_8_256_16_32_16_5_3_3_3 = `enable f16;
 fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }
 @group(0) @binding(0)
@@ -2982,6 +3011,25 @@ const setupNet = async (device, safetensor) => {
         addComputePass(device, commandEncoder, pipelines[11], layouts[11], infinityBuf, [output0, buf_21, buf_24], [32768, 2, 1]);
         commandEncoder.copyBufferToBuffer(output0, 0, gpuReadBuffer0, 0, output0.size);
         device.queue.submit([commandEncoder.finish()]);
+
+        // SAFARI DEBUG: read back buf_21 (3-channel pre-argmax logits). buf_21 is
+        // only READ by the max/argmax passes, never overwritten, so it still holds
+        // the logits after submit. Off unless window.BC_WEBGPU_DEBUG is truthy.
+        if (debugEnabled()) {
+            try {
+                const dbgEnc = device.createCommandEncoder();
+                const dbgRead = device.createBuffer({ size: buf_21.size,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+                dbgEnc.copyBufferToBuffer(buf_21, 0, dbgRead, 0, buf_21.size);
+                device.queue.submit([dbgEnc.finish()]);
+                await dbgRead.mapAsync(GPUMapMode.READ);
+                analyzeLogitsF16(dbgRead.getMappedRange().slice(0), 3, 'model5 pre-argmax logits');
+                dbgRead.unmap();
+                dbgRead.destroy();
+            } catch (e) {
+                console.warn('[SAFARI-DEBUG] logits readback failed:', e?.message);
+            }
+        }
 
         await gpuReadBuffer0.mapAsync(GPUMapMode.READ);
         const resultBuffer0 = new Float32Array(gpuReadBuffer0.size/4);
