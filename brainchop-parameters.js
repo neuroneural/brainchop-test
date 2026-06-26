@@ -77,30 +77,42 @@ const inferenceModelsList = [
       'The omnimodal skull stripping model delivers high-accuracy brain extraction in seconds, supporting multiple imaging modalities including T1, T2, FLAIR, DWI, EPI, MRA, PDw, CT, and PET without a need for tuning. It runs in a single pass with only 15 filters per layer, and is offered in high-memory/fast and low-memory/slow configurations. Use it today to improve and accelerate your brain extraction!'
   },
   {
+    // Default Subcortical + GWM: now backed by the deep gridding-free MeshNet
+    // model16chan18cls (16 channels, 13 conv + 1x1, affine GroupNorm + GELU,
+    // dilations -> 31 / RF=255). Lightest/fastest of the deep 18-class family;
+    // the WebGPU build is good enough to be the default (replaces the old
+    // model30chan18cls here). Same family as the Heavy variant (id 8).
+    // Assets in public/models/model16chan18cls/:
+    //   WebGPU fp16 : model16chan18cls_runner.js     + model.safetensors
+    //   WebGPU fp32 : model16chan18cls_f32_runner.js + model_f32.safetensors
+    //   WebGL2      : model.json (tfjs topology)      + model.bin
     id: 3,
     type: 'Atlas',
-    path: '/models/model30chan18cls/model.json',
+    path: '/models/model16chan18cls/model.json',
     modelName: '\u{1FA93} Subcortical + GWM',
-    colormapPath: './models/model30chan18cls/colormap.json',
-      webgpu_safetensor: './models/model30chan18cls/model.safetensors', webgpu_runner: 'model30chan18cls',
-      webgpuTTArunner: true,      
-    preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
-    preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
-    isBatchOverlapEnable: false, // create extra overlap batches for inference
-    numOverlapBatches: 200, // Number of extra overlap batches for inference
+    colormapPath: './models/model16chan18cls/colormap.json',
+    webgpu_safetensor: './models/model16chan18cls/model.safetensors',
+    webgpu_runner: 'model16chan18cls',
+    forceFP32: false, // fp16 default; fp32 auto-used only if device lacks shader-f16 AND the _f32 runner exists.
+    webgpuStorageSize: 1073741824, // 16 * 256^3 * 4 = 1 GiB largest full-volume f32 conv buffer.
+    numClasses: 18,
+    preModelId: null, // gridding-free (RF=255): full head, no pre-model/crop on WebGPU.
+    preModelPostProcess: false,
+    isBatchOverlapEnable: false,
+    numOverlapBatches: 0,
     enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
-    enableCrop: true, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
-    cropPadding: 0, // Padding size add to cropped brain
-    autoThreshold: 0.2, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
-    enableQuantileNorm: false, // Some models needs Quantile Normaliztion.
+    enableCrop: true, // WebGL2 fallback only (texture limit); WebGPU runs the full volume.
+    cropPadding: 20, // Padding size add to cropped brain
+    autoThreshold: 0, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
+    enableQuantileNorm: true, // synth18/turbo16 trained with quantile normalization -- must match at inference. Do NOT set false.
     filterOutWithPreMask: false, // Can be used to multiply final output with premodel output mask to crean noisy areas
-    enableSeqConv: false, // For low memory system and low configuration, enable sequential convolution instead of last layer
+    enableSeqConv: true, // For low memory system and low configuration, enable sequential convolution instead of last layer
     textureSize: 0, // Requested Texture size for the model, if unknown can be 0.
     warning:
       "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.", // Warning message to show when select the model.
     inferenceDelay: 100, // Delay in ms time while looping layers applying.
     description:
-      'Parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. This is a robust model able to handle range of data quality, including varying saturation, and even clinical scans. It may work on infant brains, but your mileage may vary.'
+      'Parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. A deep 16-channel gridding-free MeshNet (affine GroupNorm + GELU), synth-trained for robustness across data quality including varying saturation and clinical scans. The lightest/fastest of the Subcortical + GWM family.'
   },
   {
     id: 4,
