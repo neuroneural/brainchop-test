@@ -414,6 +414,14 @@ async function enableProductionMode(textureF16Flag = true) {
   tf.env().set('WEBGL_FORCE_F16_TEXTURES', textureF16Flag)
   // -- set this flag so that textures are deleted when tensors are disposed.
   tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', -1)
+  // -- Periodically flush the GL command queue (~every 1ms of GPU work).
+  // Firefox defaults this to -1 (never auto-flush) on desktop. NOTE: this does
+  // NOT fully silence Firefox's "ClientWaitSync ... without
+  // SYNC_FLUSH_COMMANDS_BIT" warning -- that comes from tfjs's own fence-poll
+  // readback path (clientWaitSync with timeout 0), which this flag doesn't
+  // cover. The warning is benign (results are correct); kept here only because
+  // periodic flushing tends to help Firefox throughput.
+  tf.env().set('WEBGL_FLUSH_THRESHOLD', 1)
   // -- tf.env().set('WEBGL_PACK', false)
   // -- Put ready after sets above
   await tf.ready()
@@ -543,15 +551,17 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
         niftiImage
       )
     } else {
-      // Transpose MRI data to be match pytorch/keras input output
       console.log('Cropping Disabled')
 
-      if (transpose) {
-        slices_3d = slices_3d.transpose()
-        console.log('Input transposed')
-      } else {
-        console.log('Transpose NOT Enabled')
-      }
+      // NOTE: do NOT transpose slices_3d here. runFullVolumeInference applies the
+      // input transpose itself (modelEntry.enableTranspose / inputPermutation) and
+      // the matching inverse transpose on the output. Transposing here as well
+      // would DOUBLE-transpose the input (back to the original orientation) while
+      // the output is only SINGLE-transposed -- yielding a correctly-labeled but
+      // axis-swapped volume on display (this affected the only enableCrop:false
+      // model, Tissue GWM / id 7). The crop path (inferenceFullVolumePhase1) already
+      // delegates the transpose to runFullVolumeInference; this branch must do the
+      // same so both orientations match -- and match the WebGPU path.
 
       let enableSeqConv = modelEntry.enableSeqConv
 

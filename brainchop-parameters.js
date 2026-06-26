@@ -186,11 +186,12 @@ const inferenceModelsList = [
     isBatchOverlapEnable: false, // create extra overlap batches for inference
     numOverlapBatches: 0, // Number of extra overlap batches for inference
     enableTranspose: true, // Keras and tfjs input orientation may need a tranposing step to be matched
+    webglEnableTranspose: false, // WebGL-only override: this model's tfjs export expects the UNtransposed orientation (unlike its WebGPU safetensors export, which needs enableTranspose:true). With transpose on, the WebGL segmentation degrades to noise. WebGPU is unaffected by this flag.
     enableCrop: false, // For speed-up inference, crop brain from background before feeding to inference model to lower memory use.
-    cropPadding: 0, // Padding size add to cropped brain
+    cropPadding: 10, // Padding size add to cropped brain
       inputPermutation: null, // [0, 1, 2] etc. Overrides enableTranspose if set.
       outputPermutation: null, // Inverse of inputPermutation.
-    outputShift: [0, 0, 1], // Manual shift correction [Row, Col, Depth]
+    outputShift: [0, 0, 0], // No shift: matches the (correct) WebGPU display. outputShift is a WebGL-only correction (restoreToOriginalSize); the WebGPU path ignores it, so a non-zero value here desyncs WebGL from WebGPU by that many voxels. [Row, Col, Depth]
     forceFP32: false, // Force float32 precision for better quality
     ttaFlipAxis: 0, // Axis to flip for TTA (1 = Depth/Width depending on transpose)
     autoThreshold: 0.2, // Threshold between 0 and 1, given no preModel and tensor is normalized either min-max or by quantiles. Will remove noisy voxels around brain
