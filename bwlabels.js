@@ -660,17 +660,103 @@ export class BWLabeler {
    * @param {Uint32Array} ls - Label map
    * @param {number} maxRank - Max number of components to keep per class (e.g. 2)
    */
-  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0, dim = null, relabelSuppressed = false) {
+  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0, dim = null, relabelSuppressed = false, nearBrainMaxGap = null, diag = false) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
 
-    // 1. Map labels to original classes and count sizes
+    // Spatial gate (`nearBrainMaxGap`, in VOXELS): a NON-largest kept component
+    // is retained only if the gap between its bounding box and the MAIN BRAIN's
+    // bounding box is <= this many voxels. A genuinely detached cerebellum
+    // touches the cerebrum (gap ~= 0) and survives; a phantom blob outside the
+    // head is separated by a real gap and is dropped. Unlike a centroid-in-
+    // expanded-bbox test, a bbox GAP does not depend on the brain's size
+    // (the brain bbox fills most of a 256^3 head, which made the expanded-bbox
+    // test a near no-op). Disabled (null) -> original rank-only behavior.
+    const useDist = nearBrainMaxGap != null && Array.isArray(dim) && dim.length === 3;
+    // Decode a linear index to (A, B, C) using the SAME convention as idx():
+    // idx = C*DIM0*DIM1 + B*DIM0 + A, i.e. A is the fastest-varying axis.
+    const D0 = useDist ? dim[0] : 0;
+    const D1 = useDist ? dim[1] : 0;
+    const minA = useDist ? new Int32Array(cl + 1).fill(2147483647) : null;
+    const maxA = useDist ? new Int32Array(cl + 1).fill(-1) : null;
+    const minB = useDist ? new Int32Array(cl + 1).fill(2147483647) : null;
+    const maxB = useDist ? new Int32Array(cl + 1).fill(-1) : null;
+    const minC = useDist ? new Int32Array(cl + 1).fill(2147483647) : null;
+    const maxC = useDist ? new Int32Array(cl + 1).fill(-1) : null;
+
+    // 1. Map labels to original classes, count sizes, accumulate per-comp bbox
     for (let i = 0; i < nvox; i++) {
       const comp = ls[i]
       if (comp > 0) {
         if (ls2bw[comp] === 0) ls2bw[comp] = bw[i];
         sumls[comp]++;
+        if (useDist) {
+          const a = i % D0;
+          const t = (i / D0) | 0;
+          const b = t % D1;
+          const c = (t / D1) | 0;
+          if (a < minA[comp]) minA[comp] = a; if (a > maxA[comp]) maxA[comp] = a;
+          if (b < minB[comp]) minB[comp] = b; if (b > maxB[comp]) maxB[comp] = b;
+          if (c < minC[comp]) minC[comp] = c; if (c > maxC[comp]) maxC[comp] = c;
+        }
+      }
+    }
+
+    // Spatial gate setup: find the globally-largest component (the brain), then
+    // measure each candidate's SURFACE distance to it -- the shortest path of
+    // voxels (through any space) from the candidate to the brain, via a
+    // multi-source 6-connected BFS from all brain voxels. A detached cerebellum
+    // nearly touches the cerebrum (a few voxels of CSF), so its surface distance
+    // is small; a phantom blob outside the head is separated by a large empty
+    // gap. NOTE: a bounding-box gap fails here -- the cerebrum bbox fills most of
+    // the head and ENCLOSES the phantom's region, giving a misleading gap of 0;
+    // surface distance measures the actual empty separation instead.
+    let surfDist = null;  // Float64Array(cl+1): min BFS distance of each comp to brain
+    let brainComp = 0;
+    if (useDist) {
+      let brainSize = -1;
+      for (let i = 1; i <= cl; i++) {
+        if (sumls[i] > brainSize) { brainSize = sumls[i]; brainComp = i; }
+      }
+      // City-block BFS, capped a few layers beyond the threshold (monotonic, so
+      // the cap is all the gate needs). dist = -1 stays "farther than the cap".
+      const MAX_SCAN = Math.max(2, Math.ceil(nearBrainMaxGap) + 4);
+      const D0D1 = D0 * D1;
+      const dist = new Int16Array(nvox).fill(-1);
+      let frontier = [];
+      for (let i = 0; i < nvox; i++) {
+        if (ls[i] === brainComp) { dist[i] = 0; frontier.push(i); }
+      }
+      for (let d = 1; d <= MAX_SCAN && frontier.length; d++) {
+        const next = [];
+        for (let f = 0; f < frontier.length; f++) {
+          const v = frontier[f];
+          const a = v % D0;
+          const t = (v / D0) | 0;
+          const b = t % D1;
+          if (a > 0 && dist[v - 1] === -1) { dist[v - 1] = d; next.push(v - 1); }
+          if (a < D0 - 1 && dist[v + 1] === -1) { dist[v + 1] = d; next.push(v + 1); }
+          if (b > 0 && dist[v - D0] === -1) { dist[v - D0] = d; next.push(v - D0); }
+          if (b < D1 - 1 && dist[v + D0] === -1) { dist[v + D0] = d; next.push(v + D0); }
+          if (v - D0D1 >= 0 && dist[v - D0D1] === -1) { dist[v - D0D1] = d; next.push(v - D0D1); }
+          if (v + D0D1 < nvox && dist[v + D0D1] === -1) { dist[v + D0D1] = d; next.push(v + D0D1); }
+        }
+        frontier = next;
+      }
+      // Per-component minimum distance to the brain (FAR if beyond the scan cap).
+      const FAR = MAX_SCAN + 1;
+      surfDist = new Float64Array(cl + 1).fill(FAR);
+      for (let i = 0; i < nvox; i++) {
+        const comp = ls[i];
+        if (comp > 0 && comp !== brainComp) {
+          const dd = dist[i] >= 0 ? dist[i] : FAR;
+          if (dd < surfDist[comp]) surfDist[comp] = dd;
+        }
+      }
+      if (diag) {
+        console.log(`[rank-filter] brain comp=${brainComp} size=${brainSize} ` +
+          `bbox A[${minA[brainComp]},${maxA[brainComp]}] B[${minB[brainComp]},${maxB[brainComp]}] C[${minC[brainComp]},${maxC[brainComp]}] | maxGap=${nearBrainMaxGap} scan=${MAX_SCAN}`);
       }
     }
 
@@ -703,11 +789,24 @@ export class BWLabeler {
       const largest = components.length ? components[0].size : 0;
       const sizeFloor = minRatio > 0 ? largest * minRatio : 0;
 
-      // Keep top K (subject to the size floor)
+      // Keep top K (subject to the size floor). The per-class largest (k=0) is
+      // always kept; secondary kept components must also pass the spatial gate
+      // (when enabled) so far-away phantoms are dropped but a detached
+      // cerebellum (touching the brain, gap ~= 0) survives.
       const count = Math.min(components.length, maxRank);
       for (let k = 0; k < count; k++) {
-        if (components[k].size < sizeFloor) break;
-        keepLabel[components[k].i] = 1;
+        const comp = components[k];
+        if (comp.size < sizeFloor) {
+          if (diag && k > 0) console.log(`[rank-filter] class ${classID} #${k}: size=${comp.size} DROP (below ${(minRatio*100).toFixed(0)}% floor)`);
+          break;
+        }
+        if (k > 0 && useDist) {
+          const g = surfDist[comp.i];
+          const pass = g <= nearBrainMaxGap;
+          if (diag) console.log(`[rank-filter] class ${classID} #${k}: size=${comp.size} surfDist=${g} -> ${pass ? 'KEEP' : 'DROP (too far)'}`);
+          if (!pass) continue;
+        }
+        keepLabel[comp.i] = 1;
       }
     }
 

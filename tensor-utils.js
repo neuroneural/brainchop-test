@@ -335,6 +335,209 @@ export async function gn_convByOutputChannelAndInputSlicing(input, filter, biase
 //     return finalResult;
 // }
 
+// ===========================================================================
+// CHANNEL-LIST (sequential) convolution path
+// ---------------------------------------------------------------------------
+// The functions below carry a layer's activation as a JavaScript ARRAY of
+// single-channel tensors ([1, D, H, W, 1] each) instead of one packed
+// [1, D, H, W, C] tensor. For the large gridding-free MeshNet models the full
+// multi-channel activation (~256x204x204x24) would be materialized by tfjs as
+// an unpacked WebGL2 texture larger than the 8192 limit and throw. A single
+// channel is only ~3257^2 packed, comfortably under the limit -- so as long as
+// no tensor ever holds more than one channel, every texture fits.
+//
+// These replace the old convByOutputChannelAndInputSlicing / gn_ variants,
+// whose final `tf.concat([...], 4)` rebuilt the oversized full tensor.
+// ===========================================================================
+
+/**
+ * Compute ONE output channel of a Conv3D as a single-channel [1, D, H, W, 1]
+ * tensor, reading inputs from a channel-list (array of single-channel tensors).
+ * Input channels are gathered in small groups of `sliceSize` so the only
+ * multi-channel tensor ever built is a tiny [1, D, H, W, sliceSize] temporary.
+ *
+ * @param {tf.Tensor[]} inputList Array of [1, D, H, W, 1] input channels.
+ * @param {tf.Tensor} filter Conv3D kernel [kD, kH, kW, inC, outC].
+ * @param {tf.Tensor|null} biases Bias vector [outC] or null.
+ * @param {number} channel Index of the output channel to compute.
+ * @returns {tf.Tensor} A kept [1, D, H, W, 1] tensor (caller disposes).
+ */
+function convOneOutputChannel(inputList, filter, biases, channel, stride, pad, dilationRate, sliceSize) {
+  const inChannels = inputList.length;
+  return tf.tidy(() => {
+    let acc = null;
+    const numSlices = Math.ceil(inChannels / sliceSize);
+    for (let i = 0; i < numSlices; i++) {
+      const start = i * sliceSize;
+      const end = Math.min((i + 1) * sliceSize, inChannels);
+      const group = end - start;
+      // Gather this small group of input channels. group===1 avoids a needless
+      // concat (and never materializes anything wider than `sliceSize`).
+      const inputSlice = group === 1
+        ? inputList[start]
+        : tf.concat(inputList.slice(start, end), 4);
+      const filterSlice = filter.slice([0, 0, 0, start, channel], [-1, -1, -1, group, 1]);
+      const part = tf.conv3d(inputSlice, filterSlice, stride, pad, 'NDHWC', dilationRate);
+      acc = acc === null ? part : acc.add(part);
+    }
+    if (biases) {
+      acc = acc.add(biases.slice([channel], [1]));
+    }
+    return acc;
+  });
+}
+
+/**
+ * Channel-list Conv3D: returns an ARRAY of single-channel [1, D, H, W, 1]
+ * tensors (one per output channel) instead of a concatenated full tensor.
+ * Optionally applies per-channel normalization (the affine-GroupNorm export
+ * decomposes GroupNorm into per-channel instance-norm + a diagonal 1x1
+ * "affine_*" conv, so per-channel normalization here is mathematically exact).
+ * Uses the CENTERED-variance LayerNormInPlace -- the same normalization the
+ * dense WebGL path uses, which is required for fp16-texture stability (the
+ * one-pass E[x^2]-E[x]^2 form cancels catastrophically in fp16 and produces
+ * pure-noise segmentations).
+ *
+ * Caller owns the returned array and must dispose it (tf.dispose(list)).
+ *
+ * @param {tf.Tensor[]} inputList Array of [1, D, H, W, 1] input channels.
+ * @param {tf.Tensor} filter Conv3D kernel [kD, kH, kW, inC, outC].
+ * @param {tf.Tensor|null} biases Bias vector [outC] or null.
+ * @param {boolean} applyNorm Apply per-channel GroupNorm (instance norm) to each output channel.
+ * @returns {tf.Tensor[]} Array of `outC` single-channel tensors.
+ */
+export function convChannelList(inputList, filter, biases, stride, pad, dilationRate, sliceSize, applyNorm = false) {
+  const outChannels = filter.shape[4];
+  const outputList = [];
+  for (let c = 0; c < outChannels; c++) {
+    let ch = convOneOutputChannel(inputList, filter, biases, c, stride, pad, dilationRate, sliceSize);
+    if (applyNorm) {
+      const normed = LayerNormInPlace(ch); // centered-variance, fp16-safe, per-channel
+      ch.dispose();
+      ch = normed;
+    }
+    outputList.push(ch);
+  }
+  return outputList;
+}
+
+/**
+ * Channel-list transposed (strided up-sampling) Conv3D, for SpatialAE-style
+ * MeshNet variants (e.g. Tissue GWM / model_sae16ch3). Returns an ARRAY of
+ * single-channel [1, D', H', W', 1] tensors (one per output channel) without
+ * ever materializing a full multi-channel activation -- so the up-sampled
+ * 256^3 result stays under the WebGL2 8192 texture limit.
+ *
+ * The tfjs/Keras Conv3DTranspose kernel layout is [kD, kH, kW, outC, inC]
+ * (out/in swapped vs Conv3D). Each output channel is the sum over input
+ * channels of conv3dTranspose(inChannel, kernel[..., o, c]).
+ *
+ * @param {tf.Tensor[]} inputList Array of [1, D, H, W, 1] input channels.
+ * @param {tf.Tensor} filter Conv3DTranspose kernel [kD, kH, kW, outC, inC].
+ * @param {tf.Tensor|null} biases Bias vector [outC] or null.
+ * @param {number[]} outSpatialShape Output [D', H', W'] (from layer.computeOutputShape).
+ * @returns {tf.Tensor[]} Array of `outC` single-channel tensors.
+ */
+export function convTransposeChannelList(inputList, filter, biases, outSpatialShape, stride, pad) {
+  const outChannels = filter.shape[3];
+  const inChannels = filter.shape[4];
+  const outShape5d = [1, outSpatialShape[0], outSpatialShape[1], outSpatialShape[2], 1];
+  const outputList = [];
+  for (let o = 0; o < outChannels; o++) {
+    const ch = tf.tidy(() => {
+      let acc = null;
+      for (let c = 0; c < inChannels; c++) {
+        const kSlice = filter.slice([0, 0, 0, o, c], [-1, -1, -1, 1, 1]); // [kD,kH,kW,1,1]
+        const part = tf.conv3dTranspose(inputList[c], kSlice, outShape5d, stride, pad);
+        acc = acc === null ? part : acc.add(part);
+      }
+      if (biases) {
+        acc = acc.add(biases.slice([o], [1]));
+      }
+      return acc;
+    });
+    outputList.push(ch);
+  }
+  return outputList;
+}
+
+/**
+ * Final classifier + argmax over a channel-list input, without ever building
+ * the full [1, D, H, W, numClasses] logits tensor. Computes each class logit as
+ * a single-channel tensor and folds it into a running (max-logit, argmax-index)
+ * pair -- the same incremental-argmax trick as SequentialConvLayer, but reading
+ * from a channel-list instead of a packed tensor.
+ *
+ * @param {tf.Tensor[]} inputList Array of [1, D, H, W, 1] activations (backbone output).
+ * @param {tf.Tensor} weights Final Conv3D kernel [kD, kH, kW, inC, numClasses].
+ * @param {tf.Tensor|null} biases Bias vector [numClasses] or null.
+ * @param {function} [callbackUI] Optional progress callback (msg, frac).
+ * @returns {Promise<tf.Tensor>} Squeezed [D, H, W] argmax label volume (float32).
+ */
+export async function seqConvArgMaxChannelList(inputList, weights, biases, stride, pad, dilationRate, callbackUI, isWebWorker = true) {
+  const numClasses = weights.shape[4];
+  const sliceSize = 3;
+  // The running max/argmax are kept at RANK 3 ([D, H, W]). tf.where (select) on
+  // the WebGL backend only supports up to rank 4 -- Firefox throws "Where for
+  // rank 5 is not yet supported" on the [1, D, H, W, 1] form -- so we reshape
+  // each single-channel logit down to [D, H, W] before the compare/select.
+  let outB = null; // running max logit  [D, H, W]
+  let outC = null; // running argmax idx [D, H, W]
+  let spatialShape = null;
+
+  for (let k = 0; k < numClasses; k++) {
+    const logit5d = convOneOutputChannel(inputList, weights, biases, k, stride, pad, dilationRate, sliceSize);
+    if (spatialShape === null) {
+      // [1, D, H, W, 1] -> [D, H, W]
+      spatialShape = [logit5d.shape[1], logit5d.shape[2], logit5d.shape[3]];
+    }
+    const logit = tf.tidy(() => logit5d.reshape(spatialShape));
+    logit5d.dispose();
+
+    if (outB === null) {
+      outB = logit;
+      outC = tf.zerosLike(logit);
+    } else {
+      const [newB, newC] = tf.tidy(() => {
+        const greater = tf.greater(logit, outB);
+        return [tf.where(greater, logit, outB), tf.where(greater, tf.fill(outC.shape, k), outC)];
+      });
+      outB.dispose();
+      outC.dispose();
+      logit.dispose();
+      outB = newB;
+      outC = newC;
+    }
+    if (callbackUI) callbackUI(`Final layer class ${k + 1}/${numClasses}`, (k + 1) / numClasses);
+    // Yield to the event loop periodically so the UI can update / avoid GPU
+    // watchdog timeouts on the long classifier loop (only on main thread).
+    if (!isWebWorker && (k % 8 === 0)) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
+  outB.dispose();
+  return outC; // already [D, H, W]
+}
+
+/**
+ * Split a packed [1, D, H, W, C] tensor into a channel-list of C single-channel
+ * [1, D, H, W, 1] tensors. For C===1 the input is returned as a one-element list
+ * WITHOUT copying (the caller then owns disposal via the list).
+ *
+ * @param {tf.Tensor} tensor Packed [1, D, H, W, C] tensor.
+ * @returns {tf.Tensor[]} Array of C single-channel tensors.
+ */
+export function splitToChannelList(tensor) {
+  const C = tensor.shape[4];
+  if (C === 1) return [tensor];
+  const list = [];
+  for (let c = 0; c < C; c++) {
+    list.push(tensor.slice([0, 0, 0, 0, c], [-1, -1, -1, -1, 1]));
+  }
+  return list;
+}
+
 /**
  * Applies instance normalization to a tensor and disposes the input tensor
  * to simulate an in-place operation, minimizing peak memory usage.
@@ -909,11 +1112,22 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // touching the much-larger cerebellum. Tune UP if noise remains; tune
       // DOWN if a small detached cerebellum ever gets clipped.
       const SMALL_COMPONENT_MIN_RATIO = 0.02;
+      // Spatial gate (SURFACE distance in VOXELS): the 2nd component per class is
+      // kept ONLY if its shortest empty-space path to the main brain is within
+      // this many voxels. A detached cerebellum nearly touches the cerebrum
+      // (surfDist ~= a few voxels of CSF) and is kept; a phantom blob outside the
+      // head is separated by a large empty gap and is dropped. We measure SURFACE
+      // distance (multi-source BFS from the brain), NOT a bounding-box gap: the
+      // cerebrum bbox fills most of a 256^3 head and encloses a far phantom's
+      // bbox, giving a misleading gap of 0. Tune UP to keep farther pieces, DOWN
+      // to be stricter. (BFS scans ~GAP+4 layers, so larger values cost a bit more.)
+      const NEAR_BRAIN_MAX_GAP = 8;
+      const DIAG_RANK_FILTER = false; // set true to log brain bbox + per-component surfDist/keep decision
       // Reuse the labeling already computed by the noise guard (identical call:
       // conn=6, binarize=false, onlyLargest=false) to avoid a redundant pass.
       const cl = guardComponentCount;
       const ls = guardLabels;
-      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO, Vshape, relabelSuppressed);
+      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO, Vshape, relabelSuppressed, NEAR_BRAIN_MAX_GAP, DIAG_RANK_FILTER);
       segmentationData.set(filtered);
     } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
       // Mixed case (18-class) - Hierarchical approach:
