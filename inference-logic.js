@@ -4,6 +4,10 @@ import {
   applyMriThreshold,
   convByOutputChannelAndInputSlicing,
   gn_convByOutputChannelAndInputSlicing,
+  convChannelList,
+  convTransposeChannelList,
+  seqConvArgMaxChannelList,
+  splitToChannelList,
   LayerNormInPlace,
   firstLastNonZero3D,
   cropAndGetCorner,
@@ -76,6 +80,17 @@ export async function runFullVolumeInference(
   // Capture original dimensions for restoration
   const originalVolumeShape = slices_3d.shape;
 
+  // WebGL-path-only transpose override. Some models' tfjs (WebGL) export expects
+  // a DIFFERENT input orientation than their WebGPU (safetensors) export. When
+  // modelEntry.webglEnableTranspose is defined it overrides enableTranspose for
+  // THIS (WebGL) path only; the WebGPU path (inference-webgpu.js) always uses
+  // modelEntry.enableTranspose. Example: Tissue GWM (id 7) needs transpose ON for
+  // WebGPU but OFF for WebGL -- with it on, WebGL feeds the tfjs model the wrong
+  // orientation and the segmentation degrades to noise.
+  const webglEnableTranspose = (modelEntry.webglEnableTranspose !== undefined)
+    ? modelEntry.webglEnableTranspose
+    : modelEntry.enableTranspose;
+
   // Cropping and Padding
   // Cropping and Padding
   const pad = modelEntry.cropPadding;
@@ -113,7 +128,7 @@ export async function runFullVolumeInference(
   if (modelEntry.inputPermutation) {
     console.log(`Permuting Input: ${modelEntry.inputPermutation}`);
     cropped_slices_3d_w_pad = cropped_slices_3d_w_pad.transpose(modelEntry.inputPermutation);
-  } else if (modelEntry.enableTranspose) {
+  } else if (webglEnableTranspose) {
     cropped_slices_3d_w_pad = cropped_slices_3d_w_pad.transpose();
     console.log('Input transposed for pre-model');
   }
@@ -300,6 +315,119 @@ export async function runFullVolumeInference(
     return currentOutputTensor;
   }
 
+  // --- CHANNEL-LIST INFERENCE LOOP (memory-frugal WebGL2 path) ---------------
+  // Threads the activation through the backbone as an ARRAY of single-channel
+  // [1, D, H, W, 1] tensors, so no [1, D, H, W, C] intermediate is ever built
+  // (which would exceed WebGL2's 8192 texture limit for the big models).
+  // Layer handling is driven off topology (class name + activation), not
+  // hardcoded indices, so any MeshNet model works:
+  //   - Conv3D (linear): channel-list conv; if name ends with `_gn`, fuse the
+  //     per-channel instance-norm (GroupNorm decomposed) into each output channel.
+  //   - Activation (gelu/relu/elu/...): elementwise map over the channel-list.
+  // Returns the backbone output as a channel-list (caller runs the final layer).
+  async function runChannelListInferenceLoop(res, inputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI) {
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
+    const SYNC_GPU_EVERY_N_LAYERS = (isSafari || isFirefox) ? 4 : 6;
+
+    // Split the (single- or multi-channel) input into a channel-list. For the
+    // 1-channel input this takes ownership of inputTensor (no copy); it is
+    // disposed when layer 1 produces the next list.
+    let currentList = splitToChannelList(inputTensor);
+
+    let i = 1;
+    while (i <= loopEnd) {
+      try {
+        const layer = res.layers[i];
+        const cn = layer.getClassName();
+        const act = layer.activation;
+        let nextList;
+
+        if (cn === 'Conv3D' && act && act.getClassName() === 'linear') {
+          // Linear Conv3D: dilated backbone conv (`_gn` -> fuse instance norm),
+          // the diagonal 1x1 affine conv, or a strided/downsample conv. All go
+          // through the same channel-list conv (stride/dilation/bias honored).
+          const isGN = layer.name.endsWith('_gn');
+          nextList = convChannelList(
+            currentList,
+            layer.getWeights()[0],
+            layer.getWeights()[1],
+            layer.strides,
+            layer.padding,
+            layer.dilationRate,
+            3,
+            isGN
+          );
+        } else if (cn === 'Activation') {
+          // Elementwise activation -> map over the channel-list.
+          nextList = currentList.map((t) => tf.tidy(() => layer.apply(t)));
+        } else if (cn === 'Conv3D') {
+          // Conv3D whose built-in activation is non-linear: do the linear conv
+          // via the channel-list, then apply the activation per channel.
+          nextList = convChannelList(
+            currentList,
+            layer.getWeights()[0],
+            layer.getWeights()[1],
+            layer.strides,
+            layer.padding,
+            layer.dilationRate,
+            3,
+            false
+          );
+          const activated = nextList.map((t) => tf.tidy(() => layer.activation.apply(t)));
+          tf.dispose(nextList);
+          nextList = activated;
+        } else if (cn === 'Conv3DTranspose') {
+          // Strided up-sampling conv (SpatialAE decoder, e.g. Tissue GWM SAE).
+          // Compute the output spatial dims from the layer itself (robust to
+          // any stride/kernel/padding), then run the channel-list transpose conv.
+          const inSpatial = [currentList[0].shape[1], currentList[0].shape[2], currentList[0].shape[3]];
+          const outShape = layer.computeOutputShape([1, inSpatial[0], inSpatial[1], inSpatial[2], currentList.length]);
+          const outSpatial = [outShape[1], outShape[2], outShape[3]];
+          nextList = convTransposeChannelList(
+            currentList,
+            layer.getWeights()[0],
+            layer.getWeights()[1],
+            outSpatial,
+            layer.strides,
+            layer.padding
+          );
+          // Apply the layer's activation per channel if it's non-linear.
+          if (layer.activation && layer.activation.getClassName() !== 'linear') {
+            const activated = nextList.map((t) => tf.tidy(() => layer.activation.apply(t)));
+            tf.dispose(nextList);
+            nextList = activated;
+          }
+        } else {
+          throw new Error(`Channel-list path: unsupported layer ${cn} (${layer.name})`);
+        }
+
+        // Dispose the previous layer's list as soon as the next is produced.
+        tf.dispose(currentList);
+        currentList = nextList;
+      } catch (err) {
+        tf.dispose(currentList);
+        callbackUI(err.message, -1, err.message);
+        tf.engine().endScope();
+        tf.engine().disposeVariables();
+        markFailure(statData, err, 'Failed while model layer ' + i + ' apply (channel-list)');
+        callbackUI('', -1, '', statData);
+        throw err;
+      }
+
+      callbackUI('Layer ' + i.toString(), (i + 1) / layersLength);
+      if (i % SYNC_GPU_EVERY_N_LAYERS === 0) {
+        // Periodic GPU sync on a single channel keeps the command queue bounded
+        // without ever reading back a full multi-channel tensor.
+        const firstElement = currentList[0].slice([0, 0, 0, 0, 0], [1, 1, 1, 1, 1]);
+        await firstElement.data();
+        firstElement.dispose();
+      }
+      i++;
+    }
+    return currentList;
+  }
+
   // --- 3. MAIN INFERENCE (TTA Enabled) ---
   const startTime = performance.now();
   const skipFinalLayer = modelEntry.enableSeqConv || useChunkedArgMax;
@@ -307,83 +435,110 @@ export async function runFullVolumeInference(
 
 
 
-  if (modelEntry.enableTTA) {
-    console.log('--- Running TTA Pass 1 (Original) ---');
-    // input1 is the reshaped 5D tensor from line 97
-    const input1 = currentOutputTensor;
-    // Note: runModelInferenceLoop disposes input1.
-    const logits1 = await runModelInferenceLoop(res, input1, loopEnd, layersLength, modelEntry, statData, callbackUI);
-
-    if (!logits1) throw new Error("TTA Error: logits1 is null or undefined");
-
-    console.log('--- Running TTA Pass 2 (Flipped) ---');
-    const flipAxis = modelEntry.ttaFlipAxis || 1;
-    // input2 must be 5D. Reverse 3D then reshape.
-    const input2 = cropped_slices_3d_w_pad.clone().reverse(flipAxis).reshape(adjusted_input_shape);
-    const logits2 = await runModelInferenceLoop(res, input2, loopEnd, layersLength, modelEntry, statData, callbackUI);
-
-    if (!logits2) throw new Error("TTA Error: logits2 is null or undefined");
-
-    console.log('--- Averaging TTA Results ---');
-    // WebGL cannot reverse rank-5 tensors. Reshape to 4D -> Reverse -> Reshape back.
-    const logits2_flipped = tf.tidy(() => {
-      const shape = logits2.shape; // [B, D, H, W, C]
-      // Flatten B and D to create 4D [B*D, H, W, C]. Axis mapping works for 0,1,2.
-      return logits2.reshape([shape[0] * shape[1], shape[2], shape[3], shape[4]])
-        .reverse(flipAxis)
-        .reshape(shape);
-    });
-
-    // Use instance method to avoid potential issue with tf.add shim
-    currentOutputTensor = logits1.add(logits2_flipped).div(2.0);
-
-    logits1.dispose();
-    logits2.dispose();
-    logits2_flipped.dispose();
-    // input1/input2 disposed by loop logic
-    cropped_slices_3d_w_pad.dispose();
-  } else {
-    // Standard execution: Use the 5D tensor prepared at line 97
-    currentOutputTensor = await runModelInferenceLoop(res, currentOutputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI);
-    cropped_slices_3d_w_pad.dispose();
-  }
-
-  // --- 4. FINAL PROCESSING (Conditional based on strategy) ---
+  // --- 3/4. INFERENCE + FINAL PROCESSING (path-dependent) ---
   let outLabelVolume;
 
   if (modelEntry.enableSeqConv) {
-    // --- FINAL PROCESSING FOR SEQCONV ---
-    console.log('Applying final SequentialConvLayer...');
-    const seqConvLayer = new SequentialConvLayer(res, 10, isChannelLast, callbackUI);
-    const seqConvResult = await seqConvLayer.apply(currentOutputTensor);
-    outLabelVolume = seqConvResult.asType('int32');
-    seqConvResult.dispose();
-    currentOutputTensor.dispose(); // Dispose the input to the final layer
-    console.log('SequentialConvLayer output shape:', outLabelVolume.shape);
+    // ===== CHANNEL-LIST PATH (memory-frugal, WebGL2 texture-safe) ============
+    // The backbone activation is carried as an array of single-channel tensors,
+    // so no full [1, D, H, W, C] intermediate is ever materialized. This is the
+    // path used when the dense/packed path would exceed WebGL2's 8192 texture
+    // limit (the big gridding-free models: 24ch/104cls, 32ch/18cls).
+    if (modelEntry.enableTTA) {
+      console.warn('[channel-list] TTA is not supported on the channel-list path; running a single pass.');
+    }
+    const backboneList = await runChannelListInferenceLoop(
+      res, currentOutputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI
+    );
+    cropped_slices_3d_w_pad.dispose();
 
-  } else if (useChunkedArgMax) {
-    // --- FINAL PROCESSING WITH CHUNKED FINAL LAYER (Fast Path + Safe Final Conv/ArgMax) ---
-    // The final conv layer (e.g., 30→50 channels) would create a 50-channel output
-    // that exceeds texture limits when unpacked for argmax. Use SequentialConvLayer
-    // for ONLY the final layer, which chunks both conv and argmax operations.
-    console.log('Applying SequentialConvLayer for final layer only (fast path for layers 1-18)...');
-    const seqConvLayer = new SequentialConvLayer(res, 10, isChannelLast, callbackUI);
-    const seqConvResult = await seqConvLayer.apply(currentOutputTensor);
-    outLabelVolume = seqConvResult.asType('int32');
-    seqConvResult.dispose();
-    currentOutputTensor.dispose();
-    console.log('SequentialConvLayer (final only) output shape:', outLabelVolume.shape);
+    // Final classifier + incremental argmax, straight from the channel-list
+    // (never builds the full [.,numClasses] logits tensor).
+    console.log('Applying channel-list final classifier + argmax...');
+    const finalLayer = res.layers[layersLength - 1];
+    const isWebWorker = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
+    const argmaxVolume = await seqConvArgMaxChannelList(
+      backboneList,
+      finalLayer.getWeights()[0],
+      finalLayer.getWeights()[1],
+      finalLayer.strides,
+      finalLayer.padding,
+      finalLayer.dilationRate,
+      callbackUI,
+      isWebWorker
+    );
+    tf.dispose(backboneList);
+    outLabelVolume = argmaxVolume.asType('int32');
+    argmaxVolume.dispose();
+    console.log('Channel-list argmax output shape:', outLabelVolume.shape);
 
   } else {
-    // --- FINAL PROCESSING FOR STANDARD METHOD ---
-    console.log('Applying final ArgMax...');
-    outLabelVolume = tf.tidy(() => {
-      const axis = isChannelLast ? -1 : 1;
-      const prediction_argmax = tf.argMax(currentOutputTensor, axis);
-      return tf.squeeze(prediction_argmax);
-    });
-    currentOutputTensor.dispose(); // The tidy already disposed the original, but this is safe
-    console.log('ArgMax output shape:', outLabelVolume.shape);
+    // ===== DENSE PATH (fast packed path; optional chunked final argmax) ======
+    if (modelEntry.enableTTA) {
+      console.log('--- Running TTA Pass 1 (Original) ---');
+      // input1 is the reshaped 5D tensor
+      const input1 = currentOutputTensor;
+      // Note: runModelInferenceLoop disposes input1.
+      const logits1 = await runModelInferenceLoop(res, input1, loopEnd, layersLength, modelEntry, statData, callbackUI);
+
+      if (!logits1) throw new Error("TTA Error: logits1 is null or undefined");
+
+      console.log('--- Running TTA Pass 2 (Flipped) ---');
+      const flipAxis = modelEntry.ttaFlipAxis || 1;
+      // input2 must be 5D. Reverse 3D then reshape.
+      const input2 = cropped_slices_3d_w_pad.clone().reverse(flipAxis).reshape(adjusted_input_shape);
+      const logits2 = await runModelInferenceLoop(res, input2, loopEnd, layersLength, modelEntry, statData, callbackUI);
+
+      if (!logits2) throw new Error("TTA Error: logits2 is null or undefined");
+
+      console.log('--- Averaging TTA Results ---');
+      // WebGL cannot reverse rank-5 tensors. Reshape to 4D -> Reverse -> Reshape back.
+      const logits2_flipped = tf.tidy(() => {
+        const shape = logits2.shape; // [B, D, H, W, C]
+        // Flatten B and D to create 4D [B*D, H, W, C]. Axis mapping works for 0,1,2.
+        return logits2.reshape([shape[0] * shape[1], shape[2], shape[3], shape[4]])
+          .reverse(flipAxis)
+          .reshape(shape);
+      });
+
+      // Use instance method to avoid potential issue with tf.add shim
+      currentOutputTensor = logits1.add(logits2_flipped).div(2.0);
+
+      logits1.dispose();
+      logits2.dispose();
+      logits2_flipped.dispose();
+      // input1/input2 disposed by loop logic
+      cropped_slices_3d_w_pad.dispose();
+    } else {
+      // Standard execution: Use the 5D tensor prepared above
+      currentOutputTensor = await runModelInferenceLoop(res, currentOutputTensor, loopEnd, layersLength, modelEntry, statData, callbackUI);
+      cropped_slices_3d_w_pad.dispose();
+    }
+
+    if (useChunkedArgMax) {
+      // --- FINAL PROCESSING WITH CHUNKED FINAL LAYER (Fast Path + Safe Final Conv/ArgMax) ---
+      // The final conv layer (e.g., 30→50 channels) would create a 50-channel output
+      // that exceeds texture limits when unpacked for argmax. Use SequentialConvLayer
+      // for ONLY the final layer, which chunks both conv and argmax operations.
+      console.log('Applying SequentialConvLayer for final layer only (fast path for layers 1-18)...');
+      const seqConvLayer = new SequentialConvLayer(res, 10, isChannelLast, callbackUI);
+      const seqConvResult = await seqConvLayer.apply(currentOutputTensor);
+      outLabelVolume = seqConvResult.asType('int32');
+      seqConvResult.dispose();
+      currentOutputTensor.dispose();
+      console.log('SequentialConvLayer (final only) output shape:', outLabelVolume.shape);
+
+    } else {
+      // --- FINAL PROCESSING FOR STANDARD METHOD ---
+      console.log('Applying final ArgMax...');
+      outLabelVolume = tf.tidy(() => {
+        const axis = isChannelLast ? -1 : 1;
+        const prediction_argmax = tf.argMax(currentOutputTensor, axis);
+        return tf.squeeze(prediction_argmax);
+      });
+      currentOutputTensor.dispose(); // The tidy already disposed the original, but this is safe
+      console.log('ArgMax output shape:', outLabelVolume.shape);
+    }
   }
 
   // --- 5. UNIFIED POST-PROCESSING & OUTPUT GENERATION ---
@@ -395,7 +550,7 @@ export async function runFullVolumeInference(
   if (modelEntry.outputPermutation) {
     console.log(`Permuting Output: ${modelEntry.outputPermutation}`);
     outLabelVolume = outLabelVolume.transpose(modelEntry.outputPermutation);
-  } else if (modelEntry.enableTranspose) {
+  } else if (webglEnableTranspose) {
     console.log('outLabelVolume transposed');
     outLabelVolume = outLabelVolume.transpose();
   }
