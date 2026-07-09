@@ -189,6 +189,8 @@ async function main() {
   const ISOLATE_MODIFIER = "altKey";
   let isolatedLabel = null;    // label value shown alone, or null = show all
   let originalSegImg = null;   // pristine label voxels, for restore + stats
+  let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
+  const HUD_TEXT_SCALE = 0.9;  // relative to niivue fontPx
 
   dragMode.onchange = async function () {
     nv1.opts.dragMode = this.selectedIndex;
@@ -344,6 +346,7 @@ async function main() {
   function resetLabelIsolation() {
     isolatedLabel = null;
     originalSegImg = null;
+    isolationStats = null;
   }
 
   // Isolation works on the label DATA, not the color LUT: non-selected voxels
@@ -361,13 +364,67 @@ async function main() {
     if (originalSegImg === null) originalSegImg = ov.img; // capture pristine once
     if (isolatedLabel === null) {
       ov.img = originalSegImg;
+      isolationStats = null;
     } else {
       const src = originalSegImg;
       const out = new src.constructor(src.length);
       for (let i = 0; i < src.length; i++) out[i] = (src[i] === isolatedLabel) ? isolatedLabel : 0;
       ov.img = out;
+      isolationStats = buildIsolationStats(isolatedLabel);
     }
     nv1.updateGLVolume();
+  }
+
+  // Full stats for one label, formatted as lines for the on-screen readout.
+  function buildIsolationStats(labelVal) {
+    const base = nv1.volumes[0];
+    const seg = originalSegImg || (nv1.volumes[1] && nv1.volumes[1].img);
+    if (!base || !seg) return null;
+    const pd = base.hdr.pixDims || [];
+    const voxMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
+    const rows = computeLabelStats(base.img, seg, voxMm3);
+    const total = rows.reduce((s, r) => s + r.volume_mm3, 0);
+    const r = rows.find((x) => x.label === labelVal);
+    if (!r) return null;
+    const pct = total > 0 ? (r.volume_mm3 / total) * 100 : 0;
+    const lines = [
+      r.name,
+      `${fmtCm3(r.volume_mm3)} cm3   (${pct.toFixed(1)}% of brain)`,
+      `${r.voxels.toLocaleString()} voxels`,
+      `intensity  ${r.mean.toFixed(0)} +/- ${r.stdev.toFixed(0)}`,
+    ];
+    // Title in the region's own color, brightened for legibility on black.
+    let color = [1, 1, 1, 1];
+    if (lastSegColors && lastSegColors.R && lastSegColors.R[labelVal] != null) {
+      const br = (c) => Math.min(255, c * 0.55 + 130) / 255;
+      color = [br(lastSegColors.R[labelVal]), br(lastSegColors.G[labelVal]), br(lastSegColors.B[labelVal]), 1];
+    }
+    return { lines, color };
+  }
+
+  // Draw the isolated-region readout as fixed screen-space text in the empty
+  // top-left corner of the 3D render tile. Because it's drawn per-frame in
+  // canvas coordinates (not anchored in the scene), it stays put while the head
+  // rotates. niivue's drawText is single-line, so we lay out the lines by hand.
+  function drawIsolationHUD() {
+    if (isolatedLabel === null || !isolationStats || !segOverlay()) return;
+    const tile = nv1.screenSlices && nv1.screenSlices.find((s) => s.axCorSag === 4 /* RENDER */);
+    if (!tile) return;
+    const [L, T] = tile.leftTopWidthHeight; // canvas px, top-left origin
+    const gl = nv1.gl;
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    gl.enable(gl.BLEND);
+    const size = nv1.fontPx * HUD_TEXT_SCALE;
+    const lineH = size * 1.55;
+    const pad = nv1.fontPx * 0.6;
+    const x = L + pad;
+    const y = T + pad;
+    const white = [0.92, 0.92, 0.92, 1];
+    const { lines, color } = isolationStats;
+    nv1.drawText([x, y], lines[0], HUD_TEXT_SCALE, color);
+    for (let i = 1; i < lines.length; i++) {
+      nv1.drawText([x, y + i * lineH], lines[i], HUD_TEXT_SCALE, white);
+    }
   }
 
   // True (pristine) label under the crosshair, even while a region is isolated,
@@ -384,14 +441,21 @@ async function main() {
     return v;
   }
 
+  // Toggle isolation of a specific label value. Background (0) or the already
+  // isolated label restores the full view. Shared by Alt-click, the stats
+  // panel, and Esc.
+  function isolateLabel(labelVal) {
+    if (!segOverlay()) return;
+    isolatedLabel = (labelVal === 0 || labelVal === isolatedLabel) ? null : labelVal;
+    applyLabelIsolation();
+  }
+
   function handleIsolateClick(e) {
     if (!e[ISOLATE_MODIFIER]) return;
     if (!segOverlay()) return;
     const lbl = labelUnderCursor();
     if (lbl === null || Number.isNaN(lbl)) return;
-    // Background (0) or re-clicking the isolated label => restore everything.
-    isolatedLabel = (lbl === 0 || lbl === isolatedLabel) ? null : lbl;
-    applyLabelIsolation();
+    isolateLabel(lbl);
     e.preventDefault();
   }
 
@@ -401,6 +465,7 @@ async function main() {
     if (modelSelect.selectedIndex < 0) return;
 
     await closeAllOverlays();
+    resetLabelIsolation(); // drop any active single-label view + its HUD
     await ensureConformed();
 
     const modelEntry = inferenceModelsList[selectedModelIndex];
@@ -676,11 +741,12 @@ async function main() {
         + cell("median", r.median) + cell("mean", r.mean.toFixed(2))
         + cell("SD", r.stdev.toFixed(2)) + cell("voxels", r.voxels.toLocaleString());
       body += `
-        <div class="stat-row" role="button" tabindex="0" style="cursor:pointer">
+        <div class="stat-row" role="button" tabindex="0" data-label="${r.label}" style="cursor:pointer">
           <div class="stat-line">
             <span class="stat-name">${escHtml(r.name)}</span>
             <span class="stat-track">${bar}</span>
             ${val}
+            <button type="button" class="stat-iso" title="Show only this region in the viewer">isolate</button>
           </div>
           <div class="stat-detail" style="display:none">${detail}</div>
         </div>`;
@@ -704,7 +770,10 @@ async function main() {
         #statsPanel #statsRows{flex:1 1 auto;min-height:0;overflow-y:auto;display:block}
         #statsPanel .stat-row{display:block;padding:6px 4px;border-radius:6px}
         #statsPanel .stat-row:hover{background:rgba(255,255,255,.05)}
-        #statsPanel .stat-line{display:grid;grid-template-columns:120px 1fr 60px;align-items:center;gap:10px}
+        #statsPanel .stat-line{display:grid;grid-template-columns:120px 1fr 60px auto;align-items:center;gap:10px}
+        #statsPanel .stat-iso{background:transparent;color:inherit;border:1px solid #555;border-radius:6px;padding:2px 8px;font:inherit;font-size:.78em;opacity:.55;cursor:pointer;float:none;margin:0}
+        #statsPanel .stat-row:hover .stat-iso{opacity:.9}
+        #statsPanel .stat-iso:hover{background:#3a3a3a;border-color:#777}
         #statsPanel .stat-name{text-align:right;opacity:.85;font-size:.9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         #statsPanel .stat-track{background:rgba(255,255,255,.06);border-radius:5px;height:18px;overflow:hidden;min-width:0}
         #statsPanel .stat-bar{display:block;height:100%;border-radius:5px;min-width:3px}
@@ -784,11 +853,34 @@ async function main() {
       row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
     });
 
+    // Per-row "isolate": show only that region in the viewer and close the
+    // dialog so it's visible. stopPropagation so the row's detail toggle
+    // doesn't also fire.
+    panel.querySelectorAll(".stat-iso").forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const labelVal = parseInt(btn.closest(".stat-row").dataset.label, 10);
+        if (!Number.isNaN(labelVal)) isolateLabel(labelVal);
+        const dlg = document.getElementById("appDialog");
+        if (dlg && dlg.open) dlg.close();
+      };
+    });
+
     document.getElementById("statsDownloadBtn").onclick = () => downloadCsv(rows);
   };
 
-  saveSceneBtn.onclick = function () {
-    nv1.saveDocument("brainchop.nvd");
+  saveSceneBtn.onclick = async function () {
+    // Export the FULL segmentation even while a region is isolated (isolation is
+    // a view-only state). Swap the pristine labels in for the save, then rebuild
+    // the isolated view so the receiver can Esc/Alt-click through everything.
+    const ov = segOverlay();
+    const restore = isolatedLabel !== null && ov && originalSegImg;
+    if (restore) ov.img = originalSegImg;
+    try {
+      await nv1.saveDocument("brainchop.nvd");
+    } finally {
+      if (restore) applyLabelIsolation();
+    }
   };
 
 
@@ -863,6 +955,14 @@ async function main() {
     }
     overlayVolume.opacity = opacitySlider1.value / 255;
     await nv1.addVolume(overlayVolume);
+
+    // One-line discoverability hint (only for multi-label overlays where
+    // isolation applies). It sits in the location bar until the next mouse move.
+    if (segOverlay() && lastSegLabelNames && lastSegLabelNames.length > 2) {
+      const loc = document.getElementById("location");
+      if (loc) loc.innerHTML =
+        `<p style="font-size:14px;margin:0;opacity:.75;">Tip: Option/Alt-click a region to show only it — Esc restores all</p>`;
+    }
   }
 
   async function reportTelemetry(statData) {
@@ -910,7 +1010,9 @@ async function main() {
   }
 
   const defaults = {
-    backColor: [0.4, 0.4, 0.4, 1],
+    // Match the 2D panes (whose surround is the image's black background) so the
+    // 3D render tile no longer reads as a lighter gray box.
+    backColor: [0, 0, 0, 1],
     show3Dcrosshair: true,
     onLocationChange: handleLocationChange,
   };
@@ -919,6 +1021,52 @@ async function main() {
   await nv1.attachTo("gl1");
   // Alt/Option-click a region to isolate it (see handleIsolateClick).
   nv1.gl.canvas.addEventListener("click", handleIsolateClick);
+
+  // Esc restores the full segmentation (unless a dialog is open — let it close).
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || isolatedLabel === null) return;
+    if (document.querySelector("dialog[open]")) return;
+    isolatedLabel = null;
+    applyLabelIsolation();
+  });
+
+  // Note: we intentionally do NOT force the label overlay to NEAREST in the 3D
+  // pass. niivue's draw3D uses LINEAR there on purpose — in a volume ray-marcher
+  // nearest sampling makes big opaque regions (e.g. white matter) accumulate
+  // into a flat, noisy "glow" with the folds washed out. LINEAR gives the soft
+  // shading that reveals surface structure. 2D panels stay crisp via
+  // setInterpolation(true).
+
+  // Crisp isolation. niivue's atlas shader anti-aliases label edges with a
+  // 7-tap alpha feather (uniform xyzaFrac.xyz = 1/dims). With the full
+  // segmentation every voxel is a label, so the feather is invisible — but an
+  // isolated region borders background (0), and the feather softens that edge,
+  // making the isolated region look blurry/"interpolated" in 2D even though the
+  // texture filter is nearest (the feather is baked into the overlay texture
+  // that both 2D and 3D sample). While a region is isolated we zero the feather
+  // offsets for the atlas shaders so edges stay hard, matching the full-seg
+  // look; the outline component (xyzaFrac.a) is preserved. Passes through
+  // untouched when not isolating, so the full segmentation is unchanged.
+  const _origUniform4fv = nv1.gl.uniform4fv.bind(nv1.gl);
+  nv1.gl.uniform4fv = function (loc, v) {
+    if (isolatedLabel !== null) {
+      const aU = nv1.orientShaderAtlasU && nv1.orientShaderAtlasU.uniforms.xyzaFrac;
+      const aI = nv1.orientShaderAtlasI && nv1.orientShaderAtlasI.uniforms.xyzaFrac;
+      if ((aU && loc === aU) || (aI && loc === aI)) {
+        return _origUniform4fv(loc, [0, 0, 0, v[3]]);
+      }
+    }
+    return _origUniform4fv(loc, v);
+  };
+
+  // Draw the isolated-region readout at the end of every frame (screen-space,
+  // so it doesn't rotate with the 3D head).
+  const _origDrawSceneCore = nv1.drawSceneCore.bind(nv1);
+  nv1.drawSceneCore = function () {
+    const s = _origDrawSceneCore();
+    try { drawIsolationHUD(); } catch (e) { console.warn("isolation HUD draw failed", e); }
+    return s;
+  };
   Object.assign(nv1.opts, {
     dragMode: nv1.dragModes.pan,
     multiplanarForceRender: true,
