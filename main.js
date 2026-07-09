@@ -174,6 +174,9 @@ async function main() {
   let diagnosticsString = "";
   let missingLabelStatus = "";
   let chopWorker;
+  // Raw label names / colors for the current segmentation (index -> value), used by "Save Stats".
+  let lastSegLabelNames = null;
+  let lastSegColors = null; // { R:[], G:[], B:[] }
 
   dragMode.onchange = async function () {
     nv1.opts.dragMode = this.selectedIndex;
@@ -499,6 +502,217 @@ async function main() {
     nv1.volumes[1].saveToDisk("segmentation.nii.gz");
   };
 
+  // Compute per-label statistics of the input image intensities within each
+  // segmentation label. Single pass builds a 256-bin histogram per label
+  // (the conformed input is Uint8Array, so bins are exact), from which
+  // count/volume/min/max/quartiles/mean/stdev are derived.
+  function computeLabelStats(imgArr, labelArr, voxelVolMm3) {
+    const HIST = 256;
+    const stats = new Map(); // labelValue -> { count, sum, sumSq, hist }
+    const n = labelArr.length;
+    for (let i = 0; i < n; i++) {
+      const lbl = labelArr[i];
+      if (lbl === 0) continue; // skip background
+      let s = stats.get(lbl);
+      if (!s) {
+        s = { count: 0, sum: 0, sumSq: 0, hist: new Float64Array(HIST) };
+        stats.set(lbl, s);
+      }
+      const v = imgArr[i];
+      s.count++;
+      s.sum += v;
+      s.sumSq += v * v;
+      s.hist[v]++;
+    }
+
+    const quantileFromHist = (hist, count, p) => {
+      const target = p * count;
+      let cum = 0;
+      for (let b = 0; b < hist.length; b++) {
+        cum += hist[b];
+        if (cum >= target) return b;
+      }
+      return hist.length - 1;
+    };
+
+    const rows = [];
+    for (const [lbl, s] of [...stats.entries()].sort((a, b) => a[0] - b[0])) {
+      const mean = s.sum / s.count;
+      const variance = Math.max(0, s.sumSq / s.count - mean * mean);
+      let min = 0, max = 0;
+      for (let b = 0; b < s.hist.length; b++) { if (s.hist[b] > 0) { min = b; break; } }
+      for (let b = s.hist.length - 1; b >= 0; b--) { if (s.hist[b] > 0) { max = b; break; } }
+      rows.push({
+        label: lbl,
+        name: (lastSegLabelNames && lastSegLabelNames[lbl] != null) ? lastSegLabelNames[lbl] : `label_${lbl}`,
+        voxels: s.count,
+        volume_mm3: s.count * voxelVolMm3,
+        min,
+        max,
+        q1: quantileFromHist(s.hist, s.count, 0.25),
+        median: quantileFromHist(s.hist, s.count, 0.5),
+        q3: quantileFromHist(s.hist, s.count, 0.75),
+        mean,
+        stdev: Math.sqrt(variance),
+      });
+    }
+    return rows;
+  }
+
+  function buildStatsCsv(rows) {
+    const header = ["label", "name", "voxels", "volume_mm3", "min", "max", "q1", "median", "q3", "mean", "stdev"];
+    const fmt = (x) => (Number.isInteger(x) ? String(x) : x.toFixed(6));
+    const esc = (s) => /[",\n]/.test(s) ? `"${String(s).replace(/"/g, '""')}"` : String(s);
+    const lines = [header.join(",")];
+    for (const r of rows) {
+      lines.push([r.label, esc(r.name), r.voxels, fmt(r.volume_mm3),
+        r.min, r.max, r.q1, r.median, r.q3, fmt(r.mean), fmt(r.stdev)].join(","));
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  function downloadCsv(rows) {
+    const blob = new Blob([buildStatsCsv(rows)], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "mask_stats.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  const escHtml = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const fmtCm3 = (mm3) => { const v = mm3 / 1000; return v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1); };
+
+  function buildStatsPanelHtml(rows, totalMm3) {
+    const maxVol = Math.max(...rows.map(r => r.volume_mm3));
+    const colorOf = (r) => (lastSegColors && lastSegColors.R && lastSegColors.R[r.label] != null)
+      ? `rgb(${lastSegColors.R[r.label]},${lastSegColors.G[r.label]},${lastSegColors.B[r.label]})`
+      : "#6b9bd1";
+    let body = "";
+    for (const r of rows) {
+      const pct = totalMm3 > 0 ? (r.volume_mm3 / totalMm3) * 100 : 0;
+      const wAbs = maxVol > 0 ? (r.volume_mm3 / maxVol) * 100 : 0;
+      const val = `<span class="stat-val" data-cm3="${fmtCm3(r.volume_mm3)}" data-pct="${pct.toFixed(1)}%">${fmtCm3(r.volume_mm3)}</span>`;
+      const bar = `<span class="stat-bar" style="width:${wAbs.toFixed(2)}%;background:${colorOf(r)}" data-w-abs="${wAbs.toFixed(2)}" data-w-pct="${pct.toFixed(2)}"></span>`;
+      const cell = (k, v) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`;
+      const detail = cell("min", r.min) + cell("max", r.max)
+        + cell("Q1", r.q1) + cell("Q3", r.q3)
+        + cell("median", r.median) + cell("mean", r.mean.toFixed(2))
+        + cell("SD", r.stdev.toFixed(2)) + cell("voxels", r.voxels.toLocaleString());
+      body += `
+        <div class="stat-row" role="button" tabindex="0" style="cursor:pointer">
+          <div class="stat-line">
+            <span class="stat-name">${escHtml(r.name)}</span>
+            <span class="stat-track">${bar}</span>
+            ${val}
+          </div>
+          <div class="stat-detail" style="display:none">${detail}</div>
+        </div>`;
+    }
+    return `
+      <style>
+        /* niivue.css sets a global "div{display:table-row}"; force block/flex on our
+           plain container divs so width/1fr track sizing works. */
+        /* Cap the dialog and let ONLY the region list scroll, so the header,
+           toggle, Download and Close stay pinned/visible with long atlases. */
+        #appDialog[open]{max-height:88vh;display:flex;flex-direction:column;box-sizing:border-box}
+        #appDialog[open] h3{flex:0 0 auto}
+        #appDialog[open] #dialogCloseBtn{flex:0 0 auto;align-self:center;width:auto;float:none}
+        #dialogMessage{display:flex;flex-direction:column;flex:1 1 auto;min-height:0}
+        #statsPanel{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;width:440px;max-width:100%;box-sizing:border-box}
+        #statsPanel .stat-head{flex:0 0 auto;display:flex;justify-content:space-between;align-items:baseline;margin:0 0 8px}
+        #statsPanel .stat-total{opacity:.7;font-size:.95em}
+        #statsPanel .stat-toggle{flex:0 0 auto;align-self:flex-start;display:inline-flex;border:1px solid #444;border-radius:8px;overflow:hidden;margin:0 0 10px}
+        #statsPanel .stat-toggle button{background:transparent;color:inherit;border:0;padding:6px 16px;cursor:pointer;font:inherit;float:none;margin:0}
+        #statsPanel .stat-toggle button.active{background:#3a3a3a;font-weight:600}
+        #statsPanel #statsRows{flex:1 1 auto;min-height:0;overflow-y:auto;display:block}
+        #statsPanel .stat-row{display:block;padding:6px 4px;border-radius:6px}
+        #statsPanel .stat-row:hover{background:rgba(255,255,255,.05)}
+        #statsPanel .stat-line{display:grid;grid-template-columns:120px 1fr 60px;align-items:center;gap:10px}
+        #statsPanel .stat-name{text-align:right;opacity:.85;font-size:.9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        #statsPanel .stat-track{background:rgba(255,255,255,.06);border-radius:5px;height:18px;overflow:hidden;min-width:0}
+        #statsPanel .stat-bar{display:block;height:100%;border-radius:5px;min-width:3px}
+        #statsPanel .stat-val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+        #statsPanel .stat-detail{margin:4px 0 6px 0;display:grid;grid-template-rows:auto auto;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px 14px;font-size:.78em;font-variant-numeric:tabular-nums}
+        #statsPanel .stat-detail>div{display:flex;justify-content:space-between;gap:6px;white-space:nowrap}
+        #statsPanel .stat-detail .k{opacity:.55}
+        #statsPanel .stat-detail .v{font-weight:600}
+        #statsPanel .stat-actions{flex:0 0 auto;display:block;margin-top:12px;border-top:1px solid #444;padding-top:10px;text-align:right}
+      </style>
+      <div id="statsPanel">
+        <div class="stat-head">
+          <span class="stat-total" id="statsUnitLabel">total ${fmtCm3(totalMm3)} cm³</span>
+        </div>
+        <div class="stat-toggle">
+          <button type="button" data-mode="cm3" class="active">cm³</button>
+          <button type="button" data-mode="pct">% of total</button>
+        </div>
+        <div id="statsRows">${body}</div>
+        <div class="stat-actions">
+          <button type="button" id="statsDownloadBtn">Download CSV</button>
+        </div>
+      </div>`;
+  }
+
+  saveStatsBtn.onclick = function () {
+    if (nv1.volumes.length < 2) {
+      window.alert("No segmentation to measure (run a model first).");
+      return;
+    }
+    const imgArr = nv1.volumes[0].img;   // conformed input intensities
+    const labelArr = nv1.volumes[1].img; // segmentation labels
+    if (!imgArr || !labelArr || imgArr.length !== labelArr.length) {
+      window.alert("Input and segmentation grids do not match.");
+      return;
+    }
+    const pd = nv1.volumes[0].hdr.pixDims || [];
+    const voxelVolMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
+
+    let rows = computeLabelStats(imgArr, labelArr, voxelVolMm3);
+    if (rows.length === 0) {
+      window.alert("No non-background labels found in the segmentation.");
+      return;
+    }
+    // Largest region first, matching the reference panel layout.
+    rows = rows.slice().sort((a, b) => b.volume_mm3 - a.volume_mm3);
+    const totalMm3 = rows.reduce((s, r) => s + r.volume_mm3, 0);
+
+    showModal("Region volumes", buildStatsPanelHtml(rows, totalMm3));
+
+    // Wire up interactivity (innerHTML strips <script>, so attach handlers here).
+    const panel = document.getElementById("statsPanel");
+    if (!panel) return;
+
+    panel.querySelectorAll(".stat-toggle button").forEach(btn => {
+      btn.onclick = () => {
+        const mode = btn.dataset.mode;
+        panel.querySelectorAll(".stat-toggle button").forEach(b => b.classList.toggle("active", b === btn));
+        document.getElementById("statsUnitLabel").textContent =
+          mode === "pct" ? "100% of segmented volume" : `total ${fmtCm3(totalMm3)} cm³`;
+        panel.querySelectorAll(".stat-row").forEach(row => {
+          const val = row.querySelector(".stat-val");
+          const bar = row.querySelector(".stat-bar");
+          val.textContent = mode === "pct" ? val.dataset.pct : val.dataset.cm3;
+          bar.style.width = (mode === "pct" ? bar.dataset.wPct : bar.dataset.wAbs) + "%";
+        });
+      };
+    });
+
+    panel.querySelectorAll(".stat-row").forEach(row => {
+      const toggle = () => {
+        const d = row.querySelector(".stat-detail");
+        d.style.display = d.style.display === "none" ? "grid" : "none";
+      };
+      row.onclick = toggle;
+      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
+    });
+
+    document.getElementById("statsDownloadBtn").onclick = () => downloadCsv(rows);
+  };
+
   saveSceneBtn.onclick = function () {
     nv1.saveDocument("brainchop.nvd");
   };
@@ -542,16 +756,22 @@ async function main() {
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
     overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
 
+    lastSegLabelNames = null;
+    lastSegColors = null;
     if (modelEntry.type === 'Brain_Masking') {
       const newLabels = ["Background", "Brain Mask"];
+      lastSegLabelNames = newLabels.slice();
       const newR = [0, 217];
       const newG = [0, 119];
       const newB = [0, 33];
+      lastSegColors = { R: newR, G: newG, B: newB };
       overlayVolume.setColormapLabel({ R: newR, G: newG, B: newB, labels: newLabels });
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
     } else if (modelEntry.colormapPath) {
       const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
       const cmap = await fetchJSON(modelEntry.colormapPath);
+      lastSegLabelNames = cmap["labels"] ? cmap["labels"].slice() : null;
+      lastSegColors = { R: cmap["R"], G: cmap["G"], B: cmap["B"] };
       const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"]);
       overlayVolume.setColormapLabel({ R: cmap["R"], G: cmap["G"], B: cmap["B"], labels: newLabels });
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
