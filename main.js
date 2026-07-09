@@ -178,6 +178,18 @@ async function main() {
   let lastSegLabelNames = null;
   let lastSegColors = null; // { R:[], G:[], B:[] }
 
+  // --- Single-label isolation --------------------------------------------
+  // Alt/Option-click a region in a 2D panel to show ONLY that label across
+  // the X/Y/Z panels and the 3D render. Alt-click the same region again (or
+  // Alt-click background) to restore all labels. It's a pure display toggle:
+  // we only flip per-label alpha in the overlay color LUT, never the voxels.
+  // Option/Alt is chosen because niivue already binds Shift+drag and
+  // Ctrl+drag to its own drag modes (and Ctrl-click is a context menu on
+  // macOS), whereas altKey is free for in-canvas clicks.
+  const ISOLATE_MODIFIER = "altKey";
+  let isolatedLabel = null;    // label value shown alone, or null = show all
+  let originalSegImg = null;   // pristine label voxels, for restore + stats
+
   dragMode.onchange = async function () {
     nv1.opts.dragMode = this.selectedIndex;
   };
@@ -231,7 +243,8 @@ async function main() {
         <p><strong>⌨️ Controls</strong><br>
         • <strong>Drag & Drop</strong> any NIfTI file to open.
         • Press <strong>C</strong> to toggle/cycle the clip-plane.
-        • Press <strong>V</strong> repeatedly to cycle through views.</p>
+        • Press <strong>V</strong> repeatedly to cycle through views.
+        • <strong>Option/Alt-click</strong> a region to isolate it (show it alone in all panels + 3D); Alt-click it again, or Alt-click the background, to bring the others back.</p>
 
         <p><strong>🧠 AI Models</strong><br>
         <strong>⚡ Flash Filet:</strong> Small, lightning fast, resource-friendly. Best for HCP-like structural MRIs ("Tissue GWM (light)").<br>
@@ -320,6 +333,66 @@ async function main() {
     while (nv1.volumes.length > 1) {
       await nv1.removeVolume(nv1.volumes[1]);
     }
+  }
+
+  // The segmentation overlay, only if it carries a discrete label LUT.
+  function segOverlay() {
+    return (nv1.volumes.length >= 2 && nv1.volumes[1].colormapLabel)
+      ? nv1.volumes[1] : null;
+  }
+
+  function resetLabelIsolation() {
+    isolatedLabel = null;
+    originalSegImg = null;
+  }
+
+  // Isolation works on the label DATA, not the color LUT: non-selected voxels
+  // are set to background (0). We tried hiding others via the LUT (alpha 0)
+  // instead, but niivue's 3D atlas shader anti-aliases each voxel's ALPHA from
+  // its 6 neighbours while keeping each voxel's own RGB — so hidden voxels
+  // touching the kept region borrowed alpha and smeared their color/glow onto
+  // the surface, burying the folds. Zeroing the data makes those voxels true
+  // background: the shader skips them, the T1 shows through the sulci, and the
+  // kept region keeps clean anti-aliased edges. Fully reversible — the pristine
+  // labels are restored from originalSegImg (also used for stats).
+  function applyLabelIsolation() {
+    const ov = segOverlay();
+    if (!ov) return;
+    if (originalSegImg === null) originalSegImg = ov.img; // capture pristine once
+    if (isolatedLabel === null) {
+      ov.img = originalSegImg;
+    } else {
+      const src = originalSegImg;
+      const out = new src.constructor(src.length);
+      for (let i = 0; i < src.length; i++) out[i] = (src[i] === isolatedLabel) ? isolatedLabel : 0;
+      ov.img = out;
+    }
+    nv1.updateGLVolume();
+  }
+
+  // True (pristine) label under the crosshair, even while a region is isolated,
+  // so Alt-clicking a different region switches straight to it.
+  function labelUnderCursor() {
+    const ov = segOverlay();
+    if (!ov) return null;
+    const mm = nv1.frac2mm(nv1.scene.crosshairPos, 0, true);
+    const vox = ov.mm2vox(mm);
+    const cur = ov.img;
+    if (originalSegImg) ov.img = originalSegImg;
+    const v = Math.round(ov.getValue(vox[0], vox[1], vox[2], ov.frame4D));
+    ov.img = cur;
+    return v;
+  }
+
+  function handleIsolateClick(e) {
+    if (!e[ISOLATE_MODIFIER]) return;
+    if (!segOverlay()) return;
+    const lbl = labelUnderCursor();
+    if (lbl === null || Number.isNaN(lbl)) return;
+    // Background (0) or re-clicking the isolated label => restore everything.
+    isolatedLabel = (lbl === 0 || lbl === isolatedLabel) ? null : lbl;
+    applyLabelIsolation();
+    e.preventDefault();
   }
 
   async function runSelectedInference() {
@@ -663,7 +736,8 @@ async function main() {
       return;
     }
     const imgArr = nv1.volumes[0].img;   // conformed input intensities
-    const labelArr = nv1.volumes[1].img; // segmentation labels
+    // Use pristine labels so region stats stay whole-brain even while isolated.
+    const labelArr = originalSegImg || nv1.volumes[1].img; // segmentation labels
     if (!imgArr || !labelArr || imgArr.length !== labelArr.length) {
       window.alert("Input and segmentation grids do not match.");
       return;
@@ -751,6 +825,7 @@ async function main() {
 
   async function callbackImg(img, opts, modelEntry) {
     await closeAllOverlays();
+    resetLabelIsolation();
     const overlayVolume = await nv1.volumes[0].clone();
     overlayVolume.zeroImage();
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
@@ -842,6 +917,8 @@ async function main() {
 
   const nv1 = new Niivue(defaults);
   await nv1.attachTo("gl1");
+  // Alt/Option-click a region to isolate it (see handleIsolateClick).
+  nv1.gl.canvas.addEventListener("click", handleIsolateClick);
   Object.assign(nv1.opts, {
     dragMode: nv1.dragModes.pan,
     multiplanarForceRender: true,
