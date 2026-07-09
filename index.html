@@ -19,7 +19,7 @@
   <link rel="stylesheet" href="./niivue.css" />
 
   <title>AI powered brain segmentation</title>
-  <script type="module" crossorigin src="./assets/index-B0Ij7of_.js"></script>
+  <script type="module" crossorigin src="./assets/index-CeWLIMJZ.js"></script>
   <link rel="modulepreload" crossorigin href="./assets/vendor-DLc_gxcK.js">
   <link rel="modulepreload" crossorigin href="./assets/vendor-math-CA38DMGy.js">
   <link rel="modulepreload" crossorigin href="./assets/vendor-niivue-uevEgbiD.js">
@@ -48,6 +48,7 @@
 
     <div class="button-group">
       <button id="saveImgBtn">Save Seg</button>
+      <button id="saveStatsBtn" title="Per-label volume and intensity statistics (min/max/quartiles/mean/stdev) of the input image, as CSV">Save Stats</button>
       <button id="saveSceneBtn">Save Scene</button>
     </div>
 
@@ -122,7 +123,7 @@
   <dialog id="appDialog">
     <h3 id="dialogTitle">Message</h3>
     <div id="dialogMessage"></div>
-    <button id="dialogCloseBtn">Close</button>
+    <button id="dialogCloseBtn" type="button">Close</button>
   </dialog>
 
 </body>
