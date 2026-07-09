@@ -88,27 +88,28 @@
 
   <footer>
     <div class="footer-content">
-      <div class="footer-item" id="location">Drag and Drop any NIfTI image</div>
+      <div class="footer-item" id="location">Drag and drop any NIfTI image</div>
 
-      <div class="footer-item">
-        <progress id="modelProgress" value="0" max="100"> 0% </progress>
-      </div>
-
-      <div class="footer-item" id="memstatus" style="color: green">Memory OK</div>
-
-      <div class="footer-item">
-        <div id="backendStatus" style="color: gray; cursor: help" title="Detecting backend...">⏳ Checking Backend...
+      <div class="footer-status">
+        <div class="footer-item">
+          <progress id="modelProgress" value="0" max="100" title="Model progress"></progress>
         </div>
-      </div>
 
-      <div class="footer-item">
-        <a href="https://github.com/neuroneural/brainchop" target="_blank" style="text-decoration:none">
-          <div class="github-star">
-            <div class="star-button">
-              <span>Star</span>
-            </div>
+        <div class="footer-item">
+          <span id="memstatus" class="status-text" style="color: #4CAF50" title="Memory status">Memory OK</span>
+        </div>
+
+        <div class="footer-item">
+          <span id="backendStatus" class="status-text" style="color: #9aa0a6; cursor: help"
+            title="Detecting backend...">Checking&hellip;</span>
+        </div>
+
+        <a class="star-link" href="https://github.com/neuroneural/brainchop" target="_blank"
+          title="Star brainchop on GitHub">
+          <span class="github-star">
+            <span class="star-glyph">&#9733;</span>
             <span id="star-count">0</span>
-          </div>
+          </span>
         </a>
       </div>
     </div>

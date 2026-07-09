@@ -1005,8 +1005,10 @@ async function main() {
   function handleLocationChange(data) {
     document.getElementById("location").innerHTML = data.string
       .split("   ")
-      .map((value) => `<p style="font-size: 14px;margin:0px;">${value}</p>`)
-      .join("");
+      .map((value) => value.trim())
+      .filter((value) => value !== "")
+      .map((value) => `<span class="loc-seg">${value}</span>`)
+      .join('<span class="loc-sep">&middot;</span>');
   }
 
   const defaults = {

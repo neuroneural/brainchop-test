@@ -129,53 +129,194 @@ canvas {
   display: block;
 }
 
-/* Footer */
+/* Footer — slim, informative status bar (fixed height across aspect ratios) */
 footer {
   margin: 0;
-  background-color: var(--footer-bg);
-  padding: var(--spacing);
-  font-size: 14px;
-  /* Normalized to match header */
-  font-weight: bold;
-  /* Make footer text bold */
-  border-top: 1px solid #555;
+  background: linear-gradient(180deg, #363636 0%, #2c2c2c 100%);
+  padding: 0 14px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 500;
+  border-top: 1px solid #4a4a4a;
   flex-shrink: 0;
   color: var(--text-color);
 }
 
-/* Footer Layout - replacing table with flexbox in CSS if possible, but HTML change is better */
 .footer-content {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
+  flex-wrap: nowrap;
   align-items: center;
   width: 100%;
-  gap: 1rem;
+  min-width: 0;
+  gap: 16px;
 }
 
 .footer-item {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.4rem;
 }
 
+/* Left: location / coordinate readout — takes remaining space and truncates */
 #location {
-  flex-direction: column;
-  align-items: flex-start;
-  font-size: 14px;
-  /* Normalized */
-  line-height: 1.2;
-  /* Stabilize layout: Fixed width prevent jitter when text changes */
-  width: 260px;
-  min-width: 260px;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 12px;
+  line-height: 1;
+  font-weight: 500;
+  color: #c9ccd1;
+  white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
+  /* Stable numeric columns so the bar doesn't jitter as coordinates change */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+#location .loc-seg {
+  display: inline-block;
+}
+
+#location .loc-sep {
+  opacity: 0.3;
+  padding: 0 2px;
+}
+
+/* First segment (coordinate group) reads as the primary value */
+#location .loc-seg:first-child {
+  color: #f2f4f7;
+  font-weight: 600;
+}
+
+/* Right: status cluster — never shrinks */
+.footer-status {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex: 0 0 auto;
+}
+
+/* Status text with a colored indicator dot driven by the element's own color.
+   main.js sets .style.color on these; currentColor keeps the dot in sync and
+   the dot survives textContent/innerHTML updates because it's a pseudo-element. */
+.status-text {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 600;
+  font-size: 12px;
   white-space: nowrap;
 }
 
-/* Progress Bar */
+.status-text::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 5px currentColor;
+  flex-shrink: 0;
+}
+
+/* Progress Bar — slim rounded pill, always visible */
 progress {
-  height: 1.2em;
-  width: 150px;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  height: 6px;
+  width: 90px;
+  border: none;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+progress::-webkit-progress-bar {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+
+progress::-webkit-progress-value {
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+progress::-moz-progress-bar {
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  border-radius: 999px;
+}
+
+/* GitHub star — the only interactive element in the bar */
+.star-link {
+  text-decoration: none;
+}
+
+.github-star {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 12px;
+  font-weight: 700;
+  color: #e8eaed;
+  line-height: 1;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.github-star:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.4);
+  transform: translateY(-1px);
+}
+
+.github-star .star-glyph {
+  color: #f7c948;
+  font-size: 13px;
+}
+
+/* Override niivue.css's ID-specific star styling (white box, borders). */
+.github-star #star-count {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  border-radius: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #e8eaed;
+}
+
+/* Narrow screens: tighten spacing, shrink progress, collapse status labels to
+   dots (their titles still carry the full text on hover/long-press). */
+@media (max-width: 600px) {
+  .footer-content {
+    gap: 10px;
+  }
+
+  .footer-status {
+    gap: 12px;
+  }
+
+  progress {
+    width: 56px;
+  }
+
+  .status-text {
+    font-size: 0;
+  }
+
+  .status-text::before {
+    width: 9px;
+    height: 9px;
+    margin-right: 0;
+  }
 }
 
 /* Loading Indicator */
