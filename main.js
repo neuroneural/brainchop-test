@@ -191,50 +191,100 @@ async function main() {
   let originalSegImg = null;   // pristine label voxels, for restore + stats
   let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
   const HUD_TEXT_SCALE = 0.9;  // relative to niivue fontPx
+  let nativeInputNV = null;    // volume as loaded (native grid), before conform
+  let nativeInputName = "input.nii.gz";
 
-  dragMode.onchange = async function () {
-    nv1.opts.dragMode = this.selectedIndex;
-  };
+  // --- Drag mode: segmented control (data-drag maps to nv.opts.dragMode) ---
+  const dragSegmented = document.getElementById("dragSegmented");
+  if (dragSegmented) {
+    dragSegmented.querySelectorAll("button").forEach((btn) => {
+      btn.onclick = () => {
+        nv1.opts.dragMode = parseInt(btn.dataset.drag, 10);
+        dragSegmented.querySelectorAll("button").forEach((b) =>
+          b.classList.toggle("active", b === btn));
+      };
+    });
+  }
 
-  drawDrop.onchange = async function () {
+  // --- Draw tools: popover with pen selection + apply actions ---
+  const drawBtn = document.getElementById("drawBtn");
+  const drawPopover = document.getElementById("drawPopover");
+  const penRow = document.getElementById("penRow");
+  const drawApplyRow = document.getElementById("drawApplyRow");
+
+  function openDrawPopover(open) {
+    if (!drawPopover) return;
+    drawPopover.hidden = !open;
+    if (drawBtn) drawBtn.setAttribute("aria-expanded", String(open));
+  }
+
+  function setPen(mode) {
+    nv1.setDrawingEnabled(mode >= 0);
+    if (mode >= 0) nv1.setPenValue(mode & 7, mode > 7);
+    if (penRow) penRow.querySelectorAll(".chip").forEach((b) =>
+      b.classList.toggle("active", parseInt(b.dataset.pen, 10) === mode));
+  }
+
+  async function applyDraw(mode) {
     if (nv1.volumes.length < 2) {
-      window.alert("No segmentation open (use the Segmentation pull down)");
-      drawDrop.selectedIndex = -1;
+      window.alert("No segmentation open (run a model first).");
+      return;
+    }
+    if (mode === 0) { // undo
+      nv1.drawUndo();
       return;
     }
     if (!nv1.drawBitmap) {
-      window.alert("No drawing (hint: use the Draw pull down to select a pen)");
-      drawDrop.selectedIndex = -1;
+      window.alert("Nothing drawn yet — pick a pen and draw on the image first.");
       return;
     }
-    const mode = parseInt(this.value);
-    if (mode === 0) {
-      nv1.drawUndo();
-      drawDrop.selectedIndex = -1;
-      return;
-    }
-    let img = nv1.volumes[1].img;
-    let draw = await nv1.saveImage({ filename: "", isSaveDrawing: true });
+    const img = nv1.volumes[1].img;
+    const draw = await nv1.saveImage({ filename: "", isSaveDrawing: true });
     const niiHdrBytes = 352;
     const nvox = img.length;
-    if (mode === 1) { //append
+    if (mode === 1) { // append
       for (let i = 0; i < nvox; i++) if (draw[niiHdrBytes + i] > 0) img[i] = 1;
     }
-    if (mode === 2) { //delete
+    if (mode === 2) { // remove
       for (let i = 0; i < nvox; i++) if (draw[niiHdrBytes + i] > 0) img[i] = 0;
     }
     nv1.closeDrawing();
     nv1.updateGLVolume();
     nv1.setDrawingEnabled(false);
-    penDrop.selectedIndex = -1;
-    drawDrop.selectedIndex = -1;
-  };
+    setPen(-1);
+  }
 
-  penDrop.onchange = async function () {
-    const mode = parseInt(this.value);
-    nv1.setDrawingEnabled(mode >= 0);
-    if (mode >= 0) nv1.setPenValue(mode & 7, mode > 7);
-  };
+  if (drawBtn) {
+    drawBtn.onclick = (e) => {
+      e.stopPropagation();
+      openDrawPopover(drawPopover.hidden);
+    };
+  }
+  if (penRow) {
+    penRow.querySelectorAll(".chip").forEach((btn) => {
+      btn.onclick = () => setPen(parseInt(btn.dataset.pen, 10));
+    });
+  }
+  if (drawApplyRow) {
+    drawApplyRow.querySelectorAll(".chip").forEach((btn) => {
+      btn.onclick = () => applyDraw(parseInt(btn.dataset.apply, 10));
+    });
+  }
+  // Close the popover on outside click / Escape.
+  document.addEventListener("click", (e) => {
+    if (!drawPopover || drawPopover.hidden) return;
+    if (!e.target.closest(".popover-wrap")) openDrawPopover(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") openDrawPopover(false);
+  });
+  // Dismiss any modal by clicking its backdrop.
+  const appDialogEl = document.getElementById("appDialog");
+  if (appDialogEl) {
+    appDialogEl.addEventListener("click", (e) => {
+      if (e.target === appDialogEl) appDialogEl.close();
+    });
+  }
 
   aboutBtn.onclick = function () {
     const aboutContent = `
@@ -483,8 +533,7 @@ async function main() {
       console.log("Attempting WebGPU backend...");
 
       // Get UI state for TTA
-      const useTTA = document.getElementById('ttaCheck') ? document.getElementById('ttaCheck').checked : false;
-      const currentModelEntry = { ...modelEntry, enableTTA: useTTA };
+      const currentModelEntry = { ...modelEntry, enableTTA: false };
 
       try {
         await runInferenceWebGpu(gpuDevice, opts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
@@ -508,9 +557,8 @@ async function main() {
 
     const runWorker = (useSeqConv) => {
       return new Promise((resolve, reject) => {
-        const useTTA = document.getElementById('ttaCheck').checked;
         const currentOpts = { ...opts, enableSeqConv: useSeqConv };
-        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv, enableTTA: useTTA };
+        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv, enableTTA: false };
 
         chopWorker = new MyWorker({ type: "module" });
         chopWorker.postMessage({ opts: currentOpts, modelEntry: currentModelEntry, niftiHeader: plainNiftiHeader, niftiImage });
@@ -632,13 +680,211 @@ async function main() {
   modelSelect.onchange = runSelectedInference;
   // backendSelect.onchange = runSelectedInference; // Removed
 
-  saveImgBtn.onclick = function () {
-    if (nv1.volumes.length < 2) {
-      window.alert("No segmentation to save.");
+  // --- Save actions -------------------------------------------------------
+  // Each action performs the pristine-label swap where relevant (isolation is
+  // a view-only state) so exports always contain the full segmentation.
+  function withPristineLabels(fn) {
+    const ov = segOverlay();
+    const restore = isolatedLabel !== null && ov && originalSegImg;
+    if (restore) ov.img = originalSegImg;
+    try {
+      return fn();
+    } finally {
+      if (restore) applyLabelIsolation();
+    }
+  }
+
+  function saveSegmentationConformed() {
+    if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
+    // The overlay already carries the right intent from callbackImg: LABEL for
+    // discrete segmentations, none for intensity outputs (e.g. skull-stripped
+    // brain). So save it as-is — don't force LABEL here.
+    withPristineLabels(() => nv1.volumes[1].saveToDisk("segmentation.nii.gz"));
+  }
+
+  function saveConformedInput() {
+    if (nv1.volumes.length < 1) { window.alert("No image loaded."); return; }
+    nv1.volumes[0].saveToDisk("conformed_input.nii.gz");
+  }
+
+  async function saveScene() {
+    if (nv1.volumes.length < 1) { window.alert("No image loaded."); return; }
+    await withPristineLabels(async () => { await nv1.saveDocument("brainchop.nvd"); });
+  }
+
+  // Native-space segmentation: reslice the conformed (256³, 1 mm) labels back
+  // onto the original input grid. See resliceLabelsToNative() for the method.
+  async function saveSegmentationNative() {
+    if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
+    if (!nativeInputNV || !nativeInputNV.hdr || !nativeInputNV.hdr.affine) {
+      window.alert("Original input grid is unavailable — reload the image and try again.");
       return;
     }
-    nv1.volumes[1].saveToDisk("segmentation.nii.gz");
-  };
+    callbackUI("Reslicing to native space…", 0);
+    await new Promise((r) => setTimeout(r, 30)); // let the status paint before the blocking loop
+    try {
+      const outNV = withPristineLabels(() => resliceLabelsToNative());
+      await outNV.saveToDisk("segmentation_native.nii.gz");
+      callbackUI("Saved native-space segmentation.", 1);
+    } catch (e) {
+      console.error("Native-space reslice failed:", e);
+      window.alert("Native-space export failed: " + (e && e.message ? e.message : e));
+    }
+  }
+
+  // Reslice the conformed overlay onto the native input grid.
+  //
+  // For a label map (segmentation): nearest-neighbour with 2× supersampling and
+  // a majority vote per output voxel — crisper categorical boundaries — written
+  // as Int16 tagged NIFTI_INTENT_LABEL.
+  // For an intensity output (e.g. skull-stripped brain): plain nearest-neighbour
+  // keeping the native datatype and NOT tagged as a label — it's an image.
+  //
+  // The native→conformed voxel map is built by probing niivue's own verified
+  // transforms at four basis points (origin + unit steps), so it is correct for
+  // any orientation without us re-deriving affine conventions. Validated: when
+  // the two grids are identical the map is the identity.
+  function resliceLabelsToNative() {
+    const seg = nv1.volumes[1];
+    const labels = seg.img;                    // pristine labels (see withPristineLabels)
+    const A = nativeInputNV.hdr.affine;        // native storage-voxel -> mm (row-major 4x4)
+    const nx = nativeInputNV.hdr.dims[1], ny = nativeInputNV.hdr.dims[2], nz = nativeInputNV.hdr.dims[3];
+    const snx = seg.hdr.dims[1], sny = seg.hdr.dims[2], snz = seg.hdr.dims[3];
+
+    const applyAffine = (a, v) => [
+      a[0][0] * v[0] + a[0][1] * v[1] + a[0][2] * v[2] + a[0][3],
+      a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2] + a[1][3],
+      a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2] + a[2][3],
+    ];
+    const applyGL = (m, v) => [ // gl-matrix mat4 is column-major
+      m[0] * v[0] + m[4] * v[1] + m[8] * v[2] + m[12],
+      m[1] * v[0] + m[5] * v[1] + m[9] * v[2] + m[13],
+      m[2] * v[0] + m[6] * v[1] + m[10] * v[2] + m[14],
+    ];
+    // native storage voxel -> conformed storage voxel (fractional)
+    const f = (v) => {
+      const mm = applyAffine(A, v);
+      const ras = seg.mm2vox([mm[0], mm[1], mm[2]], true); // mm -> conformed RAS voxel
+      return applyGL(seg.toRASvox, [ras[0], ras[1], ras[2]]); // RAS -> storage voxel
+    };
+    const o = f([0, 0, 0]);
+    const ex = f([1, 0, 0]).map((x, i) => x - o[i]);
+    const ey = f([0, 1, 0]).map((x, i) => x - o[i]);
+    const ez = f([0, 0, 1]).map((x, i) => x - o[i]);
+
+    // Is this a discrete label map (segmentation) or a continuous intensity
+    // output (e.g. skull-stripped brain from Brain_Extraction/mindgrab)? Label
+    // overlays carry a colormapLabel; intensity ones use a plain colormap.
+    const isLabel = !!seg.colormapLabel;
+    const nvox = nx * ny * nz;
+    const outNV = nativeInputNV.clone();
+    const sample = (x, y, z) =>
+      (x >= 0 && x < snx && y >= 0 && y < sny && z >= 0 && z < snz)
+        ? labels[x + y * snx + z * snx * sny] : 0;
+
+    if (isLabel) {
+      // 2× supersample: 8 offsets at ±0.25 native voxel, in conformed space.
+      const deltas = [];
+      for (const dx of [-0.25, 0.25])
+        for (const dy of [-0.25, 0.25])
+          for (const dz of [-0.25, 0.25])
+            deltas.push([
+              dx * ex[0] + dy * ey[0] + dz * ez[0],
+              dx * ex[1] + dy * ey[1] + dz * ez[1],
+              dx * ex[2] + dy * ey[2] + dz * ez[2],
+            ]);
+      const out = new Int16Array(nvox);
+      let maxLabel = 0;
+      const tv = new Int32Array(8), tc = new Int32Array(8); // majority tally (≤8 distinct)
+      let idx = 0;
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          let bx = o[0] + j * ey[0] + k * ez[0];
+          let by = o[1] + j * ey[1] + k * ez[1];
+          let bz = o[2] + j * ey[2] + k * ez[2];
+          for (let i = 0; i < nx; i++) {
+            let nt = 0;
+            for (let s = 0; s < 8; s++) {
+              const lbl = sample(
+                Math.round(bx + deltas[s][0]),
+                Math.round(by + deltas[s][1]),
+                Math.round(bz + deltas[s][2]));
+              let t = -1;
+              for (let q = 0; q < nt; q++) if (tv[q] === lbl) { t = q; break; }
+              if (t < 0) { tv[nt] = lbl; tc[nt] = 1; nt++; } else { tc[t]++; }
+            }
+            let best = tv[0], bc = tc[0];
+            for (let q = 1; q < nt; q++) if (tc[q] > bc) { bc = tc[q]; best = tv[q]; }
+            if (best > maxLabel) maxLabel = best;
+            out[idx++] = best;
+            bx += ex[0]; by += ex[1]; bz += ex[2];
+          }
+        }
+      }
+      outNV.hdr.datatypeCode = 4;      // DT_INT16
+      outNV.hdr.numBitsPerVoxel = 16;
+      outNV.hdr.scl_slope = 1;
+      outNV.hdr.scl_inter = 0;
+      outNV.hdr.cal_min = 0;
+      outNV.hdr.cal_max = maxLabel;
+      outNV.hdr.intent_code = 1002;    // NIFTI_INTENT_LABEL
+      outNV.img = out;
+    } else {
+      // Intensity output (skull-stripped brain): plain nearest-neighbour, keep
+      // the native datatype, and do NOT tag as LABEL — this is an image.
+      const out = outNV.img;           // native-datatype typed array, length nvox
+      out.fill(0);
+      outNV.hdr.scl_slope = 1;
+      outNV.hdr.scl_inter = 0;
+      let idx = 0;
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          let bx = o[0] + j * ey[0] + k * ez[0];
+          let by = o[1] + j * ey[1] + k * ez[1];
+          let bz = o[2] + j * ey[2] + k * ez[2];
+          for (let i = 0; i < nx; i++) {
+            out[idx++] = sample(Math.round(bx), Math.round(by), Math.round(bz));
+            bx += ex[0]; by += ex[1]; bz += ex[2];
+          }
+        }
+      }
+    }
+    return outNV;
+  }
+
+  const SAVE_OPTIONS = [
+    { act: saveSegmentationConformed, title: "Segmentation: conformed", sub: "256³ · 1 mm iso", need: "seg" },
+    { act: saveSegmentationNative, title: "Segmentation: native space", sub: "resampled to the input grid", need: "seg" },
+    { act: saveConformedInput, title: "Conformed input volume", sub: "the resampled T1 (256³ · 1 mm)", need: "img" },
+    { act: saveScene, title: "Scene", sub: "everything, as a .nvd document", need: "img" },
+  ];
+
+  function openSaveModal() {
+    const hasImg = nv1.volumes.length >= 1;
+    const hasSeg = nv1.volumes.length >= 2;
+    const ready = (need) => (need === "seg" ? hasSeg : hasImg);
+    const rows = SAVE_OPTIONS.map((o, i) => {
+      const dis = ready(o.need) ? "" : " disabled";
+      return `<button type="button" class="save-opt${dis}" data-i="${i}"${dis ? " disabled" : ""}>
+        <span class="save-opt-title">${o.title}</span>
+        <span class="save-opt-sub">${o.sub}</span>
+      </button>`;
+    }).join("");
+    showModal("Save", `<div class="save-options">${rows}</div>`, { hideClose: true, saveMode: true });
+    const msg = document.getElementById("dialogMessage");
+    if (!msg) return;
+    msg.querySelectorAll(".save-opt:not(.disabled)").forEach((btn) => {
+      btn.onclick = () => {
+        const opt = SAVE_OPTIONS[parseInt(btn.dataset.i, 10)];
+        const dlg = document.getElementById("appDialog");
+        if (dlg && dlg.open) dlg.close();  // dismiss first so the native save dialog is unobstructed
+        opt.act();
+      };
+    });
+  }
+
+  const saveBtn = document.getElementById("saveBtn");
+  if (saveBtn) saveBtn.onclick = openSaveModal;
 
   // Compute per-label statistics of the input image intensities within each
   // segmentation label. Single pass builds a 256-bin histogram per label
@@ -869,23 +1115,12 @@ async function main() {
     document.getElementById("statsDownloadBtn").onclick = () => downloadCsv(rows);
   };
 
-  saveSceneBtn.onclick = async function () {
-    // Export the FULL segmentation even while a region is isolated (isolation is
-    // a view-only state). Swap the pristine labels in for the save, then rebuild
-    // the isolated view so the receiver can Esc/Alt-click through everything.
-    const ov = segOverlay();
-    const restore = isolatedLabel !== null && ov && originalSegImg;
-    if (restore) ov.img = originalSegImg;
-    try {
-      await nv1.saveDocument("brainchop.nvd");
-    } finally {
-      if (restore) applyLabelIsolation();
-    }
-  };
-
-
-
   function doLoadImage() {
+    // Retain the volume as loaded (native grid) before ensureConformed() may
+    // replace volumes[0] with the 256³ conformed copy — needed to reslice the
+    // segmentation back to native space on export.
+    nativeInputNV = nv1.volumes[0] || null;
+    nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
     opacitySlider0.oninput();
     modelSelect.value = "-1";
   }
@@ -1070,11 +1305,18 @@ async function main() {
     return s;
   };
   Object.assign(nv1.opts, {
-    dragMode: nv1.dragModes.pan,
+    dragMode: nv1.dragModes.slicer3D,
     multiplanarForceRender: true,
     yoke3Dto2DZoom: true,
     crosshairGap: 11,
   });
+  // Reflect the actual initial drag mode in the segmented control, so the
+  // highlight always matches nv.opts.dragMode regardless of the HTML default.
+  {
+    const seg = document.getElementById("dragSegmented");
+    if (seg) seg.querySelectorAll("button").forEach((b) =>
+      b.classList.toggle("active", parseInt(b.dataset.drag, 10) === nv1.opts.dragMode));
+  }
   nv1.setInterpolation(true);
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
 
@@ -1107,7 +1349,7 @@ async function main() {
   // Actually, we set selected=true on placeholder, so browser should pick it up.
   // But let's be explicit.
   modelSelect.value = "-1";
-  drawDrop.selectedIndex = -1;
+  setPen(-1);
 
   await initializeBackend();
 
@@ -1122,7 +1364,7 @@ async function main() {
 }
 
 // Helper to show custom modal
-function showModal(title, message) {
+function showModal(title, message, opts = {}) {
   const dialog = document.getElementById("appDialog");
   const titleEl = document.getElementById("dialogTitle");
   const msgEl = document.getElementById("dialogMessage");
@@ -1133,7 +1375,13 @@ function showModal(title, message) {
   titleEl.textContent = title;
   msgEl.innerHTML = message;
 
+  // Default: show the bottom Close button. The Save picker hides it — you
+  // dismiss via an option, the top-right ×, Esc, or the backdrop.
+  closeBtn.style.display = opts.hideClose ? "none" : "";
   closeBtn.onclick = () => dialog.close();
+  dialog.classList.toggle("dialog-save", !!opts.saveMode);
+  const xBtn = document.getElementById("dialogXBtn");
+  if (xBtn) xBtn.onclick = () => dialog.close();
   dialog.showModal();
 }
 
