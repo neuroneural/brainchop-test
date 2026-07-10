@@ -25,61 +25,120 @@
 <body>
   <header>
 
-
-    <div class="control-group">
-      <label for="opacitySlider0">BG Opacity</label>
-      <input type="range" min="0" max="255" value="255" class="slider" id="opacitySlider0" />
+    <!-- Opacity: two mini sliders stacked to save horizontal space -->
+    <div class="opacity-stack" title="Layer opacity">
+      <div class="opacity-row">
+        <span class="opacity-label">BG</span>
+        <input type="range" min="0" max="255" value="255" class="mini-slider" id="opacitySlider0"
+          aria-label="Background opacity" />
+      </div>
+      <div class="opacity-row">
+        <span class="opacity-label">OVL</span>
+        <input type="range" min="0" max="255" value="128" class="mini-slider" id="opacitySlider1"
+          aria-label="Overlay opacity" />
+      </div>
     </div>
 
-    <div class="control-group">
-      <label for="opacitySlider1">Overlay</label>
-      <input type="range" min="0" max="255" value="128" class="slider" id="opacitySlider1" />
-    </div>
+    <span class="tb-divider"></span>
 
-    <!-- Backend selection is now automatic -->
-    <select id="modelSelect">
+    <!-- The star of the show: model selector, right after the sliders -->
+    <select id="modelSelect" class="model-select" title="Choose a segmentation model to run">
       <option value="-1" disabled selected>Loading models...</option>
     </select>
 
-    <div class="button-group">
-      <button id="saveImgBtn">Save Seg</button>
-      <button id="saveStatsBtn" title="Per-label volume and intensity statistics (min/max/quartiles/mean/stdev) of the input image, as CSV">Save Stats</button>
-      <button id="saveSceneBtn">Save Scene</button>
+    <span class="tb-divider"></span>
+
+    <!-- Interaction mode: compact icon toggle (values map to nv.opts.dragMode) -->
+    <div class="segmented segmented-icons" id="dragSegmented" role="group" aria-label="Mouse drag mode">
+      <button type="button" data-drag="3" title="Pan / zoom" aria-label="Pan / zoom">
+        <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+          <path d="M12 2v20M2 12h20" />
+          <path d="M9 5l3-3 3 3M9 19l3 3 3-3M5 9l-3 3 3 3M19 9l3 3-3 3" />
+        </svg>
+      </button>
+      <button type="button" data-drag="1" title="Brightness / contrast" aria-label="Brightness / contrast">
+        <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 3v18a9 9 0 0 0 0-18z" fill="currentColor" stroke="none" />
+        </svg>
+      </button>
+      <button type="button" data-drag="2" title="Measure a distance" aria-label="Measure a distance">
+        <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+          <rect x="2.5" y="8.5" width="19" height="7" rx="1" />
+          <path d="M7 8.5v3M11 8.5v4M15 8.5v3M19 8.5v3" />
+        </svg>
+      </button>
+      <button type="button" data-drag="4" class="active" title="Drag to reslice in 3D" aria-label="Reslice in 3D">
+        <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+          <path d="M12 2.5l8.5 4.9v9.2L12 21.5l-8.5-4.9V7.4z" />
+          <path d="M12 12v9.5M3.5 7l8.5 5 8.5-5" />
+        </svg>
+      </button>
     </div>
 
-    <div class="control-group">
-      <label for="penDrop">Draw</label>
-      <select id="penDrop">
-        <option value="-1">Off</option>
-        <option value="2">On</option>
-        <option value="10">Filled</option>
-        <option value="0">Erase</option>
-      </select>
-      <select id="drawDrop">
-        <option value="0">Undo</option>
-        <option value="1">Append</option>
-        <option value="2">Remove</option>
-      </select>
+    <!-- Draw tools: single button opening a popover -->
+    <div class="popover-wrap">
+      <button type="button" id="drawBtn" class="tb-btn" aria-haspopup="true" aria-expanded="false"
+        title="Drawing tools">
+        <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+          <path d="M4 20l4-1L20 7a2 2 0 0 0-3-3L5 16l-1 4z" />
+          <path d="M14 6l4 4" />
+        </svg>Draw
+      </button>
+      <div id="drawPopover" class="popover" hidden>
+        <div class="popover-section">
+          <span class="popover-title">Pen</span>
+          <div class="popover-row" id="penRow">
+            <button type="button" data-pen="-1" class="chip active">Off</button>
+            <button type="button" data-pen="2" class="chip">Draw</button>
+            <button type="button" data-pen="10" class="chip">Filled</button>
+            <button type="button" data-pen="0" class="chip">Erase</button>
+          </div>
+        </div>
+        <div class="popover-section">
+          <span class="popover-title">Apply to segmentation</span>
+          <div class="popover-row" id="drawApplyRow">
+            <button type="button" data-apply="1" class="chip">Append</button>
+            <button type="button" data-apply="2" class="chip">Remove</button>
+            <button type="button" data-apply="0" class="chip">Undo</button>
+          </div>
+        </div>
+      </div>
     </div>
 
-    <div class="control-group">
-      <label for="dragMode">Drag</label>
-      <select id="dragMode">
-        <option>none</option>
-        <option>contrast</option>
-        <option>measurement</option>
-        <option selected>pan/zoom</option>
-        <option>slicer3D</option>
-      </select>
-    </div>
+    <span class="tb-flex"></span>
 
-    <div class="control-group">
-      <label for="ttaCheck" title="Test Time Augmentation (Average with flipped input)">TTA</label>
-      <input type="checkbox" id="ttaCheck" style="margin: auto;" />
-    </div>
+    <!-- Outputs -->
+    <button type="button" id="saveBtn" class="tb-btn" title="Save segmentation, input, or scene">
+      <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+        <path d="M12 3v12" />
+        <path d="M7 11l5 5 5-5" />
+        <path d="M4 21h16" />
+      </svg>Save
+    </button>
+    <button type="button" id="saveStatsBtn" class="tb-btn"
+      title="Per-label volume and intensity statistics (min/max/quartiles/mean/stdev), viewable and saveable as CSV">
+      <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+        <path d="M5 21V10" />
+        <path d="M12 21V4" />
+        <path d="M19 21v-7" />
+      </svg>Stats
+    </button>
 
-    <button id="diagnosticsBtn">Diagnostics</button>
-    <button id="aboutBtn">About</button>
+    <span class="tb-divider"></span>
+
+    <button type="button" id="diagnosticsBtn" class="tb-icon-btn" title="Diagnostics" aria-label="Diagnostics">
+      <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+        <path d="M4 12h4l2 5 4-10 2 5h4" />
+      </svg>
+    </button>
+    <button type="button" id="aboutBtn" class="tb-icon-btn" title="About" aria-label="About">
+      <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 11v5" />
+        <path d="M12 7.5v.5" />
+      </svg>
+    </button>
   </header>
 
   <main id="canvas-container">
@@ -117,6 +176,7 @@
 
   <!-- Custom Modal Dialog -->
   <dialog id="appDialog">
+    <button id="dialogXBtn" class="dialog-x" type="button" aria-label="Close">&times;</button>
     <h3 id="dialogTitle">Message</h3>
     <div id="dialogMessage"></div>
     <button id="dialogCloseBtn" type="button">Close</button>

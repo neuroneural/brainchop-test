@@ -40,79 +40,274 @@ div {
   background-color: transparent;
 }
 
-/* Header */
+/* Header — compact single-row toolbar, grouped by function */
 header {
   margin: 0;
-  background-color: var(--header-bg);
-  padding: var(--spacing);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+  background: linear-gradient(180deg, #363636 0%, #2c2c2c 100%);
+  padding: 0 14px;
+  height: 56px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
   display: flex;
-  flex-wrap: wrap;
-  /* Critical for mobile responsiveness */
+  flex-wrap: nowrap;
   align-items: center;
-  gap: var(--spacing);
+  gap: 12px;
   flex-shrink: 0;
   color: var(--text-color);
 }
 
-header label {
+/* Spacers / dividers */
+.tb-flex {
+  flex: 1 1 auto;
+  min-width: 8px;
+}
+
+.tb-divider {
+  width: 1px;
+  height: 26px;
+  background: #4a4a4a;
+  flex: 0 0 auto;
+}
+
+/* Generic toolbar buttons */
+.tb-btn,
+.tb-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 12px;
+  border: 0.5px solid #565b61;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #e6e8ea;
+  font-size: 13px;
   font-weight: 500;
-  font-size: 14px;
-  /* Normalized to match buttons */
-  white-space: nowrap;
-  color: var(--text-color);
-}
-
-/* Form Controls */
-select,
-button,
-input[type="text"] {
-  padding: 5px 12px;
-  /* Tighter */
-  border: 1px solid #d1d5da;
-  /* Subtle border like GitHub star */
-  border-radius: 6px;
-  /* Slightly more rounded */
-  font-size: 14px;
-  /* Standard readable size */
-  background-color: var(--input-bg);
-  color: var(--input-text);
-}
-
-button {
   cursor: pointer;
-  background-color: #e0e0e0;
-  color: #000;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.tb-icon-btn {
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+}
+
+.tb-btn:hover,
+.tb-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: #7a8087;
+}
+
+.tb-btn:active,
+.tb-icon-btn:active {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tb-ico {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: 0 0 auto;
+}
+
+/* Opacity: two mini sliders stacked */
+.opacity-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+
+.opacity-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.opacity-label {
+  width: 26px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: #9aa4af;
+}
+
+.mini-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 84px;
+  height: 4px;
+  border-radius: 999px;
+  background: #4a5058;
+  outline: none;
+  margin: 0;
+  cursor: pointer;
+}
+
+.mini-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #e6e8ea;
+  border: none;
+  cursor: pointer;
+}
+
+.mini-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #e6e8ea;
+  border: none;
+  cursor: pointer;
+}
+
+/* Segmented control (drag mode) */
+.segmented {
+  display: inline-flex;
+  background: #1f242b;
+  border-radius: 8px;
+  padding: 3px;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.segmented button {
+  padding: 5px 11px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #9aa4af;
+  font-size: 13px;
   font-weight: 500;
-  transition: all 0.2s;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
-button:hover {
-  background-color: #ffffff;
-  border-color: #999;
+.segmented button:hover {
+  color: #e6e8ea;
 }
 
-button:active {
-  background-color: #ccc;
+.segmented button.active {
+  background: #3a424c;
+  color: #fff;
 }
 
-/* Specific Button Styles */
-#diagnosticsBtn {
-  color: #000;
-  background-color: #e0e0e0;
-  border-color: #ccc;
+/* Compact icon-only variant */
+.segmented-icons button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 9px;
 }
 
-#aboutBtn {
-  color: #000;
-  background-color: #e0e0e0;
-  border-color: #ccc;
+.segmented-icons .tb-ico {
+  width: 16px;
+  height: 16px;
 }
 
-/* Sliders */
-input[type=range] {
-  vertical-align: middle;
-  max-width: 100px;
+/* Popover (draw tools) */
+.popover-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 50;
+  min-width: 200px;
+  padding: 12px;
+  background: #2b3038;
+  border: 0.5px solid #565b61;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.popover[hidden] {
+  display: none;
+}
+
+.popover-section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.popover-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: #9aa4af;
+}
+
+.popover-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  padding: 5px 11px;
+  border: 0.5px solid #565b61;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #cbd2d9;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.chip:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.chip.active {
+  background: #185fa5;
+  border-color: #3b82f6;
+  color: #fff;
+}
+
+/* Model selector — the primary control, subtly accented */
+.model-select {
+  height: 36px;
+  max-width: 320px;
+  padding: 0 34px 0 14px;
+  border: 1px solid #3b82f6;
+  border-radius: 9px;
+  background-color: rgba(59, 130, 246, 0.08);
+  color: #e6e8ea;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9l6 6 6-6'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  text-overflow: ellipsis;
+}
+
+.model-select:hover {
+  background-color: rgba(59, 130, 246, 0.16);
+}
+
+.model-select option {
+  background-color: #2b3038;
+  color: #e6e8ea;
 }
 
 /* Main Canvas Area */
@@ -327,52 +522,128 @@ progress::-moz-progress-bar {
   display: inline-block;
 }
 
-/* Mobile Tweaks */
-@media (max-width: 768px) {
+/* Header responsiveness: the toolbar can scroll horizontally on narrow screens
+   rather than wrapping into a tall block. Labels on the segmented control drop
+   to icons-only isn't needed since the whole row scrolls. */
+@media (max-width: 820px) {
   header {
-    padding: 0.5rem;
-    gap: 0.5rem;
+    gap: 10px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
   }
 
-  header label {
-    font-size: 0.8rem;
+  header::-webkit-scrollbar {
+    display: none;
   }
 
-  select,
-  button {
-    font-size: 0.8rem;
-    padding: 0.2rem 0.4rem;
+  .tb-flex {
+    flex: 0 0 8px;
+    min-width: 8px;
   }
 
-  /* Stack some items on very small screens if needed, 
-     but wrap usually handles it. 
-     Maybe hide less important controls? */
+  .model-select {
+    max-width: 220px;
+  }
+
+  .tb-btn span,
+  .segmented button {
+    white-space: nowrap;
+  }
 }
 
-/* OVERRIDE NIIVUE.CSS HIDING */
-@media (max-width: 768px) {
+/* Save picker: borderless option list — click an option to save (no buttons) */
+.save-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  /* Fixed, centered block so the 2×2 stays symmetric regardless of the shared
+     dialog's actual width (which the stats panel also drives). */
+  width: 460px;
+  max-width: 100%;
+  margin: 4px auto 0;
+}
 
+/* Save picker sizing: compact, content-height (not the tall flex column the
+   stats panel needs). Scoped via .dialog-save so other modals are unaffected. */
+/* [open].dialog-save (id+attr+class) outranks the runtime-injected
+   #appDialog[open] stats rules, so the save picker lays out as a plain,
+   content-height block centered in the viewport — not the tall flex column. */
+#appDialog[open].dialog-save {
+  display: block;
+  width: 520px;
+  max-width: 94vw;
+  max-height: 90vh;
+  /* Let the UA modal centering (position:fixed; inset:0; margin:auto) handle
+     both axes — now that this is a plain block, it centers cleanly. */
+  inset: 0;
+  margin: auto;
+}
 
-  #penDrop,
-  #drawDrop,
-  #dragMode,
-  #saveSceneBtn,
-  #diagnosticsBtn,
-  #aboutBtn {
-    display: inline-block !important;
-    /* Force show */
-  }
+#appDialog[open].dialog-save #dialogMessage {
+  display: block;
+  flex: 0 0 auto;
+}
 
-  header label {
-    display: inline-block !important;
-  }
+/* Top-right close affordance (all modals) */
+.dialog-x {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #aaa;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 6px;
+}
 
-  /* Make sure our control groups wrap nicely */
-  .control-group {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-  }
+.dialog-x:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.save-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  height: 100%;
+  padding: 14px 16px;
+  border: 0.5px solid #565b61;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #e6e8ea;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.save-opt:hover {
+  background: rgba(59, 130, 246, 0.14);
+  border-color: #3b82f6;
+}
+
+.save-opt.disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.save-opt-title {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.save-opt-sub {
+  font-size: 12px;
+  color: #9aa4af;
 }
 
 /* Modal Dialog */
