@@ -1138,13 +1138,13 @@ async function main() {
     return Array.from(countsMap, ([value, count]) => ({ value, count }));
   }
 
-  async function createLabeledCounts(uniqueValuesAndCounts, labelStrings) {
+  async function createLabeledCounts(uniqueValuesAndCounts, labelStrings, voxelVolMm3 = 1) {
     if (!labelStrings || uniqueValuesAndCounts.length !== labelStrings.length) {
       missingLabelStatus = "Failed to Predict Some Labels - ";
     }
     return labelStrings.map((label, index) => {
       const entry = uniqueValuesAndCounts.find(item => item.value === index);
-      const countText = entry ? `${entry.count} mm3` : "Missing";
+      const countText = entry ? `${fmtCm3(entry.count * voxelVolMm3)} cm3` : "Missing";
       if (countText === "Missing") missingLabelStatus += `${label}, `;
       return `${label}   ${countText}`;
     });
@@ -1174,7 +1174,9 @@ async function main() {
       const cmap = await fetchJSON(modelEntry.colormapPath);
       lastSegLabelNames = cmap["labels"] ? cmap["labels"].slice() : null;
       lastSegColors = { R: cmap["R"], G: cmap["G"], B: cmap["B"] };
-      const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"]);
+      const pd = nv1.volumes[0].hdr.pixDims || [];
+      const voxelVolMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
+      const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"], voxelVolMm3);
       overlayVolume.setColormapLabel({ R: cmap["R"], G: cmap["G"], B: cmap["B"], labels: newLabels });
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
     } else {
