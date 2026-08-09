@@ -57,6 +57,7 @@ const inferenceModelsList = [
     webgpu_safetensor: './models/mindgrab/model.safetensors',
       webgpu_runner: 'mindgrab',
       webgpuTTArunner: true,      
+    webgpuStorageSize: 503316480, // 15 * 256^3 * 2 = 480 MiB largest full-volume fp16 activation buffer.
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
     isBatchOverlapEnable: false, // create extra overlap batches for inference
@@ -74,7 +75,7 @@ const inferenceModelsList = [
       "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
     inferenceDelay: 100, // Delay in ms time while looping layers applying.
     description:
-      'The omnimodal skull stripping model delivers high-accuracy brain extraction in seconds, supporting multiple imaging modalities including T1, T2, FLAIR, DWI, EPI, MRA, PDw, CT, and PET without a need for tuning. It runs in a single pass with only 15 filters per layer, and is offered in high-memory/fast and low-memory/slow configurations. Use it today to improve and accelerate your brain extraction!'
+      'The omnimodal skull stripping model delivers high-accuracy brain extraction in seconds, supporting multiple imaging modalities including T1, T2, FLAIR, DWI, EPI, MRA, PDw, CT, and PET without a need for tuning. Its generated WebGPU runner stores full-volume activations in fp16, reducing the largest GPU buffer to 480 MiB without the former low-memory speed penalty.'
   },
   {
     // Default Subcortical + GWM: now backed by the deep gridding-free MeshNet
@@ -94,7 +95,7 @@ const inferenceModelsList = [
     webgpu_safetensor: './models/model16chan18cls/model.safetensors',
     webgpu_runner: 'model16chan18cls',
     forceFP32: false, // fp16 default; fp32 auto-used only if device lacks shader-f16 AND the _f32 runner exists.
-    webgpuStorageSize: 1073741824, // 16 * 256^3 * 4 = 1 GiB largest full-volume f32 conv buffer.
+    webgpuStorageSize: 536870912, // 16 * 256^3 * 2 = 512 MiB largest full-volume fp16 activation/classifier chunk buffer.
     numClasses: 18,
     preModelId: null, // gridding-free (RF=255): full head, no pre-model/crop on WebGPU.
     preModelPostProcess: false,
