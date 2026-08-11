@@ -5,11 +5,22 @@ import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
 import { installResponsiveLayout } from "./responsive-layout.js";
+import { installTouchViewControls } from "./touch-view.js";
 
-// --- Backend State ---
 // --- Backend State ---
 let gpuDevice = null;
 let isWebGpuAvailable = false;
+
+// --- Backend fallback chain state -----------------------------------------
+// runSelectedInference() tries WebGPU, then the native WebGL2 runner, then the
+// tfjs worker (fast, then seqConv), then the main thread. Every one of those
+// stages reports its own failure through callbackUI's modalMessage, which used
+// to pop a blocking window.alert -- so a user on a machine where WebGPU is
+// unavailable got "WebGPU Error: ..." and then a perfectly good segmentation
+// from the next backend. An earlier backend giving up is a console-level event.
+// Messages are collected here and only surfaced if the whole chain fails.
+let suppressBackendModals = false;
+let backendAttemptMessages = [];
 
 // --- DEBUG OVERRIDE -------------------------------------------------------
 // Normally false: WebGPU is used when available, WebGL2 is the fallback.
@@ -539,7 +550,19 @@ async function main() {
     e.preventDefault();
   }
 
+  // Wrapper: owns the "is a fallback still possible" state for callbackUI.
   async function runSelectedInference() {
+    if (suppressBackendModals) return; // already running
+    suppressBackendModals = true;
+    backendAttemptMessages = [];
+    try {
+      await runInferenceChain();
+    } finally {
+      suppressBackendModals = false;
+    }
+  }
+
+  async function runInferenceChain() {
     const selectedModelIndex = modelSelect.value;
     if (selectedModelIndex === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
@@ -721,7 +744,7 @@ async function main() {
         await runMainThread(true);
       } catch (e2) {
         console.error("Main Thread (slow) failed.", e2);
-        window.alert("Inference failed on all backends.");
+        showBackendFailure(e2);
       }
     }
   }
@@ -1281,7 +1304,15 @@ async function main() {
       modelProgress.value = progressFrac * modelProgress.max;
     }
     if (modalMessage) {
-      window.alert(modalMessage);
+      if (suppressBackendModals) {
+        // A backend declined; the next one in the chain still gets a go. Keep
+        // it out of the user's way -- console + the memstatus indicator above
+        // are the signal. showBackendFailure() reports these if nothing works.
+        backendAttemptMessages.push(String(modalMessage));
+        console.warn("[backend]", modalMessage);
+      } else {
+        showModal("Message", escapeHtml(String(modalMessage)).replace(/\n/g, "<br>"));
+      }
     }
     if (statData && Object.keys(statData).length > 0) {
       reportTelemetry(statData);
@@ -1400,6 +1431,8 @@ async function main() {
   // pane size, and offer single-plane views on narrow screens. Installed after
   // onImageLoaded so it can chain onto it. See responsive-layout.js.
   installResponsiveLayout(nv1);
+  // Pinch guards: keep two-finger gestures zooming the image, not the document.
+  installTouchViewControls(nv1);
   // modelSelect.selectedIndex = -1; // Removed as we want the placeholder to be selected by default (which is index 0 or value "-1")
   // Actually, we set selected=true on placeholder, so browser should pick it up.
   // But let's be explicit.
@@ -1416,6 +1449,30 @@ async function main() {
     modelSelect.value = modelParam;
     runSelectedInference();
   }
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+// Every backend failed: this is the one point in the chain where the user does
+// need a dialog. Include what each backend said, since that is the useful part
+// for a bug report -- and use the in-app modal rather than window.alert, which
+// blocks the event loop and looks like a browser error.
+function showBackendFailure(lastError) {
+  const reasons = backendAttemptMessages.length
+    ? backendAttemptMessages
+    : [lastError && lastError.message ? lastError.message : String(lastError || "unknown error")];
+  const list = reasons
+    .map((r) => `<li>${escapeHtml(r)}</li>`)
+    .join("");
+  showModal(
+    "Segmentation failed",
+    `<p>No available backend could run this model on this device.</p>
+     <ul style="margin:0 0 4px 1.1em;padding:0;font-size:0.92em;line-height:1.45">${list}</ul>
+     <p style="font-size:0.88em;color:#9aa4af">Full details are in the browser console and under Diagnostics.</p>`
+  );
 }
 
 // Helper to show custom modal

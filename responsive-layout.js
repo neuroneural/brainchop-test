@@ -23,6 +23,7 @@
 // pick, and the multiplanar view remains the default everywhere.
 
 import { SLICE_TYPE, MULTIPLANAR_TYPE, SHOW_RENDER } from "@niivue/niivue";
+import { resetView } from "./touch-view.js";
 
 // A viewport is treated as "narrow" (phone-like) when either the CSS width is
 // small, or it is a touch screen whose short side is small. Checking the real
@@ -184,6 +185,18 @@ function buildSwitcher(nv, container) {
     btn.addEventListener("click", () => setPane(nv, bar, pane.id));
     bar.appendChild(btn);
   }
+
+  // Reset view: zoom/pan back to default. Not a pane, so it never takes the
+  // active highlight -- it is an action, and the current pane stays selected.
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "pane-reset";
+  reset.textContent = "\u27F2";
+  reset.title = "Reset zoom and pan";
+  reset.setAttribute("aria-label", "Reset zoom and pan");
+  reset.addEventListener("click", () => resetView(nv));
+  bar.appendChild(reset);
+
   container.appendChild(bar);
   return bar;
 }

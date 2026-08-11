@@ -747,6 +747,20 @@ body.nv-narrow .pane-switcher {
   color: #fff;
 }
 
+/* Reset is an action, not a pane: separated by a hairline and never highlighted */
+.pane-switcher .pane-reset {
+  margin-left: 3px;
+  padding: 0 10px;
+  border-left: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 0 999px 999px 0;
+  font-size: 15px;
+  color: #9aa4af;
+}
+
+.pane-switcher .pane-reset:active {
+  color: #fff;
+}
+
 /* Slim chrome: ~94px of header+footer becomes ~68px, all of it going to the
    image. Controls stay finger-sized (>=30px) and the toolbar keeps its
    horizontal scroll from the 820px query above. */
@@ -826,4 +840,25 @@ body.nv-narrow #location {
 
 body.nv-narrow progress {
   width: 44px;
+}
+
+/* ===========================================================================
+   Touch gestures. A two-finger pinch used to scale the whole DOCUMENT (nothing
+   set touch-action and the viewport meta allows user scaling), which shrank the
+   entire app and could only be undone by reloading -- JS cannot set the visual
+   viewport scale back. `pan-x pan-y` keeps one-finger panning and drops the
+   browser's pinch-zoom and double-tap-zoom; the canvas takes `none` so niivue
+   sees every touch. Older iOS Safari ignores this, so touch-view.js also
+   cancels the gesture* events.
+   =========================================================================== */
+html,
+body {
+  touch-action: pan-x pan-y;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+
+main#canvas-container,
+#gl1 {
+  touch-action: none;
 }
