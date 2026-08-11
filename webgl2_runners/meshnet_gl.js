@@ -69,17 +69,31 @@ export function probeWebgl2(d, dims, existingGl = null) {
     if (maxAttach < d.planes) reasons.push(`MAX_COLOR_ATTACHMENTS is ${maxAttach}, ${d.chan} channels need ${d.planes}`);
     if (maxTex < LAB_W) reasons.push(`MAX_TEXTURE_SIZE is ${maxTex}, the label texture needs ${LAB_W}`);
 
+    // Allocate the REAL working set, not one plane.
+    //
+    // brainchopC's probe tries a single 128 MB texture, and this one used to copy
+    // that. It is not good enough: a device can hand out one plane and fail on the
+    // twelfth, and the gap matters most exactly where the answer is interesting --
+    // 16 channels need 1.0 GiB (which phones do manage) while 24 need 1.5 GiB and
+    // 32 need 2.0 GiB. Guessing from one plane would refuse those on principle or
+    // admit them on hope. So allocate all 2*planes and free them.
     let allocates = false;
+    const probeTex = [];
     if (!reasons.length) {
-      const t = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_3D, t);
       while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
-      gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGBA16F, nx, ny, nz);
-      allocates = gl.getError() === gl.NO_ERROR;
-      gl.deleteTexture(t);
+      allocates = true;
+      for (let i = 0; i < 2 * d.planes && allocates; i++) {
+        const t = gl.createTexture();
+        probeTex.push(t);
+        gl.bindTexture(gl.TEXTURE_3D, t);
+        gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGBA16F, nx, ny, nz);
+        if (gl.getError() !== gl.NO_ERROR || gl.isContextLost()) allocates = false;
+      }
+      for (const t of probeTex) gl.deleteTexture(t);
       if (!allocates) {
-        const mb = Math.round((nx * ny * nz * 8) / 1048576);
-        reasons.push(`could not allocate one ${mb} MB RGBA16F 3D texture; this model needs ${2 * d.planes} of them`);
+        const mb = Math.round((2 * d.planes * nx * ny * nz * 8) / 1048576);
+        reasons.push(`could not allocate this model's ${mb} MB activation working set ` +
+          `(${2 * d.planes} x RGBA16F ${nx}x${ny}x${nz} 3D textures)`);
       }
     }
 
@@ -268,6 +282,18 @@ function sampleActivation(gl, fbo, w, h) {
 }
 
 function checkGl(gl, where) {
+  // Context loss is checked SYNCHRONOUSLY via isContextLost(), not via the
+  // `webglcontextlost` event, and the distinction is the whole point: this runner
+  // never yields, so an event listener cannot fire until the run has already
+  // finished and returned. A listener is still registered, but only so the loss
+  // gets logged -- isContextLost() is what actually stops the run.
+  //
+  // Losing the context is the likely failure mode when a large model's activation
+  // set does not fit (1.5 GiB at 24 channels, 2.0 at 32), and per the standing
+  // rule it must make the run fail rather than return a blank volume.
+  if (gl.isContextLost()) {
+    throw new Error(`the WebGL context was lost at ${where} (most likely the activation set did not fit)`);
+  }
   const e = gl.getError();
   if (e !== gl.NO_ERROR) {
     // Never a blank volume with status 0: a silent wrong answer is the cardinal sin.
@@ -316,6 +342,12 @@ export function runMeshNetGL(o) {
         preserveDrawingBuffer: false, powerPreference: 'high-performance',
       });
       if (!gl) throw new Error('no webgl2 context');
+      // Logging only -- see checkGl for why isContextLost() is the mechanism that
+      // actually stops a synchronous run.
+      canvas.addEventListener?.('webglcontextlost', (ev) => {
+        ev.preventDefault?.();
+        o.onLog?.('[webgl2] webglcontextlost fired (the run has already been aborted by isContextLost)');
+      });
     }
     if (!gl.getExtension('EXT_color_buffer_float')) {
       throw new Error('EXT_color_buffer_float unavailable; float textures are not renderable here');

@@ -1,7 +1,6 @@
 import { Niivue } from "@niivue/niivue";
 import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
 import { runInferenceWebGpu } from "./inference-webgpu.js";
-import { runInferenceWebGl2, nativeWebgl2Available } from "./inference-webgl2.js";
 import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
@@ -24,6 +23,28 @@ const FORCE_WEBGL2_TESTING = false;
 // WebGL2 implementations on the same machine and the same model, which is the
 // only comparison that settles whether the port is worth it.
 const FORCE_TFJS_WEBGL_TESTING = false;
+
+// The NATIVE WebGL2 runner (webgl2_runners/) is LIVE. It is the whole point of
+// that code: when WebGPU is missing -- Firefox, older Safari, most Linux browsers,
+// many phones -- this is what makes brainchop fast instead of a several-minute
+// crawl. 8.03 s for model16chan18cls at full 256^3 on an M1, roughly brainchopC
+// parity, against a tfjs path that on Firefox cannot even reach its dense path for
+// any GroupNorm model (see TASK_webgl2_native_runner.md section 2b).
+//
+// Shipping it is safe because it DECLINES rather than breaks: runInferenceWebGl2
+// rejects on an unsupported device, a missing descriptor or safetensors, a GL
+// error, a lost context, non-finite layer-1 activations, or an all-zero volume --
+// and every rejection falls through to the tfjs worker below, which can still run
+// every model. So the worst case is exactly the old behaviour plus a console line.
+//
+// The import stays DYNAMIC on purpose, and not to hide the feature: the WebGPU
+// block above returns on success, so a WebGPU user never fetches this chunk or the
+// second tfjs copy its worker pulls in. Same reasoning as brainchopC probing
+// before it fetches its WebGL2 module.
+//
+// Outstanding: label parity against the WebGPU runner has not been diffed
+// systematically. Set FORCE_WEBGL2_TESTING below to compare the two on one volume.
+const ENABLE_NATIVE_WEBGL2 = true;
 // --------------------------------------------------------------------------
 
 /**
@@ -555,11 +576,16 @@ async function main() {
     // and MRT, bypassing tfjs entirely. Any refusal -- unsupported device, no
     // descriptor, no safetensors, a GL error, an all-zero volume -- rejects and
     // falls through to the tfjs worker below, which can still run every model.
-    if (!FORCE_TFJS_WEBGL_TESTING && nativeWebgl2Available() && modelEntry.webgpu_safetensor) {
-      console.log("Attempting native WebGL2 runner...");
+    if (ENABLE_NATIVE_WEBGL2 && !FORCE_TFJS_WEBGL_TESTING && modelEntry.webgpu_safetensor) {
       try {
-        await runInferenceWebGl2(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
-        return; // Success
+        // Dynamic so WebGPU users never fetch this chunk (see ENABLE_NATIVE_WEBGL2).
+        const { runInferenceWebGl2, nativeWebgl2Available } = await import("./inference-webgl2.js");
+        if (nativeWebgl2Available()) {
+          console.log("Attempting native WebGL2 runner...");
+          await runInferenceWebGl2(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+          return; // Success
+        }
+        console.log("Native WebGL2 unavailable here (no OffscreenCanvas/webgl2); using the tfjs worker.");
       } catch (e) {
         console.warn("Native WebGL2 declined or failed, falling back to the tfjs worker.", e.message);
       }

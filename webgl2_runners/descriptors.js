@@ -49,16 +49,33 @@ export const DESCRIPTORS = {
   model24chan104cls_synth: {
     dilations: DEEP13,
     activation: 'gelu_tanh',
-    // 24 ch -> 6 planes -> 6*2 full-volume RGBA16F 3D textures = 1.6 GiB at
-    // 256^3. Keep today's crop for this one; the probe refuses if even the
-    // cropped set will not allocate and the tfjs channel-list path takes over.
-    fullVolume: false,
+    // THE 104 CLASSES COST ALMOST NOTHING HERE, and it is worth being explicit
+    // because the model's name invites the opposite assumption. The classify
+    // shader loops k over NCLASS keeping a running (bestv, best) pair and writes
+    // ONE BYTE per voxel into the RGBA8 label texture -- a [256^3, 104] logits
+    // tensor is never instantiated, exactly as in the WebGPU runner. 104 <= 256
+    // so it fits the label byte. The only cost is compute: 104*24 = 2496 MACs
+    // per voxel, which scales brainchopC's 18-class classify pass to ~0.36 s.
+    //
+    // What actually costs is the 24 CHANNELS: P=6 planes x 2 sets x 128 MiB =
+    // 1.5 GiB of activations, against 1.0 GiB for the 16-channel models. That is
+    // 1.5x, not a different order, so it is measured rather than assumed --
+    // probeWebgl2 now allocates the real working set and the runner checks
+    // isContextLost, so a device that cannot hold it refuses cleanly and the
+    // tfjs channel-list path takes over.
+    //
+    // No VOX=2 at P=6: it would need 12 draw buffers and no browser offers more
+    // than 8, so this model permanently forfeits that 1.41x.
+    fullVolume: true,
   },
   model32chan18cls: {
     dilations: DEEP13,
     activation: 'gelu_tanh',
-    // 32 ch -> 8 planes -> 2.1 GiB at 256^3, and P=8 exactly consumes the 8 draw
-    // buffers an M1 reports, so no VOX=2 here either.
+    // 32 ch -> P=8 -> 2.0 GiB at 256^3, and P=8 exactly consumes the 8 draw
+    // buffers an M1 reports (SwiftShader and some Mesa stacks report 6, where
+    // this model cannot run at all). Left cropped for now purely to prove the
+    // 24-channel case first -- once that holds on real hardware this is the same
+    // one-word change, and the probe already answers the memory question.
     fullVolume: false,
   },
 

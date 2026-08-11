@@ -1,9 +1,12 @@
 # Native WebGL2 runner for brainchop-test (Option A)
 
-**Status:** working and wired. Measured **8.03 s** for `model16chan18cls` on Firefox / M1 at full
-256³ with VOX=2 — against brainchopC's own 8943 ms on Chrome / M1 at the same volume, so roughly
-brainchopC parity. Backend order is back to the intended WebGPU → native WebGL2 → tfjs worker.
-Label parity against the WebGPU runner is the remaining unverified step.
+**Status:** working, wired and **live**. Measured **8.03 s** for `model16chan18cls` on Firefox / M1
+at full 256³ with VOX=2 — against brainchopC's own 8943 ms on Chrome / M1 at the same volume, so
+roughly brainchopC parity. Every `fullVolume` model also runs on a phone. Backend order is
+**WebGPU → native WebGL2 → tfjs worker**, in dev and in production alike, because the whole value of
+this path is being the fast route on the devices that have no WebGPU.
+Label parity against the WebGPU runner has not been diffed systematically — tracked in §7, not a
+reason to withhold the path, since every failure mode declines to the tfjs worker.
 Nothing in `brainchopC` was modified; it was read only.
 
 ---
@@ -271,20 +274,34 @@ Falls back to the existing tfjs path, by design and with a logged reason:
 
 ---
 
-## 6. Wiring (applied)
+## 6. Wiring (applied, live)
 
-`main.js` now dispatches in the intended order — **WebGPU → native WebGL2 → tfjs worker** — with
-`1b` inserted between the existing `1.` and `2.` blocks. Any refusal from the native runner
-(unsupported device, no descriptor, no safetensors, a GL error, an all-zero volume) rejects and
-falls through, so the worst case is exactly today's behaviour with a logged reason.
+`main.js` dispatches **WebGPU → native WebGL2 → tfjs worker**, with `1b` inserted between the
+existing `1.` and `2.` blocks, in dev and in production alike.
 
-Two debug toggles at the top of `main.js`, both `false` in normal operation:
+`const ENABLE_NATIVE_WEBGL2 = true;` — it ships. Withholding it would defeat the point: WebGPU is
+absent on Firefox, older Safari, most Linux browsers and many phones, and those are exactly the
+devices where the alternative is a several-minute crawl (§2b: on Firefox the tfjs dense path is
+unreachable for the entire GroupNorm family).
+
+**It is safe to ship because it declines rather than breaks.** `runInferenceWebGl2` rejects on an
+unsupported device, a missing descriptor or safetensors, a GL error, a lost context, non-finite
+layer-1 activations, or an all-zero volume — and every rejection falls through to the tfjs worker,
+which still runs every model. Worst case is the old behaviour plus a console line.
+
+The import is **dynamic**, and not to hide the feature: the WebGPU block returns on success, so a
+WebGPU user never fetches this chunk or the second tfjs copy its worker pulls in. Same reasoning as
+brainchopC probing before it fetches its WebGL2 module.
+
+Two debug toggles alongside it, both `false` in normal operation:
 
 | `FORCE_WEBGL2_TESTING` | `FORCE_TFJS_WEBGL_TESTING` | what runs |
 |---|---|---|
-| `false` | `false` | WebGPU → native WebGL2 → tfjs ← **normal** |
+| `false` | `false` | WebGPU → native WebGL2 → tfjs ← **normal, shipped** |
 | `true` | `false` | native WebGL2 (skips WebGPU) |
 | `true` | `true` | old tfjs WebGL2 — the A/B control |
+
+Both must be `false` before pushing; they are debug aids, not configuration.
 
 The middle two rows on one machine and one model are the comparison that settles whether the port
 earns its keep. Note the worker does **not** hot-reload on Vite HMR — hard-refresh.
