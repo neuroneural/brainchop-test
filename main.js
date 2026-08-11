@@ -4,6 +4,7 @@ import { runInferenceWebGpu } from "./inference-webgpu.js";
 import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
+import { installResponsiveLayout } from "./responsive-layout.js";
 
 // --- Backend State ---
 // --- Backend State ---
@@ -1395,6 +1396,10 @@ async function main() {
     modelSelect.appendChild(option);
   }
   nv1.onImageLoaded = doLoadImage;
+  // Phone/desktop layout: pick the multiplanar tiling that actually maximizes
+  // pane size, and offer single-plane views on narrow screens. Installed after
+  // onImageLoaded so it can chain onto it. See responsive-layout.js.
+  installResponsiveLayout(nv1);
   // modelSelect.selectedIndex = -1; // Removed as we want the placeholder to be selected by default (which is index 0 or value "-1")
   // Actually, we set selected=true on placeholder, so browser should pick it up.
   // But let's be explicit.
