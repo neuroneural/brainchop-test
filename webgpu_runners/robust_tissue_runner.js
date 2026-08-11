@@ -2303,11 +2303,17 @@ const setupNet = async (device, safetensor) => {
 
     const layouts=[device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]}),device.createBindGroupLayout({entries: [{binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' }}, {binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },{binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }]})]
 
-    const buf_0 = createEmptyBuf(device, 536870912);;
+    const arena_0 = createEmptyBuf(device, 536870912);
+
+    const arena_1 = createEmptyBuf(device, 536870912);
+
+    const arena_2 = createEmptyBuf(device, 134217728);
+
+    const arena_3 = createEmptyBuf(device, 134217728);
     const input0 = createEmptyBuf(device, 67108864);;
     const buf_1 = createWeightBuf(device, 864, getTensorBuffer(safetensor, metadata['layers.0.2']));
     const buf_2 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.0.3']));
-    const buf_3 = createEmptyBuf(device, 536870912);;
+
     const buf_4 = createWeightBuf(device, 13824, getTensorBuffer(safetensor, metadata['layers.1.2']));
     const buf_5 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.1.3']));
     const buf_6 = createWeightBuf(device, 13824, getTensorBuffer(safetensor, metadata['layers.2.2']));
@@ -2316,10 +2322,10 @@ const setupNet = async (device, safetensor) => {
     const buf_9 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.3.3']));
     const buf_10 = createWeightBuf(device, 13824, getTensorBuffer(safetensor, metadata['layers.4.2']));
     const buf_11 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.4.3']));
-    const buf_12 = createEmptyBuf(device, 134217728);;
+
     const buf_13 = createWeightBuf(device, 27648, getTensorBuffer(safetensor, metadata['layers.5.2']));
     const buf_14 = createWeightBuf(device, 64, getTensorBuffer(safetensor, metadata['layers.5.3']));
-    const buf_15 = createEmptyBuf(device, 134217728);;
+
     const buf_16 = createWeightBuf(device, 55296, getTensorBuffer(safetensor, metadata['layers.6.2']));
     const buf_17 = createWeightBuf(device, 64, getTensorBuffer(safetensor, metadata['layers.6.3']));
     const buf_18 = createWeightBuf(device, 55296, getTensorBuffer(safetensor, metadata['layers.7.2']));
@@ -2340,13 +2346,13 @@ const setupNet = async (device, safetensor) => {
     const buf_33 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.14.3']));
     const buf_34 = createWeightBuf(device, 13824, getTensorBuffer(safetensor, metadata['layers.15.2']));
     const buf_35 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.15.3']));
-    const buf_36 = createEmptyBuf(device, 536870912);;
+
     const buf_37 = createWeightBuf(device, 13824, getTensorBuffer(safetensor, metadata['layers.16.2']));
     const buf_38 = createWeightBuf(device, 32, getTensorBuffer(safetensor, metadata['layers.16.3']));
-    const buf_39 = createEmptyBuf(device, 100663296);;
+
     const buf_40 = createWeightBuf(device, 96, getTensorBuffer(safetensor, metadata['seq_conv_argmax.weight']));
     const buf_41 = createWeightBuf(device, 6, getTensorBuffer(safetensor, metadata['seq_conv_argmax.bias']));
-    const buf_42 = createEmptyBuf(device, 33554432);;
+
     const output0 = createEmptyBuf(device, 67108864);;
 
     const gpuWriteBuffer0 = device.createBuffer({size:input0.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_WRITE });
@@ -2374,83 +2380,83 @@ const setupNet = async (device, safetensor) => {
         new Float32Array(gpuWriteBuffer0.getMappedRange()).set(_input0);
         gpuWriteBuffer0.unmap();
         commandEncoder.copyBufferToBuffer(gpuWriteBuffer0, 0, input0, 0, gpuWriteBuffer0.size);
-        addComputePass(device, commandEncoder, pipelines[0], layouts[0], infinityBuf, [buf_0, input0, buf_1, buf_2], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[0], layouts[0], infinityBuf, [arena_0, input0, buf_1, buf_2], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[1], layouts[1], infinityBuf, [buf_3, buf_0, buf_4, buf_5], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[1], layouts[1], infinityBuf, [arena_1, arena_0, buf_4, buf_5], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[2], layouts[2], infinityBuf, [buf_0, buf_3, buf_6, buf_7], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[2], layouts[2], infinityBuf, [arena_0, arena_1, buf_6, buf_7], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[3], layouts[3], infinityBuf, [buf_3, buf_0, buf_8, buf_9], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[3], layouts[3], infinityBuf, [arena_1, arena_0, buf_8, buf_9], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[4], layouts[4], infinityBuf, [buf_0, buf_3, buf_10, buf_11], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[4], layouts[4], infinityBuf, [arena_0, arena_1, buf_10, buf_11], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[5], layouts[5], infinityBuf, [buf_12, buf_0, buf_13, buf_14], [32, 128, 8]);
+        addComputePass(device, commandEncoder, pipelines[5], layouts[5], infinityBuf, [arena_2, arena_0, buf_13, buf_14], [32, 128, 8]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[6], layouts[6], infinityBuf, [buf_15, buf_12, buf_16, buf_17], [32, 128, 8]);
+        addComputePass(device, commandEncoder, pipelines[6], layouts[6], infinityBuf, [arena_3, arena_2, buf_16, buf_17], [32, 128, 8]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[7], layouts[7], infinityBuf, [buf_12, buf_15, buf_18, buf_19], [32, 128, 8]);
+        addComputePass(device, commandEncoder, pipelines[7], layouts[7], infinityBuf, [arena_2, arena_3, buf_18, buf_19], [32, 128, 8]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[8], layouts[8], infinityBuf, [buf_15, buf_12, buf_20, buf_21], [32, 128, 8]);
+        addComputePass(device, commandEncoder, pipelines[8], layouts[8], infinityBuf, [arena_3, arena_2, buf_20, buf_21], [32, 128, 8]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[9], layouts[9], infinityBuf, [buf_12, buf_15, buf_22, buf_23], [32, 128, 8]);
+        addComputePass(device, commandEncoder, pipelines[9], layouts[9], infinityBuf, [arena_2, arena_3, buf_22, buf_23], [32, 128, 8]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[10], layouts[10], infinityBuf, [buf_15, buf_12, buf_24, buf_25], [32, 128, 8]);
+        addComputePass(device, commandEncoder, pipelines[10], layouts[10], infinityBuf, [arena_3, arena_2, buf_24, buf_25], [32, 128, 8]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[11], layouts[11], infinityBuf, [buf_0, buf_15, buf_26, buf_27], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[11], layouts[11], infinityBuf, [arena_0, arena_3, buf_26, buf_27], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[12], layouts[12], infinityBuf, [buf_3, buf_0, buf_28, buf_29], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[12], layouts[12], infinityBuf, [arena_1, arena_0, buf_28, buf_29], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[13], layouts[13], infinityBuf, [buf_0, buf_3, buf_30, buf_31], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[13], layouts[13], infinityBuf, [arena_0, arena_1, buf_30, buf_31], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[14], layouts[14], infinityBuf, [buf_3, buf_0, buf_32, buf_33], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[14], layouts[14], infinityBuf, [arena_1, arena_0, buf_32, buf_33], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[15], layouts[15], infinityBuf, [buf_0, buf_3, buf_34, buf_35], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[15], layouts[15], infinityBuf, [arena_0, arena_1, buf_34, buf_35], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[16], layouts[16], infinityBuf, [buf_36, buf_0, buf_37, buf_38], [128, 256, 4]);
+        addComputePass(device, commandEncoder, pipelines[16], layouts[16], infinityBuf, [arena_1, arena_0, buf_37, buf_38], [128, 256, 4]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[17], layouts[17], infinityBuf, [buf_39, buf_36, buf_40, buf_41], [32768, 4, 1]);
+        addComputePass(device, commandEncoder, pipelines[17], layouts[17], infinityBuf, [arena_0, arena_1, buf_40, buf_41], [32768, 4, 1]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[18], layouts[18], infinityBuf, [buf_42, buf_39], [32768, 4, 1]);
+        addComputePass(device, commandEncoder, pipelines[18], layouts[18], infinityBuf, [arena_1, arena_0], [32768, 4, 1]);
         device.queue.submit([commandEncoder.finish()]);
         await device.queue.onSubmittedWorkDone();
         commandEncoder = device.createCommandEncoder();
-        addComputePass(device, commandEncoder, pipelines[19], layouts[19], infinityBuf, [output0, buf_39, buf_42], [32768, 4, 1]);
+        addComputePass(device, commandEncoder, pipelines[19], layouts[19], infinityBuf, [output0, arena_0, arena_1], [32768, 4, 1]);
         commandEncoder.copyBufferToBuffer(output0, 0, gpuReadBuffer0, 0, output0.size);
         device.queue.submit([commandEncoder.finish()]);
 
