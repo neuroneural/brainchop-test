@@ -1265,6 +1265,15 @@ export function estimateMaxIntermediateTensorSize(model, inputShape, isChannelLa
   // 2. Iterate Layers to find Peak Memory (Input + Output) and Max Output
   // checkMemoryAllocation tests both packed (peak) and unpacked (maxOutput).
   let maxOutputElements = 0;
+  // Largest SINGLE tensor, which is the right quantity for a TEXTURE-DIMENSION
+  // check. `maxElements` below is input+output summed, which is a fair proxy for
+  // total GPU MEMORY but is wrong for the texture limit: the input activation and
+  // the output activation are two separate tensors in two separate textures, and
+  // MAX_TEXTURE_SIZE applies per texture. Summing them inflates the computed
+  // dimension by sqrt(2), which is enough to push a 16-channel layer on a
+  // 256x204x204 crop from 6528 to 9232 -- under Chrome's 16384 either way, but
+  // straddling Firefox's 8192. That is why this only ever bit on Firefox.
+  let maxSingleElements = 0;
 
   if (model && model.layers) {
     const _numLayers = model.layers.length;
@@ -1349,6 +1358,13 @@ export function estimateMaxIntermediateTensorSize(model, inputShape, isChannelLa
         if (!_isFinalLayer && currentPeakElements > maxElements) {
           maxElements = currentPeakElements;
         }
+        // Same exclusion of the final layer, for the same reason: it is always
+        // routed to chunkedArgMax / SequentialConvLayer and never materialized
+        // densely, so its channel count must not decide the backbone's path.
+        const currentSingleElements = spatialVol * Math.max(inputChannels, outputChannels);
+        if (!_isFinalLayer && currentSingleElements > maxSingleElements) {
+          maxSingleElements = currentSingleElements;
+        }
         // Track output of LAST layer (overwrite each iteration)
         // Only the FINAL output is unpacked for argmax. Intermediates are packed.
         maxOutputElements = currentOutputElements;
@@ -1360,11 +1376,34 @@ export function estimateMaxIntermediateTensorSize(model, inputShape, isChannelLa
   if (maxElements === 0) {
     maxElements = spatialVol * 32 * 2;
   }
+  if (maxSingleElements === 0) {
+    maxSingleElements = spatialVol * 32;
+  }
+
+  // Does the largest intermediate get UNPACKED at some point? For the affine-GN
+  // and GN models it does, and that changes the limit by 2x in the dimension.
+  // LayerNormInPlace does `x.transpose([0,4,1,2,3]).reshape([C, N])`, which
+  // materializes the whole activation as a flat [C, N] tensor with no packing --
+  // 1 element per texel, so the texture is ceil(sqrt(N)) on a side, not
+  // ceil(sqrt(N/4)). tfjs squarifies it, which is where the "[12481x12481]" in
+  // the failure message comes from: 15 * 204*202*252 = 155766240 elements.
+  //
+  // This is measured from the failure, not assumed: 12481 = ceil(sqrt(15V))
+  // exactly, and 6241 = ceil(sqrt(15V/4)) is what the packed check computed.
+  const hasUnpackedIntermediate = !!(model && model.layers &&
+    model.layers.some((l) => typeof l.name === 'string' && l.name.endsWith('_gn')));
 
   // Return BOTH peak (In+Out) and max output separately
   // This allows checkMemoryAllocation to test packed (peak) and unpacked (maxOutput)
-  console.log(`[Estimator] Total Layers: ${model?.layers?.length}, Peak: ${maxElements}, Final Output: ${maxOutputElements}`);
-  return { peak: maxElements, maxOutput: maxOutputElements };
+  console.log(`[Estimator] Total Layers: ${model?.layers?.length}, Peak(in+out): ${maxElements}, ` +
+    `MaxSingle: ${maxSingleElements}, Final Output: ${maxOutputElements}, ` +
+    `unpackedIntermediate: ${hasUnpackedIntermediate}`);
+  return {
+    peak: maxElements,
+    maxSingle: maxSingleElements,
+    maxOutput: maxOutputElements,
+    hasUnpackedIntermediate,
+  };
 }
 
 /**

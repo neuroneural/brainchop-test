@@ -175,8 +175,10 @@ export async function runFullVolumeInference(
   let useChunkedArgMax = false;
 
   if (!modelEntry.enableSeqConv) {
-    const { peak, maxOutput } = estimateMaxIntermediateTensorSize(res, adjusted_input_shape, isChannelLast);
-    console.log(`[Centralized Check] Peak (In+Out): ${peak}, Max Output: ${maxOutput}`);
+    const { peak, maxSingle, maxOutput, hasUnpackedIntermediate } =
+      estimateMaxIntermediateTensorSize(res, adjusted_input_shape, isChannelLast);
+    console.log(`[Centralized Check] Peak (In+Out): ${peak}, MaxSingle: ${maxSingle}, ` +
+      `Max Output: ${maxOutput}, unpackedIntermediate: ${hasUnpackedIntermediate}`);
 
     const backend = tf.backend();
     const maxTextureSize = (backend && backend.gpgpu && backend.gpgpu.gl)
@@ -185,8 +187,21 @@ export async function runFullVolumeInference(
 
     console.log(`[Memory Check] MAX_TEXTURE_SIZE from WebGL context: ${maxTextureSize}`);
 
-    // Check PACKED (intermediates) - if this fails, need full SeqConv
-    const packedDim = Math.ceil(Math.sqrt(Math.ceil(peak / 4)));
+    // Check PACKED (intermediates) - if this fails, need full SeqConv.
+    // Uses maxSingle, NOT peak: MAX_TEXTURE_SIZE is a per-texture limit and the
+    // input and output activations are separate tensors, so summing them
+    // overstates the required dimension by sqrt(2). With `peak` this tripped
+    // full SeqConv on Firefox (8192) for models that fit fine -- id 3 computed
+    // 9232 where the largest actual tensor needs 6528, and id 5 computed 11307
+    // where it needs 7996. Chrome's 16384 hid the error.
+    // `/ 4` only when the largest intermediate really does stay PACKED. In the
+    // GN models LayerNormInPlace transposes and reshapes it, which unpacks it to
+    // 1 element per texel -- so the divisor is 1 and the required dimension
+    // doubles. Getting this wrong does not warn, it throws mid-run
+    // ("Requested texture size [12481x12481]"), main.js waits a second for
+    // context cleanup and retries the whole model on the slow path.
+    const intermediateDivisor = hasUnpackedIntermediate ? 1 : 4;
+    const packedDim = Math.ceil(Math.sqrt(Math.ceil(maxSingle / intermediateDivisor)));
     // Check UNPACKED (final output) - if only this fails, use chunked argmax
     const unpackedDim = Math.ceil(Math.sqrt(maxOutput));
 

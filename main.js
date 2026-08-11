@@ -1,6 +1,7 @@
 import { Niivue } from "@niivue/niivue";
 import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
 import { runInferenceWebGpu } from "./inference-webgpu.js";
+import { runInferenceWebGl2, nativeWebgl2Available } from "./inference-webgl2.js";
 import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
@@ -16,6 +17,13 @@ let isWebGpuAvailable = false;
 // for debugging/benchmarking the fallback path. See the
 // `isWebGpuAvailable && !FORCE_WEBGL2_TESTING` guard in runSelectedInference().
 const FORCE_WEBGL2_TESTING = false;
+
+// Set true to skip the NATIVE WebGL2 runner (webgl2_runners/) and force the old
+// tfjs WebWorker path. This is the A/B control for the native runner: with
+// FORCE_WEBGL2_TESTING=true, flipping this false/true switches between the two
+// WebGL2 implementations on the same machine and the same model, which is the
+// only comparison that settles whether the port is worth it.
+const FORCE_TFJS_WEBGL_TESTING = false;
 // --------------------------------------------------------------------------
 
 /**
@@ -540,6 +548,20 @@ async function main() {
         return; // Success
       } catch (e) {
         console.error("WebGPU inference failed, falling back to WebWorker.", e);
+      }
+    }
+
+    // 1b. Try the NATIVE WebGL2 runner (webgl2_runners/): raw GLSL, 3D textures
+    // and MRT, bypassing tfjs entirely. Any refusal -- unsupported device, no
+    // descriptor, no safetensors, a GL error, an all-zero volume -- rejects and
+    // falls through to the tfjs worker below, which can still run every model.
+    if (!FORCE_TFJS_WEBGL_TESTING && nativeWebgl2Available() && modelEntry.webgpu_safetensor) {
+      console.log("Attempting native WebGL2 runner...");
+      try {
+        await runInferenceWebGl2(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+        return; // Success
+      } catch (e) {
+        console.warn("Native WebGL2 declined or failed, falling back to the tfjs worker.", e.message);
       }
     }
 
