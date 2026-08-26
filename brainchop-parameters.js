@@ -222,12 +222,13 @@ const inferenceModelsList = [
     // Subcortical + GWM (Heavy): the deep gridding-free MeshNet model32chan18cls
     // (32 channels, 13 conv + 1x1, affine GroupNorm + GELU, dilations -> 31 / RF=255),
     // same architecture family as the Aparc+Aseg 104 model. Higher capacity than the
-    // default model30chan18cls (id 3) but much heavier: full-volume, ~2 GiB f32 conv
-    // buffer, noticeably slower in-browser -- offered as an opt-in "Heavy" choice.
+    // default model30chan18cls (id 3), but offered as an opt-in "Heavy" choice.
+    // The optimized fp16 graph materializes 32-channel activations and reuses
+    // dead buffers, halving its largest binding from 2 GiB to 1 GiB.
     // Assets in public/models/model32chan18cls/:
-    //   WebGPU fp16 : model32chan18cls_runner.js     + model.safetensors     (present; re-export with --beam>=2 to speed up)
+    //   WebGPU fp16 : model32chan18cls_runner.js     + model.safetensors     (present; optimized low-memory graph)
     //   WebGPU fp32 : model32chan18cls_f32_runner.js + model_f32.safetensors  (pending)
-    //   WebGL2      : model.json (tfjs topology)      + model.bin             (pending)
+    //   WebGL2      : model.json (tfjs topology)      + model.bin             (present)
     id: 8,
     type: 'Atlas',
     path: '/models/model32chan18cls/model.json',
@@ -236,7 +237,7 @@ const inferenceModelsList = [
     webgpu_safetensor: './models/model32chan18cls/model.safetensors',
     webgpu_runner: 'model32chan18cls',
     forceFP32: false, // fp16 default; fp32 auto-used only if device lacks shader-f16 AND the _f32 runner exists.
-    webgpuStorageSize: 2147483648, // 32 * 256^3 * 4 = 2 GiB largest full-volume f32 conv buffer. Exceeds Firefox's ~1 GiB cap -> WebGL2 fallback there.
+    webgpuStorageSize: 1073741824, // 32 * 256^3 * 2 = 1 GiB largest full-volume fp16 activation buffer.
     numClasses: 18,
     preModelId: null, // gridding-free (RF=255): full head, no pre-model/crop on WebGPU.
     preModelPostProcess: false,
@@ -254,7 +255,7 @@ const inferenceModelsList = [
       "Heavy model: needs a dedicated graphics card and is slower than the default Subcortical + GWM. For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
     inferenceDelay: 100,
     description:
-      'Higher-capacity subcortical + gray/white matter parcellation (17 regions) using a deep 32-channel gridding-free MeshNet (affine GroupNorm + GELU). More robust but heavier and slower in-browser than the default Subcortical + GWM (id 3). WebGPU fp16; WebGL2 fallback and fp32 require the pending asset conversions.'
+      'Higher-capacity subcortical + gray/white matter parcellation (17 regions) using a deep 32-channel gridding-free MeshNet (affine GroupNorm + GELU). More robust but heavier than the default Subcortical + GWM (id 3). Uses an optimized low-memory WebGPU fp16 graph with a TensorFlow.js WebGL2 fallback.'
   },
   {
     id: 10,
