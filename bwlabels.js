@@ -207,17 +207,38 @@ export class BWLabeler {
    * 6-neighbourhood boundary. Used by the relabel-instead-of-zero option so a
    * dropped blob inherits its surrounding surviving label rather than becoming
    * background.
+   *
+   * A plain contact-majority vote is biased by SURFACE AREA, which is wrong for
+   * sheet-like structures. A dropped cortical fragment rests on white matter
+   * across its whole inner surface, meets neighbouring parcels only along a thin
+   * tangential rim, and faces background/CSF (uncounted) on the pial side - so
+   * white matter wins the vote and the fragment is repainted as WM, which is
+   * anatomically impossible for tissue on the pial side of the WM boundary.
+   * `familyOf` fixes this: the vote is first restricted to neighbours in the
+   * component's OWN class family (for the DK atlas: same-hemisphere cortex), and
+   * only falls back to the unrestricted vote when that family has no candidate -
+   * which is exactly the case (a true speck buried inside white matter) where
+   * the unrestricted answer is the right one.
+   *
    * @param {Uint32Array} ls   Component-label map (0 = background).
    * @param {number[]} dim     [nx, ny, nz].
    * @param {Uint32Array} kept Per-label surviving class id (>0) or 0 if suppressed.
    * @param {number} cl        Number of components.
+   * @param {Uint32Array} [bw] Original class volume; required for `familyOf`,
+   *   since it is the only place a SUPPRESSED component's own class survives.
+   * @param {(cls:number)=>number} [familyOf] Maps a class id to a family id, or 0
+   *   for "no restriction". Supplied by the caller so this file stays agnostic of
+   *   any model's label layout. Omit (null) for the original unrestricted vote.
    * @returns {Uint32Array}    winner[comp] = class to assign (0 = leave as bg).
    */
-  neighbor_winners(ls, dim, kept, cl) {
+  neighbor_winners(ls, dim, kept, cl, bw = null, familyOf = null) {
     const nx = dim[0]
     const ny = dim[1]
     const nz = dim[2]
     const sliceXY = nx * ny
+    // Per-suppressed-component family id (-1 = not yet seen, 0 = unrestricted).
+    const useFamily = !!(familyOf && bw)
+    const compFam = useFamily ? new Int32Array(cl + 1).fill(-1) : null
     // hist: compId -> Map(class -> contact count)
     const hist = new Map()
     const bump = (c, klass) => {
@@ -236,6 +257,9 @@ export class BWLabeler {
           if (c === 0 || kept[c]) {
             continue
           } // only suppressed (non-bg, not-kept) voxels
+          if (useFamily && compFam[c] < 0) {
+            compFam[c] = familyOf(bw[i])
+          }
           let k
           if (x > 0 && (k = kept[ls[i - 1]])) bump(c, k)
           if (x < nx - 1 && (k = kept[ls[i + 1]])) bump(c, k)
@@ -247,17 +271,44 @@ export class BWLabeler {
       }
     }
     const winner = new Uint32Array(cl + 1).fill(0)
+    let familyResolved = 0
     for (const [c, h] of hist) {
+      const fam = useFamily ? compFam[c] : 0
       let best = 0
       let bestN = 0
-      for (const [klass, n] of h) {
-        // most contacts wins; ties broken by lower class id for determinism
-        if (n > bestN || (n === bestN && (best === 0 || klass < best))) {
-          bestN = n
-          best = klass
+      // Pass 1: restrict to the component's own family, when it has one.
+      if (fam > 0) {
+        for (const [klass, n] of h) {
+          if (familyOf(klass) !== fam) {
+            continue
+          }
+          // most contacts wins; ties broken by lower class id for determinism
+          if (n > bestN || (n === bestN && (best === 0 || klass < best))) {
+            bestN = n
+            best = klass
+          }
+        }
+        if (best) {
+          familyResolved++
+        }
+      }
+      // Pass 2 (fallback): no family, or the family had no neighbour present.
+      // `best === 0` implies `bestN === 0`, so the tally starts clean.
+      if (!best) {
+        for (const [klass, n] of h) {
+          if (n > bestN || (n === bestN && (best === 0 || klass < best))) {
+            bestN = n
+            best = klass
+          }
         }
       }
       winner[c] = best
+    }
+    if (useFamily) {
+      console.log(
+        `[relabel] ${familyResolved}/${hist.size} suppressed components resolved within their own class family` +
+          ` (${hist.size - familyResolved} fell back to the unrestricted neighbour vote)`
+      )
     }
     return winner
   }
@@ -272,12 +323,15 @@ export class BWLabeler {
    *   most common kept neighbour class instead of becoming background. Components
    *   touching no kept voxel (e.g. specks floating in true exterior background)
    *   still become 0.
+   * @param {Uint32Array} [bw] Original class volume (needed with `familyOf`).
+   * @param {(cls:number)=>number} [familyOf] Class-family gate for the neighbour
+   *   vote - see neighbor_winners. Omit for the original unrestricted vote.
    * @returns {[number, Uint32Array]} [maxClass, volume].
    */
-  finalize_volume(ls, dim, kept, cl, relabelSuppressed) {
+  finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw = null, familyOf = null) {
     const nvox = ls.length
     const vxs = new Uint32Array(nvox).fill(0)
-    const winner = relabelSuppressed ? this.neighbor_winners(ls, dim, kept, cl) : null
+    const winner = relabelSuppressed ? this.neighbor_winners(ls, dim, kept, cl, bw, familyOf) : null
     let mxbw = 0
     for (let i = 0; i < nvox; i++) {
       const c = ls[i]
@@ -461,7 +515,7 @@ export class BWLabeler {
   // dim + relabelSuppressed are optional: when relabelSuppressed is true, blobs
   // that lose the per-class "largest" contest are repainted with their
   // surrounding surviving label instead of background (requires dim).
-  largest_original_cluster_labels(bw, cl, ls, dim = null, relabelSuppressed = false) {
+  largest_original_cluster_labels(bw, cl, ls, dim = null, relabelSuppressed = false, familyOf = null) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -490,14 +544,14 @@ export class BWLabeler {
     }
     // ls2bw now holds the surviving class per label (0 for suppressed). Reuse it
     // directly as the `kept` map for finalize_volume.
-    return this.finalize_volume(ls, dim, ls2bw, cl, relabelSuppressed)
+    return this.finalize_volume(ls, dim, ls2bw, cl, relabelSuppressed, bw, familyOf)
   }
 
   // Filter clusters based on target classes rules
   // targetClasses: 'all', or Set of class IDs.
   // If 'all' or class in targetClasses: keep only largest component of that class.
   // Else: keep all components of that class.
-  filter_clusters(bw, cl, ls, targetClasses, dim = null, relabelSuppressed = false) {
+  filter_clusters(bw, cl, ls, targetClasses, dim = null, relabelSuppressed = false, familyOf = null) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -556,7 +610,7 @@ export class BWLabeler {
     for (let i = 1; i <= cl; i++) {
       if (keepLabel[i]) kept[i] = ls2bw[i]
     }
-    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed)
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf)
   }
 
   /**
@@ -569,7 +623,7 @@ export class BWLabeler {
    * @param {Uint32Array} ls - Label map
    * @param {number} minRatio - Threshold (e.g. 0.3)
    */
-  filter_clusters_by_ratio(bw, cl, ls, minRatio, dim = null, relabelSuppressed = false) {
+  filter_clusters_by_ratio(bw, cl, ls, minRatio, dim = null, relabelSuppressed = false, familyOf = null) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -613,7 +667,7 @@ export class BWLabeler {
     for (let i = 1; i <= cl; i++) {
       if (keepLabel[i]) kept[i] = ls2bw[i]
     }
-    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed)
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf)
   }
 
   // given a 3D image, return a clustered label map
@@ -660,7 +714,7 @@ export class BWLabeler {
    * @param {Uint32Array} ls - Label map
    * @param {number} maxRank - Max number of components to keep per class (e.g. 2)
    */
-  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0, dim = null, relabelSuppressed = false, nearBrainMaxGap = null, diag = false) {
+  filter_clusters_by_rank(bw, cl, ls, maxRank, minRatio = 0, dim = null, relabelSuppressed = false, nearBrainMaxGap = null, diag = false, familyOf = null) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
@@ -815,6 +869,6 @@ export class BWLabeler {
     for (let i = 1; i <= cl; i++) {
       if (keepLabel[i]) kept[i] = ls2bw[i]
     }
-    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed)
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf)
   }
 }

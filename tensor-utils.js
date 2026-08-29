@@ -1045,12 +1045,38 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     // instead of becoming background. Costs one extra linear (6-neighbour) pass
     // over the volume; only applies to per-class filtering paths (not the binary
     // brain-mask path, where dropped voxels are genuinely outside the brain).
-    // Default ON for the 104-class DK-atlas models (ids 5/14), where punching
+    // Default ON for the 104-class DK-atlas models (ids 5/14/15), where punching
     // background holes into a dense parcellation is rarely what we want; the
     // global opts flag can additionally enable it for other per-class models.
-    const FILL_NEIGHBOR_DEFAULT_IDS = [5, 14];
+    const FILL_NEIGHBOR_DEFAULT_IDS = [5, 14, 15];
     const relabelSuppressed =
       !!opts.fillSuppressedWithNeighborLabel || FILL_NEIGHBOR_DEFAULT_IDS.includes(modelEntry.id);
+
+    // Class-family gate for that neighbour vote. The plain contact-majority vote
+    // is biased by surface area, which misfires on the cortical ribbon: a dropped
+    // cortical fragment rests on white matter across its entire inner surface,
+    // touches neighbouring parcels only along a thin tangential rim, and faces
+    // background/CSF (never counted) on the pial side. WM therefore wins almost
+    // every time and the fragment is repainted Cerebral-White-Matter - impossible
+    // for tissue sitting on the pial side of the WM boundary. Restricting the
+    // vote to same-hemisphere cortex sends the fragment to the adjacent gyral
+    // parcel instead, and a fragment with NO cortical neighbour (a genuine speck
+    // buried inside white matter) finds no candidate and falls back to the
+    // unrestricted vote - where WM is in fact the correct answer.
+    //
+    // DK-atlas 104-class label layout (public/models/model24chan104cls/colormap.json):
+    //   1..34  ctx-lh-*      35..68 ctx-rh-*      69..103 subcortical / WM / CSF
+    // Hemispheres are separate families so a medial-surface parcel cannot inherit
+    // a contralateral label across the interhemispheric fissure. 0 = unrestricted.
+    // Passed in from here (rather than hard-coded in bwlabels.js) so the labeler
+    // stays agnostic of any particular model's label layout.
+    // Kept separate from FILL_NEIGHBOR_DEFAULT_IDS (which currently holds the same
+    // ids) because that list is about WHETHER to relabel, this one about WHICH
+    // label layout the gate may assume - a future model added to the fill list
+    // must not silently inherit the DK map.
+    const DK104_ATLAS_IDS = [5, 14, 15];
+    const DK104_CORTICAL_FAMILY_OF = (cls) => (cls >= 1 && cls <= 34 ? 1 : cls >= 35 && cls <= 68 ? 2 : 0);
+    const voteFamilyOf = DK104_ATLAS_IDS.includes(modelEntry.id) ? DK104_CORTICAL_FAMILY_OF : null;
 
     // --- Noise guard -------------------------------------------------------
     // A garbage/noise segmentation fragments into a huge number of tiny
@@ -1085,8 +1111,8 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // Handled manually below.
       binarize = false;
       onlyLargest = false; // We handle filtering manually
-    } else if ([5, 14].includes(modelEntry.id)) {
-      // 104-class (5 = old, 14 = new deep DK-atlas): Use Strict Largest.
+    } else if ([5, 14, 15].includes(modelEntry.id)) {
+      // 104-class (5 = current, 14 = legacy deep DK-atlas, 15 = fused A/B candidate): Use Strict Largest.
       // binarize=false + onlyLargest=true keeps the largest connected component
       // PER CLASS (not a single binarized blob), which is what a multi-region
       // atlas parcellation needs.
@@ -1127,7 +1153,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // conn=6, binarize=false, onlyLargest=false) to avoid a redundant pass.
       const cl = guardComponentCount;
       const ls = guardLabels;
-      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO, Vshape, relabelSuppressed, NEAR_BRAIN_MAX_GAP, DIAG_RANK_FILTER);
+      const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO, Vshape, relabelSuppressed, NEAR_BRAIN_MAX_GAP, DIAG_RANK_FILTER, voteFamilyOf);
       segmentationData.set(filtered);
     } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
       // Mixed case (18-class) - Hierarchical approach:
@@ -1153,7 +1179,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       const targetClasses = new Set([1, 2, 5, 6, 13]);
 
       // Apply mixed filter to keep only largest component for target classes
-      const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses, Vshape, relabelSuppressed);
+      const [_mx, filtered] = BWInstance.filter_clusters(segmentationData, cl, ls, targetClasses, Vshape, relabelSuppressed, voteFamilyOf);
       segmentationData.set(filtered);
 
     } else if (!binarize && onlyLargest) {
@@ -1169,7 +1195,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       if (opts.diagnoseEnclosedComponents) {
         BWInstance.diagnose_components(segmentationData, guardComponentCount, guardLabels, Vshape, { label: `model${modelEntry.id}`, topN: 60 });
       }
-      const [_mx, res2] = BWInstance.largest_original_cluster_labels(segmentationData, guardComponentCount, guardLabels, Vshape, relabelSuppressed);
+      const [_mx, res2] = BWInstance.largest_original_cluster_labels(segmentationData, guardComponentCount, guardLabels, Vshape, relabelSuppressed, voteFamilyOf);
       segmentationData.set(res2);
     } else {
       // Standard cases (Legacy binarize-then-largest)
