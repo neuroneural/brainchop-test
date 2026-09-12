@@ -187,6 +187,41 @@ const inferenceModelsList = [
     path: null
   },
   {
+    // Experimental 24-channel version of the default 18-class model.
+    // The WebGPU runner uses the proven tuned 24-channel backbone kernels from
+    // dkatlas24 and this model's own 18-class classifier head. It measured
+    // about 12.3 seconds on an M1 browser test. The matching rescaled fp16
+    // weights are required by its fp16 GroupNorm kernels.
+    // The scheduled graph's largest storage buffer is 1.5 GiB.
+    id: 21,
+    type: 'Atlas',
+    path: '/models/model24chan18cls_gdice_prio/model.json',
+    modelName: '\u{1FA93} Subcortical + GWM (24ch, experimental)',
+    colormapPath: './models/model24chan18cls_gdice_prio/colormap.json',
+    webgpu_safetensor: './models/model24chan18cls_gdice_prio/model.safetensors',
+    webgpu_runner: 'model24chan18cls_gdice_prio',
+    forceFP32: false,
+    webgpuStorageSize: 1610612736,
+    numClasses: 18,
+    preModelId: null,
+    preModelPostProcess: false,
+    isBatchOverlapEnable: false,
+    numOverlapBatches: 0,
+    enableTranspose: true,
+    enableCrop: true, // WebGL2 fallback only; WebGPU runs the full volume.
+    cropPadding: 20,
+    autoThreshold: 0,
+    enableQuantileNorm: true,
+    filterOutWithPreMask: false,
+    enableSeqConv: true,
+    textureSize: 0,
+    warning:
+      "Experimental candidate. WebGPU requires a device with 1.5 GiB storage-buffer support and may need a dedicated graphics card. For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
+    inferenceDelay: 100,
+    description:
+      'Experimental parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. A deep 24-channel gridding-free MeshNet (affine GroupNorm + GELU), retrained with a priority-weighted generalized-Dice loss (validation macro-dice ~0.865; independent MRN macro-dice ~0.861).'
+  },
+  {
     id: 7,
     type: 'Segmentation',
     path: '/models/model_sae16ch3_tfjs/model.json',
