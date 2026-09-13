@@ -222,65 +222,7 @@ const inferenceModelsList = [
       'Experimental parcellation of the brain into 17 regions: gray and white matter plus subcortical areas. A deep 24-channel gridding-free MeshNet (affine GroupNorm + GELU), retrained with a priority-weighted generalized-Dice loss (validation macro-dice ~0.865; independent MRN macro-dice ~0.861).'
   },
   {
-    // Continuous tissue-probability view of model 21. The runner retains all 18
-    // logits, applies softmax(logit / temperature), and sums probabilities by
-    // tissue group. Only the selected group is read back to keep output memory
-    // at one 256^3 float volume. Change probabilityDisplay to whiteMatter or csf
-    // to inspect those maps without recompiling the runner.
-    //
-    // Brain-Stem (13) is deliberately not forced into GM or WM because this
-    // coarse anatomical label contains both tissues. Unknown/background (0) is
-    // also excluded, but both still remain in the softmax denominator.
-    id: 22,
-    type: 'Probability_Map',
-    path: '/models/model24chan18cls_gdice_prio/model.json',
-    modelName: '\u{1F9E0} Gray-matter probability (24ch, experimental)',
-    webgpu_safetensor: './models/model24chan18cls_gdice_prio/model.safetensors',
-    webgpu_runner: 'model24chan18cls_gdice_prio_probability',
-    forceFP32: false,
-    webgpuOnly: true,
-    webgpuStorageSize: 1610612736,
-    outputType: 'probability',
-    // Display controls: these are read at run time, so changing them does not
-    // require regenerating the WebGPU runner. Temperature > 1 softens the
-    // tissue softmax. The independent, sharper background softmax supplies a
-    // soft brain support and prevents high temperatures from filling the cube.
-    softmaxTemperature: 4.0,
-    brainSupportTemperature: 1.0,
-    brainSupportPower: 1.0,
-    // Separable Gaussian sigma in output voxels. 0 disables smoothing. 0.45
-    // follows the small radius-1 anti-aliasing kernel used by mrn_babyseg's
-    // SIAM-style label synthesis; the runner accepts values through 2.0.
-    partialVolumeSigma: 0.55,
-    probabilityDisplay: 'grayMatter',
-    probabilityColormap: 'gray',
-    // Display-only threshold. Values remain in the Float32 result/NIfTI, but
-    // Niivue treats them as transparent so tiny nonzero tails do not create an
-    // opaque cube in its 3D overlay ray marcher.
-    probabilityDisplayMin: 0.05,
-    probabilityGroups: {
-      grayMatter: [2, 6, 7, 8, 9, 10, 14, 15, 16, 17],
-      whiteMatter: [1, 5],
-      csf: [3, 4, 11, 12],
-    },
-    preModelId: null,
-    preModelPostProcess: false,
-    isBatchOverlapEnable: false,
-    numOverlapBatches: 0,
-    enableTranspose: true,
-    enableCrop: true,
-    enableQuantileNorm: true,
-    enableFovRecenter: false,
-    enableFovInflate: false,
-    warning:
-      "Experimental continuous gray-matter probability map (not a CAT12 result). WebGPU with shader-f16 and 1.5 GiB storage-buffer support is required.",
-    inferenceDelay: 100,
-    description:
-      'Temperature-scaled softmax tissue probability derived from the 18-class 24-channel MeshNet. The displayed value is the summed probability of cerebral/cerebellar cortical and subcortical gray-matter classes, preserving uncertainty and partial-volume-like boundaries instead of applying argmax.'
-  },
-  {
-    // Separate CAT-inspired experiment. Unlike the display-only probability
-    // entry above, the runner returns grouped GM, WM and CSF priors together.
+    // CAT-inspired experiment. The runner returns grouped GM, WM and CSF priors.
     // cat-lite.js then fits the subject's normalized T1 with pure and mixed
     // tissue classes. This is neural-assisted and is NOT a CAT12 result.
     id: 23,
