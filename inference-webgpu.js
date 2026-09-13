@@ -11,6 +11,7 @@ import {
     markFailure,
     ExecutionModes
 } from './diagnostic-stats.js';
+import { applyCatLitePartialVolume } from './cat-lite.js';
 
 // Use relative paths and eager loading for better error detection
 const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js', { eager: true });
@@ -259,6 +260,8 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
     let collectedBuffers = []; // Track WebGPU buffers for cleanup
     let originalCreateBuffer = null; // To restore the original method
     let oomScopeOpen = false; // True while an 'out-of-memory' error scope is pushed
+    const isCatLite = modelEntry.outputType === 'probability'
+        && modelEntry.probabilityPostprocess === 'cat-lite';
 
     try {
         // Validate inputs
@@ -306,6 +309,11 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             : await minMaxNormalizeVolumeData(tensor);
         tensor.dispose();
         tensor = normalized_tensor;
+
+        // CAT-lite combines three model tissue priors with the subject's T1.
+        // Capture this before the model-specific transpose; the three outputs
+        // are transposed back to this native order below.
+        const catLiteIntensityData = isCatLite ? await tensor.data() : null;
 
         if (modelEntry.inputPermutation) {
             console.log(`[WebGPU] Permuting Input: ${modelEntry.inputPermutation}`);
@@ -387,49 +395,86 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         callbackUI(`WebGPU inference took ${Inference_t}s.`, 0.9);
 
         // --- POST-PROCESSING ---
-        console.log('Inference result shape:', inferenceResultArray[0]?.length);
+        console.log('Inference result shapes:', inferenceResultArray.map((result) => result?.length));
 
         const isProbabilityOutput = modelEntry.outputType === 'probability';
-        outLabelVolume = tf.tidy(() => {
-            let volume = tf.tensor(
-                inferenceResultArray[0],
-                finalShape,
-                isProbabilityOutput ? 'float32' : 'int32'
-            );
-
+        const makeNativeVolume = (result, probability, description) => tf.tidy(() => {
+            let volume = tf.tensor(result, finalShape, probability ? 'float32' : 'int32');
             if (modelEntry.outputPermutation) {
-                console.log(`[WebGPU] Permuting Output: ${modelEntry.outputPermutation}`);
+                console.log(`[WebGPU] Permuting ${description}: ${modelEntry.outputPermutation}`);
                 volume = volume.transpose(modelEntry.outputPermutation);
             } else if (modelEntry.enableTranspose) {
                 volume = volume.transpose();
             }
-
-            // Validation check. Probability outputs must remain finite and in
-            // [0,1]; categorical outputs retain the original non-empty check.
             const sum = tf.sum(volume).dataSync()[0];
-            console.log(isProbabilityOutput ? 'Probability volume sum:' : 'Segmentation volume sum:', sum);
-
+            console.log(`${description} sum:`, sum);
             if (!Number.isFinite(sum) || sum === 0) {
-                throw new Error(isProbabilityOutput
-                    ? 'Probability map is empty or non-finite.'
-                    : 'Segmentation resulted in all zeros (empty volume).');
+                throw new Error(`${description} is empty or non-finite.`);
             }
-            if (isProbabilityOutput) {
+            if (probability) {
                 const min = tf.min(volume).dataSync()[0];
                 const max = tf.max(volume).dataSync()[0];
-                console.log(`Probability range: ${min} .. ${max}`);
+                console.log(`${description} range: ${min} .. ${max}`);
                 if (!Number.isFinite(min) || !Number.isFinite(max) || min < -1e-6 || max > 1 + 1e-6) {
-                    throw new Error(`Probability map is outside [0,1]: ${min} .. ${max}`);
+                    throw new Error(`${description} is outside [0,1]: ${min} .. ${max}`);
                 }
             }
-
             return volume;
         });
 
         const postProcessStartTime = performance.now();
-        const finalImage = isProbabilityOutput
-            ? await outLabelVolume.data()
-            : await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+        let finalImage;
+        let catLiteStats = null;
+        if (isCatLite) {
+            if (inferenceResultArray.length !== 3 || !catLiteIntensityData) {
+                throw new Error(`CAT-lite expected three tissue maps; received ${inferenceResultArray.length}.`);
+            }
+            callbackUI('CAT-lite: fitting GM/WM/CSF and partial-volume classes...', 0.92);
+            const tissueNames = ['GM prior', 'WM prior', 'CSF prior'];
+            const nativeTissues = [];
+            for (let tissue = 0; tissue < 3; tissue++) {
+                const tissueVolume = makeNativeVolume(inferenceResultArray[tissue], true, tissueNames[tissue]);
+                nativeTissues.push(await tissueVolume.data());
+                tissueVolume.dispose();
+            }
+            const catLite = applyCatLitePartialVolume(
+                nativeTissues,
+                catLiteIntensityData,
+                [256, 256, 256],
+                modelEntry
+            );
+            finalImage = catLite.probabilities;
+            catLiteStats = catLite.stats;
+            if (!catLiteStats.applied) {
+                console.warn(`[CAT-lite] skipped: ${catLiteStats.reason}`);
+            } else {
+                const means = catLiteStats.tissueMeans;
+                const sigmas = catLiteStats.tissueSigmas;
+                console.log(
+                    `[CAT-lite] means CSF=${means.csf.toFixed(4)}, GM=${means.gray.toFixed(4)}, WM=${means.white.toFixed(4)}; ` +
+                    `sigmas=${sigmas.csf.toFixed(4)}/${sigmas.gray.toFixed(4)}/${sigmas.white.toFixed(4)}; ` +
+                    `GM range=${catLiteStats.outputMin.toFixed(4)}..${catLiteStats.outputMax.toFixed(4)}; ` +
+                    `${(100 * catLiteStats.partialVolumeFraction).toFixed(1)}% of supported voxels are fractional; ` +
+                    `${(100 * catLiteStats.midrangeVisibleFraction).toFixed(1)}% of visible GM is midrange (0.2..0.8)`
+                );
+                const cleanup = catLiteStats.supportCleanup;
+                if (cleanup?.applied) {
+                    console.log(
+                        `[CAT-lite] support cleanup: ${cleanup.componentCount} components at ` +
+                        `${cleanup.threshold.toFixed(3)}; removed ${cleanup.removedVoxels} detached voxels`
+                    );
+                }
+            }
+        } else {
+            outLabelVolume = makeNativeVolume(
+                inferenceResultArray[0],
+                isProbabilityOutput,
+                isProbabilityOutput ? 'Probability volume' : 'Segmentation volume'
+            );
+            finalImage = isProbabilityOutput
+                ? await outLabelVolume.data()
+                : await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+        }
         const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
 
         await callbackImg(finalImage, opts, modelEntry);
@@ -438,6 +483,13 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             statData.Output_Type = 'Continuous tissue probability';
             statData.Tissue = modelEntry.probabilityDisplay || 'grayMatter';
             statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;
+            if (catLiteStats) {
+                statData.Partial_Volume = catLiteStats.applied ? 'CAT-lite mixed-class PVE' : `Skipped: ${catLiteStats.reason}`;
+                if (catLiteStats.applied) {
+                    statData.CAT_Lite_Tissue_Means = catLiteStats.tissueMeans;
+                    statData.CAT_Lite_Tissue_Sigmas = catLiteStats.tissueSigmas;
+                }
+            }
         } else {
             // Add label statistics from categorical output.
             const uniqueLabels = new Set(finalImage);

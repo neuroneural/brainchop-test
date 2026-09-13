@@ -233,6 +233,10 @@ async function main() {
   let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
   const HUD_TEXT_SCALE = 0.9;  // relative to niivue fontPx
   let nativeInputNV = null;    // volume as loaded (native grid), before conform
+  // CAT-lite temporarily dims the T1 so a neutral-gray probability map remains
+  // readable. Preserve the user's slider value and restore it when leaving the
+  // probability view; never force ordinary segmentations to 100%.
+  let probabilityUnderlayRestoreValue = null;
   let nativeInputName = "input.nii.gz";
 
   // --- Drag mode: segmented control (data-drag maps to nv.opts.dragMode) ---
@@ -403,6 +407,23 @@ async function main() {
   opacitySlider1.oninput = function () {
     nv1.setOpacity(1, opacitySlider1.value / 255);
   };
+
+  function applyModelUnderlayOpacity(modelEntry = null) {
+    const configured = Number(modelEntry?.probabilityUnderlayOpacity);
+    const useTemporaryOpacity = modelEntry?.outputType === 'probability'
+      && Number.isFinite(configured);
+    if (useTemporaryOpacity) {
+      if (probabilityUnderlayRestoreValue === null) {
+        probabilityUnderlayRestoreValue = opacitySlider0.value;
+      }
+      opacitySlider0.value = Math.round(Math.min(1, Math.max(0, configured)) * 255);
+      opacitySlider0.oninput();
+    } else if (probabilityUnderlayRestoreValue !== null) {
+      opacitySlider0.value = probabilityUnderlayRestoreValue;
+      probabilityUnderlayRestoreValue = null;
+      opacitySlider0.oninput();
+    }
+  }
 
   async function ensureConformed() {
     const nii = nv1.volumes[0];
@@ -1201,6 +1222,10 @@ async function main() {
     // segmentation back to native space on export.
     nativeInputNV = nv1.volumes[0] || null;
     nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
+    // addVolume() can also notify Niivue's image-loaded hook. Only treat a
+    // single-volume scene as a newly loaded underlay; an inference overlay must
+    // not immediately restore the opacity we just set for CAT-lite.
+    if (nv1.volumes.length <= 1) applyModelUnderlayOpacity();
     opacitySlider0.oninput();
     modelSelect.value = "-1";
   }
@@ -1273,6 +1298,23 @@ async function main() {
     lastSegColors = null;
     if (isProbabilityMap) {
       let colormap = (modelEntry.probabilityColormap || 'gray').toLowerCase();
+      if (modelEntry.probabilityDisplayEncoding === 'light-gray-overlay') {
+        const configuredAlpha = Number(modelEntry.probabilityOverlayAlpha ?? 96);
+        const alpha = Number.isFinite(configuredAlpha)
+          ? Math.round(Math.min(192, Math.max(16, configuredAlpha)))
+          : 96;
+        const configuredFloor = Number(modelEntry.probabilityOverlayFloor ?? 192);
+        const floor = Number.isFinite(configuredFloor)
+          ? Math.round(Math.min(240, Math.max(128, configuredFloor)))
+          : 192;
+        colormap = `probability-light-gray-${floor}-${alpha}`;
+        if (!nv1.colormaps().includes(colormap)) {
+          nv1.addColormap(colormap, {
+            R: [floor, 255], G: [floor, 255], B: [floor, 255],
+            A: [0, alpha], I: [0, 255],
+          });
+        }
+      }
       if (!nv1.colormaps().includes(colormap)) colormap = 'actc';
       overlayVolume.colormap = colormap;
       // Niivue normally rounds any nonzero overlay alpha up to opaque. Use the
@@ -1313,6 +1355,9 @@ async function main() {
     }
     overlayVolume.opacity = opacitySlider1.value / 255;
     await nv1.addVolume(overlayVolume);
+    // Apply after addVolume: Niivue may fire its image-loaded callback while an
+    // overlay is added, and that callback handles real underlay replacements.
+    applyModelUnderlayOpacity(modelEntry);
 
     // One-line discoverability hint (only for multi-label overlays where
     // isolation applies). It sits in the location bar until the next mouse move.

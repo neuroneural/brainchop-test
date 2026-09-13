@@ -279,6 +279,80 @@ const inferenceModelsList = [
       'Temperature-scaled softmax tissue probability derived from the 18-class 24-channel MeshNet. The displayed value is the summed probability of cerebral/cerebellar cortical and subcortical gray-matter classes, preserving uncertainty and partial-volume-like boundaries instead of applying argmax.'
   },
   {
+    // Separate CAT-inspired experiment. Unlike the display-only probability
+    // entry above, the runner returns grouped GM, WM and CSF priors together.
+    // cat-lite.js then fits the subject's normalized T1 with pure and mixed
+    // tissue classes. This is neural-assisted and is NOT a CAT12 result.
+    id: 23,
+    type: 'Probability_Map',
+    path: '/models/model24chan18cls_gdice_prio/model.json',
+    modelName: '\u{1F9E0} Gray-matter CAT-lite PVE (24ch, experimental)',
+    webgpu_safetensor: './models/model24chan18cls_gdice_prio/model.safetensors',
+    webgpu_runner: 'model24chan18cls_gdice_prio_probability',
+    forceFP32: false,
+    webgpuOnly: true,
+    webgpuStorageSize: 1610612736,
+    outputType: 'probability',
+    probabilityPostprocess: 'cat-lite',
+    // This temperature controls the three anatomical priors, not the final
+    // partial-volume contrast. A moderate value supplies soft interfaces while
+    // the intensity model, rather than temperature alone, creates fractions.
+    softmaxTemperature: 2.0,
+    brainSupportTemperature: 1.0,
+    brainSupportPower: 1.0,
+    // Approximate the acquisition/resampling point-spread function on each of
+    // the three priors before the joint mixed-class fit (not on the final map).
+    partialVolumeSigma: 0.65,
+    probabilityDisplay: 'grayMatter',
+    probabilityColormap: 'gray',
+    // A light-gray overlay ramp avoids the dark false edge made by compositing
+    // ordinary black-to-white gray probabilities over naturally bright WM,
+    // while retaining probability-dependent contrast for the 3D view.
+    probabilityDisplayEncoding: 'light-gray-overlay',
+    // The wider ramp restores depth cues in volume rendering; reduced alpha
+    // keeps mid-probability gray from drawing a dark band over bright T1 WM.
+    probabilityOverlayFloor: 128,
+    probabilityOverlayAlpha: 48,
+    probabilityDisplayMin: 0.03,
+    // CAT-lite is much easier to inspect without a bright anatomical volume
+    // competing with it. main.js applies this temporarily and restores the
+    // user's previous underlay opacity on the next non-probability result.
+    probabilityUnderlayOpacity: 0.05,
+    probabilityGroups: {
+      grayMatter: [2, 6, 7, 8, 9, 10, 14, 15, 16, 17],
+      whiteMatter: [1, 5],
+      csf: [3, 4, 11, 12],
+    },
+    // CAT-lite refinement controls. These intentionally remain here so they
+    // can be tuned without recompiling the WebGPU runner.
+    catLitePurePriorPower: 3.0,
+    catLitePriorStrength: 0.8,
+    catLiteIntensityStrength: 0.75,
+    catLiteMixelPrior: 0.35,
+    catLiteCsfWmMixelPrior: 6.0,
+    catLiteSpatialWeight: 0.25,
+    catLiteMinSupport: 0.03,
+    catLiteKeepLargestComponent: true,
+    catLiteComponentThreshold: 0.03,
+    catLiteSigmaFloor: 0.025,
+    catLiteBiasBlockSize: 16,
+    catLiteBiasSmoothPasses: 3,
+    preModelId: null,
+    preModelPostProcess: false,
+    isBatchOverlapEnable: false,
+    numOverlapBatches: 0,
+    enableTranspose: true,
+    enableCrop: true,
+    enableQuantileNorm: true,
+    enableFovRecenter: false,
+    enableFovInflate: false,
+    warning:
+      "Experimental neural-assisted mixed-class partial-volume estimate, not CAT12. WebGPU with shader-f16 and 1.5 GiB storage-buffer support is required.",
+    inferenceDelay: 100,
+    description:
+      'CAT-inspired gray-matter partial-volume estimate. The 24-channel model supplies joint GM/WM/CSF priors; normalized T1 intensity, a coarse local bias estimate, spatial regularization, and explicit GM-CSF/GM-WM mixture classes produce the displayed continuous GM fraction. Experimental and not a CAT12 result.'
+  },
+  {
     id: 7,
     type: 'Segmentation',
     path: '/models/model_sae16ch3_tfjs/model.json',
