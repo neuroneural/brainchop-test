@@ -239,7 +239,9 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         // fp16 runner: if the file holds fp32 master weights, cast to fp16 now
         // (no-op when the file is already fp16). The fp32 runner keeps fp32 as-is.
         if (!useF32) weights = castSafetensorsToF16(weights, callbackUI);
-        return await setupNet(device, weights, callbackUI);
+        // Generated runners ignore the fourth argument. Probability-map runners
+        // use it for softmax temperature, tissue grouping, and display choice.
+        return await setupNet(device, weights, callbackUI, modelEntry);
     } catch (error) {
         throw new Error(
             `Failed to setup network for '${runnerName}': ${error.message}`
@@ -387,8 +389,13 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         // --- POST-PROCESSING ---
         console.log('Inference result shape:', inferenceResultArray[0]?.length);
 
+        const isProbabilityOutput = modelEntry.outputType === 'probability';
         outLabelVolume = tf.tidy(() => {
-            let volume = tf.tensor(inferenceResultArray[0], finalShape, 'int32');
+            let volume = tf.tensor(
+                inferenceResultArray[0],
+                finalShape,
+                isProbabilityOutput ? 'float32' : 'int32'
+            );
 
             if (modelEntry.outputPermutation) {
                 console.log(`[WebGPU] Permuting Output: ${modelEntry.outputPermutation}`);
@@ -397,32 +404,58 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
                 volume = volume.transpose();
             }
 
-            // Validation check
+            // Validation check. Probability outputs must remain finite and in
+            // [0,1]; categorical outputs retain the original non-empty check.
             const sum = tf.sum(volume).dataSync()[0];
-            console.log('Segmentation volume sum:', sum);
+            console.log(isProbabilityOutput ? 'Probability volume sum:' : 'Segmentation volume sum:', sum);
 
-            if (sum === 0) {
-                throw new Error("Segmentation resulted in all zeros (empty volume).");
+            if (!Number.isFinite(sum) || sum === 0) {
+                throw new Error(isProbabilityOutput
+                    ? 'Probability map is empty or non-finite.'
+                    : 'Segmentation resulted in all zeros (empty volume).');
+            }
+            if (isProbabilityOutput) {
+                const min = tf.min(volume).dataSync()[0];
+                const max = tf.max(volume).dataSync()[0];
+                console.log(`Probability range: ${min} .. ${max}`);
+                if (!Number.isFinite(min) || !Number.isFinite(max) || min < -1e-6 || max > 1 + 1e-6) {
+                    throw new Error(`Probability map is outside [0,1]: ${min} .. ${max}`);
+                }
             }
 
             return volume;
         });
 
         const postProcessStartTime = performance.now();
-        const finalImage = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+        const finalImage = isProbabilityOutput
+            ? await outLabelVolume.data()
+            : await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
         const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
 
-        callbackImg(finalImage, opts, modelEntry);
+        await callbackImg(finalImage, opts, modelEntry);
 
-        // Add label statistics from output
-        const uniqueLabels = new Set(finalImage);
-        const actualLabels = uniqueLabels.size;
-        const expectedLabels = modelEntry.numClasses || actualLabels;
-        addLabelStats(statData, expectedLabels, actualLabels);
+        if (isProbabilityOutput) {
+            statData.Output_Type = 'Continuous tissue probability';
+            statData.Tissue = modelEntry.probabilityDisplay || 'grayMatter';
+            statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;
+        } else {
+            // Add label statistics from categorical output.
+            const uniqueLabels = new Set(finalImage);
+            const actualLabels = uniqueLabels.size;
+            const expectedLabels = modelEntry.numClasses || actualLabels;
+            addLabelStats(statData, expectedLabels, actualLabels);
+        }
 
         markSuccess(statData, Inference_t, Postprocess_t);
 
-        callbackUI(modelEntry.modelName + '<br>Segmentation finished.', 1, '', statData);
+        callbackUI(
+            modelEntry.modelName + (isProbabilityOutput
+                ? '<br>Probability map finished.'
+                : '<br>Segmentation finished.'),
+            1,
+            '',
+            statData
+        );
 
     } catch (error) {
         console.error("WebGPU Inference Error:", error);

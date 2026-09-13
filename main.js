@@ -596,6 +596,14 @@ async function main() {
       }
     }
 
+    // Continuous tissue probabilities require the dedicated WebGPU runner.
+    // Falling back to the categorical WebGL/TFJS paths would silently turn an
+    // argmax label map into meaningless "probabilities".
+    if (modelEntry.webgpuOnly) {
+      showBackendFailure(new Error(`${modelEntry.modelName} currently requires WebGPU.`));
+      return;
+    }
+
     // 1b. Try the NATIVE WebGL2 runner (webgl2_runners/): raw GLSL, 3D textures
     // and MRT, bypassing tfjs entirely. Any refusal -- unsupported device, no
     // descriptor, no safetensors, a GL error, an all-zero volume -- rejects and
@@ -1223,16 +1231,57 @@ async function main() {
   }
 
   async function callbackImg(img, opts, modelEntry) {
+    const isProbabilityMap = modelEntry.outputType === 'probability';
     await closeAllOverlays();
     resetLabelIsolation();
     const overlayVolume = await nv1.volumes[0].clone();
     overlayVolume.zeroImage();
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
-    overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
+    if (isProbabilityMap) {
+      overlayVolume.img = img instanceof Float32Array ? img : Float32Array.from(img);
+      Object.assign(overlayVolume.hdr, {
+        datatypeCode: 16,       // DT_FLOAT32: preserve partial-volume probabilities
+        numBitsPerVoxel: 32,
+        cal_min: 0,
+        cal_max: 1,
+        intent_code: 1001,      // NIFTI_INTENT_ESTIMATE, not a categorical LABEL
+      });
+      // clone() calibrated the original image before we replaced its pixels.
+      // Refresh NVImage's object-level range as well as the NIfTI header: 2D
+      // slices happened to use the new pixels, while volume rendering retained
+      // the cloned range until save/reload constructed a fresh NVImage.
+      overlayVolume.trustCalMinMax = true;
+      overlayVolume.calMinMax();
+      const configuredDisplayMin = Number(modelEntry.probabilityDisplayMin ?? 0.005);
+      const probabilityDisplayMin = Number.isFinite(configuredDisplayMin)
+        ? Math.min(1, Math.max(0, configuredDisplayMin))
+        : 0.005;
+      Object.assign(overlayVolume, {
+        cal_min: probabilityDisplayMin,
+        cal_max: 1,
+        robust_min: probabilityDisplayMin,
+        robust_max: 1,
+        // ZERO_TO_MAX_TRANSPARENT_BELOW_MIN. This is essential for 3D: the
+        // overlay shader otherwise rounds every tiny positive alpha to opaque.
+        colormapType: 1,
+      });
+    } else {
+      overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
+    }
 
     lastSegLabelNames = null;
     lastSegColors = null;
-    if (modelEntry.type === 'Brain_Masking') {
+    if (isProbabilityMap) {
+      let colormap = (modelEntry.probabilityColormap || 'gray').toLowerCase();
+      if (!nv1.colormaps().includes(colormap)) colormap = 'actc';
+      overlayVolume.colormap = colormap;
+      // Niivue normally rounds any nonzero overlay alpha up to opaque. Use the
+      // probability volume itself as an alpha modulator so zero is genuinely
+      // transparent and intermediate probabilities reveal the T1 underneath.
+      // closeAllOverlays() leaves the T1 at index 0, so this new volume is 1.
+      overlayVolume.modulationImage = 1;
+      overlayVolume.modulateAlpha = 1;
+    } else if (modelEntry.type === 'Brain_Masking') {
       const newLabels = ["Background", "Brain Mask"];
       lastSegLabelNames = newLabels.slice();
       const newR = [0, 217];
