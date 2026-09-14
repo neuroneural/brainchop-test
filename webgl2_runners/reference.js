@@ -160,6 +160,49 @@ export function compareLabels(a, b) {
   return { diff, total: a.length, pct: (100 * diff) / a.length, examples };
 }
 
+/** CPU oracle for the grouped-softmax classifier used by CAT-lite. */
+export function referenceTissueProbabilities(d, desc, channels, config) {
+  const nvox = d.nx * d.ny * d.nz;
+  const classifier = desc.classifier;
+  if (!classifier || channels.length !== classifier.inC) {
+    throw new Error('reference grouped probabilities need final activations and a classifier');
+  }
+  const tissues = [new Float32Array(nvox), new Float32Array(nvox), new Float32Array(nvox)];
+  const support = new Float32Array(nvox);
+  const masks = [config.grayMask >>> 0, config.whiteMask >>> 0, config.csfMask >>> 0];
+  const logits = new Float64Array(classifier.outC);
+  for (let voxel = 0; voxel < nvox; voxel++) {
+    let maximum = -Infinity;
+    for (let k = 0; k < classifier.outC; k++) {
+      let value = classifier.bias ? classifier.bias[k] : 0;
+      for (let channel = 0; channel < classifier.inC; channel++) {
+        value += channels[channel][voxel] * classifier.w[k * classifier.inC + channel];
+      }
+      logits[k] = value;
+      maximum = Math.max(maximum, value);
+    }
+    let denominator = 0;
+    let supportDenominator = 0;
+    let backgroundWeight = 0;
+    const numerators = [0, 0, 0];
+    for (let k = 0; k < classifier.outC; k++) {
+      const value = Math.exp((logits[k] - maximum) / config.temperature);
+      const supportValue = Math.exp((logits[k] - maximum) / config.supportTemperature);
+      denominator += value;
+      supportDenominator += supportValue;
+      if (k === 0) backgroundWeight = supportValue;
+      for (let tissue = 0; tissue < 3; tissue++) {
+        if ((masks[tissue] & ((1 << k) >>> 0)) !== 0) numerators[tissue] += value;
+      }
+    }
+    for (let tissue = 0; tissue < 3; tissue++) {
+      tissues[tissue][voxel] = numerators[tissue] / denominator;
+    }
+    support[voxel] = 1 - backgroundWeight / supportDenominator;
+  }
+  return { tissues, support };
+}
+
 /**
  * A synthetic model, for testing the plumbing without needing real weights.
  *

@@ -314,7 +314,10 @@ function checkGl(gl, where) {
  * @param {function}     [o.onProgress] (fraction, message)
  * @param {boolean}      [o.vox2]      enable 2-voxel blocking if the device allows
  * @param {WebGL2RenderingContext} [o.gl] reuse a context instead of making one
- * @returns {{labels: Uint8Array, ms: number, path: string}}
+ * @param {object}       [o.probability] grouped-softmax uniforms; when present,
+ *                       returns three Float32 tissue priors and brain support
+ *                       instead of categorical labels
+ * @returns {{labels?: Uint8Array, tissues?: Float32Array[], support?: Float32Array, ms: number, path: string}}
  */
 export function runMeshNetGL(o) {
   const d = o.descriptor;
@@ -411,6 +414,12 @@ export function runMeshNetGL(o) {
     const labRows = Math.ceil(labTexels / LAB_W);
     const labels = T(tex2d(gl, LAB_W, labRows, gl.RGBA8));
     const fboLab = F(make2dFbo(gl, [labels]));
+    let probabilitySlice = null;
+    let fboProbability = null;
+    if (o.probability) {
+      probabilitySlice = T(tex2d(gl, nx, ny, gl.RGBA32F));
+      fboProbability = F(make2dFbo(gl, [probabilitySlice]));
+    }
     checkGl(gl, 'aux textures');
 
     // ---- framebuffers ---------------------------------------------------
@@ -444,6 +453,10 @@ export function runMeshNetGL(o) {
       mk('norm', 'norm', 'norm');
     }
     if (d.nclass > 0) mk('classify', 'classify', 'classify');
+    if (o.probability) {
+      if (!S.tissueProbability) throw new Error(`grouped probabilities are unavailable for ${d.nclass} classes`);
+      mk('tissueProbability', 'tissueProbability', 'tissue_probability');
+    }
     checkGl(gl, 'program link');
 
     const U = (p, n) => gl.getUniformLocation(p, n);
@@ -478,6 +491,17 @@ export function runMeshNetGL(o) {
       gl.useProgram(progs.classify);
       planeNames.forEach((n, i) => gl.uniform1i(U(progs.classify, n), i));
       gl.uniform1i(U(progs.classify, 'wts'), P);
+    }
+    if (progs.tissueProbability) {
+      const p = progs.tissueProbability;
+      gl.useProgram(p);
+      planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
+      gl.uniform1i(U(p, 'wts'), P);
+      gl.uniform1f(U(p, 'uTemperature'), o.probability.temperature);
+      gl.uniform1f(U(p, 'uSupportTemperature'), o.probability.supportTemperature);
+      gl.uniform1ui(U(p, 'uGrayMask'), o.probability.grayMask >>> 0);
+      gl.uniform1ui(U(p, 'uWhiteMask'), o.probability.whiteMask >>> 0);
+      gl.uniform1ui(U(p, 'uCsfMask'), o.probability.csfMask >>> 0);
     }
     checkGl(gl, 'uniform setup');
 
@@ -630,9 +654,40 @@ export function runMeshNetGL(o) {
       report(li);
     }
 
-    // ---- classifier + argmax, on the GPU --------------------------------
+    // ---- classifier readback ---------------------------------------------
     let out;
-    if (d.nclass > 0) {
+    let tissues = null;
+    let support = null;
+    if (o.probability) {
+      const p = progs.tissueProbability;
+      gl.useProgram(p);
+      for (let g = 0; g < P; g++) bind3d(g, cur[g]);
+      bind2d(P, wts);
+      gl.uniform1i(U(p, 'uWCls'), o.offsets.clsFloat);
+      gl.uniform1i(U(p, 'uWBias'), Math.max(o.offsets.clsBiasFloat, 0));
+      gl.uniform1i(U(p, 'uHasBias'), o.offsets.clsBiasFloat >= 0 ? 1 : 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbability);
+      gl.viewport(0, 0, nx, ny);
+      const uZ = U(p, 'uZ');
+      const slice = new Float32Array(nx * ny * 4);
+      tissues = [new Float32Array(nvox), new Float32Array(nvox), new Float32Array(nvox)];
+      support = new Float32Array(nvox);
+      for (let z = 0; z < nz; z++) {
+        gl.uniform1i(uZ, z);
+        draw();
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboProbability);
+        gl.readPixels(0, 0, nx, ny, gl.RGBA, gl.FLOAT, slice);
+        if ((z & 31) === 31) checkGl(gl, `tissue probability slice ${z}`);
+        const base = z * nx * ny;
+        for (let i = 0; i < nx * ny; i++) {
+          tissues[0][base + i] = slice[i * 4];
+          tissues[1][base + i] = slice[i * 4 + 1];
+          tissues[2][base + i] = slice[i * 4 + 2];
+          support[base + i] = slice[i * 4 + 3];
+        }
+      }
+      checkGl(gl, 'tissue probability readback');
+    } else if (d.nclass > 0) {
       const p = progs.classify;
       gl.useProgram(p);
       for (let g = 0; g < P; g++) bind3d(g, cur[g]);
@@ -659,8 +714,10 @@ export function runMeshNetGL(o) {
     const ms = (typeof performance !== 'undefined' ? performance : Date).now() - t0;
     return {
       labels: out,
+      tissues,
+      support,
       ms,
-      path: `webgl2-native P=${P}${useVox2 ? ' vox2' : ''} ${nx}x${ny}x${nz}`,
+      path: `webgl2-native P=${P}${useVox2 ? ' vox2' : ''}${o.probability ? ' tissue-probability' : ''} ${nx}x${ny}x${nz}`,
     };
   } finally {
     // One exit. brainchopC's repeat test gates WebGL2 harder than WebGPU

@@ -41,6 +41,17 @@ export const DESCRIPTORS = {
     activation: 'gelu_tanh',
     fullVolume: true,
   },
+  // EXPERIMENTAL A/B candidate for model16chan18cls's slot: same 18-class
+  // family and topology (DEEP13, family C), 24 channels instead of 16,
+  // retrained weights only (catalyst run ce_gdice_24ch_prio). Channels cost
+  // is the only thing that changes here (see model24chan104cls_synth's notes
+  // above) -- P=6 planes x 2 sets x 128 MiB = 1.5 GiB, same as the other 24ch
+  // family-C models, so fullVolume:true is consistent with them.
+  model24chan18cls_gdice_prio: {
+    dilations: DEEP13,
+    activation: 'gelu_tanh',
+    fullVolume: true,
+  },
   model6chan3cls: {
     dilations: DEEP13,
     activation: 'gelu_tanh',

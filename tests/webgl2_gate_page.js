@@ -6,7 +6,8 @@
 import { buildSources, VERTEX_SRC } from '/webgl2_runners/kernels.js';
 import { packWeights, deriveDescriptor } from '/webgl2_runners/weights.js';
 import { runMeshNetGL, probeWebgl2 } from '/webgl2_runners/meshnet_gl.js';
-import { referenceForward, compareLabels, syntheticModel } from '/webgl2_runners/reference.js';
+import { referenceForward, referenceTissueProbabilities, compareLabels, syntheticModel } from '/webgl2_runners/reference.js';
+import { tissueProbabilityConfig } from '/webgl2_runners/probability.js';
 
 /**
  * The real shapes, read off public/models/<name>/model.json and
@@ -20,6 +21,7 @@ import { referenceForward, compareLabels, syntheticModel } from '/webgl2_runners
  */
 const SHIPPED = [
   { name: 'model16chan18cls',        chan: 16, nclass: 18,  nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
+  { name: 'model24chan18cls_gdice_prio', chan: 24, nclass: 18,  nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'model6chan3cls',          chan: 6,  nclass: 3,   nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'model24chan104cls_synth', chan: 24, nclass: 104, nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'model32chan18cls',        chan: 32, nclass: 18,  nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
@@ -154,6 +156,53 @@ export async function runGate() {
     } catch (e) {
       add(`numerics ${c.label}`, false, `threw: ${e.message}`);
     }
+  }
+
+  // ---- grouped tissue softmax for CAT-lite -------------------------------
+  try {
+    const dil = [1, 2, 1];
+    const { desc } = syntheticModel({
+      chan: 8, nclass: 4, nlayers: 3, dilations: dil,
+      convBias: false, gn: true, affine: true, seed: 31415,
+    });
+    const n = 12;
+    const d = deriveDescriptor(desc, {
+      nx: n, ny: n, nz: n, activation: 'gelu_tanh', dilations: dil, norm: 'gn',
+    });
+    const input = noise(n * n * n, 0.05, 1.5, 2718);
+    const packed = packWeights(desc, d);
+    const probability = tissueProbabilityConfig({
+      softmaxTemperature: 2,
+      brainSupportTemperature: 1,
+      probabilityGroups: { grayMatter: [1], whiteMatter: [2], csf: [3] },
+    }, d.nclass);
+    const gpu = runMeshNetGL({
+      descriptor: d, packed: packed.data, offsets: packed.offsets, input, probability,
+    });
+    const forward = referenceForward(d, desc, input);
+    const ref = referenceTissueProbabilities(d, desc, forward.activations.at(-1), probability);
+    let maximum = 0;
+    let sum = 0;
+    let count = 0;
+    for (let tissue = 0; tissue < 3; tissue++) {
+      for (let voxel = 0; voxel < ref.tissues[tissue].length; voxel++) {
+        const delta = Math.abs(gpu.tissues[tissue][voxel] - ref.tissues[tissue][voxel]);
+        maximum = Math.max(maximum, delta);
+        sum += delta;
+        count++;
+      }
+    }
+    for (let voxel = 0; voxel < ref.support.length; voxel++) {
+      const delta = Math.abs(gpu.support[voxel] - ref.support[voxel]);
+      maximum = Math.max(maximum, delta);
+      sum += delta;
+      count++;
+    }
+    const mean = sum / count;
+    add('CAT-lite grouped probability numerics', maximum < 0.03 && mean < 0.002,
+      `max |delta| ${maximum.toExponential(3)}, mean ${mean.toExponential(3)} | ${gpu.path}`);
+  } catch (e) {
+    add('CAT-lite grouped probability numerics', false, `threw: ${e.message}`);
   }
 
   // ---- VOX=2 must not move a single voxel --------------------------------

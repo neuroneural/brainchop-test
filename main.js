@@ -617,14 +617,6 @@ async function main() {
       }
     }
 
-    // Continuous tissue probabilities require the dedicated WebGPU runner.
-    // Falling back to the categorical WebGL/TFJS paths would silently turn an
-    // argmax label map into meaningless "probabilities".
-    if (modelEntry.webgpuOnly) {
-      showBackendFailure(new Error(`${modelEntry.modelName} currently requires WebGPU.`));
-      return;
-    }
-
     // 1b. Try the NATIVE WebGL2 runner (webgl2_runners/): raw GLSL, 3D textures
     // and MRT, bypassing tfjs entirely. Any refusal -- unsupported device, no
     // descriptor, no safetensors, a GL error, an all-zero volume -- rejects and
@@ -642,6 +634,16 @@ async function main() {
       } catch (e) {
         console.warn("Native WebGL2 declined or failed, falling back to the tfjs worker.", e.message);
       }
+    }
+
+    // Probability entries may opt out of the legacy tfjs worker: that path
+    // returns categorical argmax labels. Native WebGL2 runs first because its
+    // classifier can preserve grouped tissue probabilities for CAT-lite.
+    if (modelEntry.webgpuOnly) {
+      showBackendFailure(new Error(
+        `${modelEntry.modelName} requires WebGPU or the native WebGL2 runner.`
+      ));
+      return;
     }
 
     // 2. Try WebWorker (WebGL)

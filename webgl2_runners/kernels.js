@@ -548,6 +548,58 @@ export function classifySrc(d) {
 }
 
 /**
+ * CAT-lite classifier: grouped softmax probabilities for GM, WM and CSF plus
+ * an independent low-temperature brain-support probability. Unlike classifySrc
+ * this renders one voxel per RGBA32F texel and is invoked one z-slice at a time,
+ * keeping the additional GPU allocation to a single 256x256 texture.
+ */
+export function tissueProbabilitySrc(d) {
+  if (d.nclass > 32) throw new Error('grouped tissue masks support at most 32 classes');
+  const P = d.planes;
+  const pick = rep(P, (i) =>
+    i === 0 ? `      float sv = c0[c];\n`
+      : `      if (c >= ${i * 4}) sv = c${i}[c - ${i * 4}];\n`);
+  const logit = `      float acc = uHasBias != 0 ? ws(uWBias + k) : 0.0;
+      for (int c = 0; c < CHAN; ++c) {
+${pick}        acc += sv * ws(uWCls + c * NCLASS + k);
+      }
+`;
+  return preamble(d) + samplerDecl(P) + WFETCH +
+    `uniform int uWCls;\nuniform int uWBias;\nuniform int uHasBias;\n` +
+    `uniform int uZ;\nuniform float uTemperature;\nuniform float uSupportTemperature;\n` +
+    `uniform highp uint uGrayMask;\nuniform highp uint uWhiteMask;\nuniform highp uint uCsfMask;\n` +
+    `out vec4 outColor;\n` +
+    `void main() {
+  ivec3 p = ivec3(int(gl_FragCoord.x), int(gl_FragCoord.y), uZ);
+` + rep(P, (i) => `  vec4 c${i} = texelFetch(s${i}, p, 0);\n`) +
+    `  float maximum = -3.0e38;
+  for (int k = 0; k < NCLASS; ++k) {
+${logit}    maximum = max(maximum, acc);
+  }
+  float denominator = 0.0;
+  float supportDenominator = 0.0;
+  float backgroundWeight = 0.0;
+  vec3 numerator = vec3(0.0);
+  float invTemperature = 1.0 / max(uTemperature, 0.000001);
+  float invSupportTemperature = 1.0 / max(uSupportTemperature, 0.000001);
+  for (int k = 0; k < NCLASS; ++k) {
+${logit}    float value = exp((acc - maximum) * invTemperature);
+    float supportValue = exp((acc - maximum) * invSupportTemperature);
+    denominator += value;
+    supportDenominator += supportValue;
+    if (k == 0) backgroundWeight = supportValue;
+    uint bit = 1u << uint(k);
+    if ((uGrayMask & bit) != 0u) numerator.r += value;
+    if ((uWhiteMask & bit) != 0u) numerator.g += value;
+    if ((uCsfMask & bit) != 0u) numerator.b += value;
+  }
+  float support = clamp(1.0 - backgroundWeight / supportDenominator, 0.0, 1.0);
+  outColor = vec4(numerator / denominator, support);
+}
+`;
+}
+
+/**
  * Build every shader source for a descriptor. Returned as plain strings so the
  * host can hand them to a validator (mirroring brainchopC's check-glsl) without
  * creating a context.
@@ -573,6 +625,7 @@ export function buildSources(d, maxDrawBuffers = 8) {
     convFirst: convFirstSrc(d),
     convHidden: convHiddenSrc(d),
     classify: d.nclass > 0 ? classifySrc(d) : null,
+    tissueProbability: d.nclass > 0 && d.nclass <= 32 ? tissueProbabilitySrc(d) : null,
   };
   // VOX=2 is only offered for the GroupNorm families. It needs the convolution
   // to always target the SAME activation set, which the gn schedule guarantees

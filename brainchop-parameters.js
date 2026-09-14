@@ -232,6 +232,8 @@ const inferenceModelsList = [
     webgpu_safetensor: './models/model24chan18cls_gdice_prio/model.safetensors',
     webgpu_runner: 'model24chan18cls_gdice_prio_probability',
     forceFP32: false,
+    // The native WebGL2 runner supports CAT-lite; this flag only prevents the
+    // older tfjs worker from misreading categorical labels as probabilities.
     webgpuOnly: true,
     webgpuStorageSize: 1610612736,
     outputType: 'probability',
@@ -289,7 +291,7 @@ const inferenceModelsList = [
     enableFovRecenter: false,
     enableFovInflate: false,
     warning:
-      "Experimental neural-assisted mixed-class partial-volume estimate, not CAT12. WebGPU with shader-f16 and 1.5 GiB storage-buffer support is required.",
+      "Experimental neural-assisted mixed-class partial-volume estimate, not CAT12. Requires WebGPU or native WebGL2 and roughly 1.5 GiB of graphics memory.",
     inferenceDelay: 100,
     description:
       'CAT-inspired gray-matter partial-volume estimate. The 24-channel model supplies joint GM/WM/CSF priors; normalized T1 intensity, a coarse local bias estimate, spatial regularization, and explicit GM-CSF/GM-WM mixture classes produce the displayed continuous GM fraction. Experimental and not a CAT12 result.'
