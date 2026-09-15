@@ -50,9 +50,9 @@ const result = applyCatLitePartialVolume([gm, wm, csf], t1, shape, {
 assert.equal(result.stats.applied, true);
 assert.ok(result.stats.supportCleanup.componentCount > 1);
 assert.ok(result.stats.supportCleanup.removedVoxels > 0);
-assert.equal(result.probabilities[(6 * shape[0]) + 14], 0);
+assert.equal(result.tissues[0][(6 * shape[0]) + 14], 0);
 
-const at = (x) => result.probabilities[x + shape[0]]; // y=1, z=0
+const at = (x) => result.tissues[0][x + shape[0]]; // y=1, z=0
 assert.equal(at(0), 0);
 assert.ok(at(4) < 0.2, `pure CSF should have little GM, got ${at(4)}`);
 assert.ok(at(15) > 0.7, `pure GM should remain predominantly GM, got ${at(15)}`);
@@ -61,6 +61,13 @@ assert.ok(at(10) < at(11), 'GM fraction should rise continuously across CSF-GM m
 assert.ok(at(20) > at(21), 'GM fraction should fall continuously across GM-WM mixels');
 for (let x = 2; x < 28; x++) {
   assert.ok(Math.abs(at(x) - at(x - 1)) < 0.5, `unexpected hard jump at x=${x}`);
+}
+const [, wmAt, csfAt] = result.tissues.map((tissue) => (x) => tissue[x + shape[0]]);
+assert.ok(wmAt(26) > 0.7, `pure WM should be predominantly WM, got ${wmAt(26)}`);
+assert.ok(csfAt(4) > 0.7, `pure CSF should be predominantly CSF, got ${csfAt(4)}`);
+for (let x = 1; x < shape[0] - 1; x++) {
+  const sum = at(x) + wmAt(x) + csfAt(x);
+  assert.ok(Math.abs(sum - 1) < 1e-4, `GM+WM+CSF should equal support at x=${x}, got ${sum}`);
 }
 
 // A ventricle meets white matter directly. The interface may be fractional,
@@ -85,7 +92,7 @@ const ventricleResult = applyCatLitePartialVolume(
   { catLiteBiasBlockSize: 4, catLiteBiasSmoothPasses: 1, catLiteSigmaFloor: 0.02 }
 );
 const ventricleProfile = Array.from(
-  { length: 18 }, (_, offset) => ventricleResult.probabilities[(3 * shape[0]) + offset + 7]
+  { length: 18 }, (_, offset) => ventricleResult.tissues[0][(3 * shape[0]) + offset + 7]
 );
 assert.ok(
   Math.max(...ventricleProfile) < 0.2,

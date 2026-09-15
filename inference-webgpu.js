@@ -11,7 +11,7 @@ import {
     markFailure,
     ExecutionModes
 } from './diagnostic-stats.js';
-import { applyCatLitePartialVolume } from './cat-lite.js';
+import { isCatLite, runCatLite } from './cat-lite.js';
 
 // Use relative paths and eager loading for better error detection
 const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js', { eager: true });
@@ -260,8 +260,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
     let collectedBuffers = []; // Track WebGPU buffers for cleanup
     let originalCreateBuffer = null; // To restore the original method
     let oomScopeOpen = false; // True while an 'out-of-memory' error scope is pushed
-    const isCatLite = modelEntry.outputType === 'probability'
-        && modelEntry.probabilityPostprocess === 'cat-lite';
+    const catLite = isCatLite(modelEntry);
 
     try {
         // Validate inputs
@@ -313,7 +312,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         // CAT-lite combines three model tissue priors with the subject's T1.
         // Capture this before the model-specific transpose; the three outputs
         // are transposed back to this native order below.
-        const catLiteIntensityData = isCatLite ? await tensor.data() : null;
+        const catLiteIntensityData = catLite ? await tensor.data() : null;
 
         if (modelEntry.inputPermutation) {
             console.log(`[WebGPU] Permuting Input: ${modelEntry.inputPermutation}`);
@@ -398,14 +397,13 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         console.log('Inference result shapes:', inferenceResultArray.map((result) => result?.length));
 
         const isProbabilityOutput = modelEntry.outputType === 'probability';
+        const toNativeTensor = (result, dtype) => tf.tidy(() => {
+            const volume = tf.tensor(result, finalShape, dtype);
+            if (modelEntry.outputPermutation) return volume.transpose(modelEntry.outputPermutation);
+            return modelEntry.enableTranspose ? volume.transpose() : volume;
+        });
         const makeNativeVolume = (result, probability, description) => tf.tidy(() => {
-            let volume = tf.tensor(result, finalShape, probability ? 'float32' : 'int32');
-            if (modelEntry.outputPermutation) {
-                console.log(`[WebGPU] Permuting ${description}: ${modelEntry.outputPermutation}`);
-                volume = volume.transpose(modelEntry.outputPermutation);
-            } else if (modelEntry.enableTranspose) {
-                volume = volume.transpose();
-            }
+            const volume = toNativeTensor(result, probability ? 'float32' : 'int32');
             const sum = tf.sum(volume).dataSync()[0];
             console.log(`${description} sum:`, sum);
             if (!Number.isFinite(sum) || sum === 0) {
@@ -424,47 +422,20 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         const postProcessStartTime = performance.now();
         let finalImage;
-        let catLiteStats = null;
-        if (isCatLite) {
-            if (inferenceResultArray.length !== 3 || !catLiteIntensityData) {
+        if (catLite) {
+            // The runner is chosen by name, so a mismatched model entry can return the wrong map count.
+            if (inferenceResultArray.length !== 3) {
                 throw new Error(`CAT-lite expected three tissue maps; received ${inferenceResultArray.length}.`);
             }
             callbackUI('CAT-lite: fitting GM/WM/CSF and partial-volume classes...', 0.92);
-            const tissueNames = ['GM prior', 'WM prior', 'CSF prior'];
-            const nativeTissues = [];
-            for (let tissue = 0; tissue < 3; tissue++) {
-                const tissueVolume = makeNativeVolume(inferenceResultArray[tissue], true, tissueNames[tissue]);
-                nativeTissues.push(await tissueVolume.data());
-                tissueVolume.dispose();
-            }
-            const catLite = applyCatLitePartialVolume(
-                nativeTissues,
-                catLiteIntensityData,
-                [256, 256, 256],
-                modelEntry
-            );
-            finalImage = catLite.probabilities;
-            catLiteStats = catLite.stats;
-            if (!catLiteStats.applied) {
-                console.warn(`[CAT-lite] skipped: ${catLiteStats.reason}`);
-            } else {
-                const means = catLiteStats.tissueMeans;
-                const sigmas = catLiteStats.tissueSigmas;
-                console.log(
-                    `[CAT-lite] means CSF=${means.csf.toFixed(4)}, GM=${means.gray.toFixed(4)}, WM=${means.white.toFixed(4)}; ` +
-                    `sigmas=${sigmas.csf.toFixed(4)}/${sigmas.gray.toFixed(4)}/${sigmas.white.toFixed(4)}; ` +
-                    `GM range=${catLiteStats.outputMin.toFixed(4)}..${catLiteStats.outputMax.toFixed(4)}; ` +
-                    `${(100 * catLiteStats.partialVolumeFraction).toFixed(1)}% of supported voxels are fractional; ` +
-                    `${(100 * catLiteStats.midrangeVisibleFraction).toFixed(1)}% of visible GM is midrange (0.2..0.8)`
-                );
-                const cleanup = catLiteStats.supportCleanup;
-                if (cleanup?.applied) {
-                    console.log(
-                        `[CAT-lite] support cleanup: ${cleanup.componentCount} components at ` +
-                        `${cleanup.threshold.toFixed(3)}; removed ${cleanup.removedVoxels} detached voxels`
-                    );
-                }
-            }
+            finalImage = await runCatLite(inferenceResultArray, catLiteIntensityData, modelEntry, statData,
+                async (prior) => {
+                    // Softmax priors: skip makeNativeVolume's three blocking readbacks per map.
+                    const volume = toNativeTensor(prior, 'float32');
+                    const data = await volume.data();
+                    volume.dispose();
+                    return data;
+                });
         } else {
             outLabelVolume = makeNativeVolume(
                 inferenceResultArray[0],
@@ -479,23 +450,16 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         await callbackImg(finalImage, opts, modelEntry);
 
-        if (isProbabilityOutput) {
-            statData.Output_Type = 'Continuous tissue probability';
-            statData.Tissue = modelEntry.probabilityDisplay || 'grayMatter';
-            statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;
-            if (catLiteStats) {
-                statData.Partial_Volume = catLiteStats.applied ? 'CAT-lite mixed-class PVE' : `Skipped: ${catLiteStats.reason}`;
-                if (catLiteStats.applied) {
-                    statData.CAT_Lite_Tissue_Means = catLiteStats.tissueMeans;
-                    statData.CAT_Lite_Tissue_Sigmas = catLiteStats.tissueSigmas;
-                }
-            }
-        } else {
+        if (!isProbabilityOutput) {
             // Add label statistics from categorical output.
             const uniqueLabels = new Set(finalImage);
             const actualLabels = uniqueLabels.size;
             const expectedLabels = modelEntry.numClasses || actualLabels;
             addLabelStats(statData, expectedLabels, actualLabels);
+        } else if (!catLite) { // runCatLite fills its own statData
+            statData.Output_Type = 'Continuous tissue probability';
+            statData.Tissue = modelEntry.probabilityDisplay || 'grayMatter';
+            statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;
         }
 
         markSuccess(statData, Inference_t, Postprocess_t);

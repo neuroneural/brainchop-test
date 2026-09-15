@@ -36,7 +36,7 @@ import { descriptorFor } from './webgl2_runners/descriptors.js';
 import { parseSafetensors, describeSafetensors, packWeights, deriveDescriptor } from './webgl2_runners/weights.js';
 import { probeWebgl2, runMeshNetGL } from './webgl2_runners/meshnet_gl.js';
 import { tissueProbabilityConfig, smoothAndGateTissuePriors } from './webgl2_runners/probability.js';
-import { applyCatLitePartialVolume } from './cat-lite.js';
+import { isCatLite, runCatLite } from './cat-lite.js';
 
 function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData = []) {
   let statStr = [];
@@ -44,8 +44,10 @@ function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData
   self.postMessage({ cmd: 'ui', message, progressFrac, modalMessage, statData: statStr });
 }
 
+// Transfer, not clone: three 256^3 tissue maps are ~200 MB and main.js
+// terminates this worker right after 'img'. Every array here owns a distinct buffer.
 function callbackImg(img, opts, modelEntry) {
-  self.postMessage({ cmd: 'img', img, opts, modelEntry });
+  self.postMessage({ cmd: 'img', img, opts, modelEntry }, (Array.isArray(img) ? img : [img]).map((a) => a.buffer));
 }
 
 /** A refusal, not a crash: main.js reads this and starts the tfjs worker. */
@@ -54,8 +56,7 @@ function refuse(reason) {
 }
 
 async function run(opts, modelEntry, niftiHeader, niftiImage) {
-  const isCatLite = modelEntry.outputType === 'probability'
-    && modelEntry.probabilityPostprocess === 'cat-lite';
+  const catLite = isCatLite(modelEntry);
   const entry = descriptorFor(modelEntry);
   if (!entry) {
     refuse(`no native WebGL2 descriptor for ${modelEntry.path} (needs a webgl2_runners/descriptors.js entry and a model.safetensors)`);
@@ -72,7 +73,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
 
   const statData = createStatData(modelEntry, ExecutionModes.WEBGL_WEBWORKER ?? 'webgl2-native');
   statData.TF_Backend = 'webgl2-native';
-  callbackUI(isCatLite ? 'CAT-lite probability estimation started' : 'Segmentation started', 0);
+  callbackUI(catLite ? 'CAT-lite probability estimation started' : 'Segmentation started', 0);
 
   const dim = 256;                      // main.js conforms before dispatching
   const dims = [dim, dim, dim];
@@ -117,14 +118,14 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
       : await minMaxNormalizeVolumeData(t);
     t.dispose();
     t = normed;
-    if (isCatLite) catLiteIntensityData = new Float32Array(await t.data());
+    if (catLite) catLiteIntensityData = await t.data();
     if (modelEntry.inputPermutation) {
       const p = t.transpose(modelEntry.inputPermutation); t.dispose(); t = p;
     } else if (modelEntry.enableTranspose) {
       const p = t.transpose(); t.dispose(); t = p;
     }
     finalShape = t.shape;
-    input = new Float32Array(await t.data());
+    input = await t.data();
     t.dispose();
   }
   // Release tfjs's GPU allocations before the runner allocates its own. Without
@@ -141,7 +142,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
     packed: packed.data,
     offsets: packed.offsets,
     input,
-    probability: isCatLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
+    probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
     vox2: probe.vox2,
     onProgress: (frac, msg) => callbackUI(msg, 0.2 + 0.7 * frac),
     onLog: (msg) => console.log(msg),
@@ -152,75 +153,36 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
 
   // ---- postprocessing, identical to inference-webgpu.js ----------------
   await tf.setBackend('webgl');
-  if (isCatLite) {
-    if (!out.tissues || out.tissues.length !== 3 || !out.support || !catLiteIntensityData) {
-      throw new Error('native WebGL2 CAT-lite did not return three tissue priors and brain support');
-    }
-    const p0 = performance.now();
-    callbackUI('CAT-lite: smoothing priors and fitting partial-volume classes...', 0.92);
-    smoothAndGateTissuePriors(out.tissues, out.support, dims, modelEntry);
-    out.support = null;
-
-    const nativeTissues = [];
-    for (let tissueIndex = 0; tissueIndex < out.tissues.length; tissueIndex++) {
-      const tissue = out.tissues[tissueIndex];
-      let volume = tf.tensor(tissue, finalShape, 'float32');
-      if (modelEntry.outputPermutation) {
-        const transposed = volume.transpose(modelEntry.outputPermutation);
-        volume.dispose();
-        volume = transposed;
-      } else if (modelEntry.enableTranspose) {
-        const transposed = volume.transpose();
-        volume.dispose();
-        volume = transposed;
-      }
-      nativeTissues.push(new Float32Array(await volume.data()));
-      volume.dispose();
-      out.tissues[tissueIndex] = null;
-    }
-
-    const catLite = applyCatLitePartialVolume(
-      nativeTissues, catLiteIntensityData, dims, modelEntry
-    );
-    const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
-    if (!catLite.stats.applied) {
-      console.warn(`[CAT-lite/WebGL2] skipped: ${catLite.stats.reason}`);
-    } else {
-      const means = catLite.stats.tissueMeans;
-      const sigmas = catLite.stats.tissueSigmas;
-      console.log(
-        `[CAT-lite/WebGL2] means CSF=${means.csf.toFixed(4)}, GM=${means.gray.toFixed(4)}, ` +
-        `WM=${means.white.toFixed(4)}; sigmas=${sigmas.csf.toFixed(4)}/` +
-        `${sigmas.gray.toFixed(4)}/${sigmas.white.toFixed(4)}`
-      );
-    }
-    statData.Output_Type = 'Continuous tissue probability';
-    statData.Tissue = modelEntry.probabilityDisplay || 'grayMatter';
-    statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;
-    statData.Partial_Volume = catLite.stats.applied
-      ? 'CAT-lite mixed-class PVE'
-      : `Skipped: ${catLite.stats.reason}`;
-    if (catLite.stats.applied) {
-      statData.CAT_Lite_Tissue_Means = catLite.stats.tissueMeans;
-      statData.CAT_Lite_Tissue_Sigmas = catLite.stats.tissueSigmas;
-    }
-    markSuccess(statData, Inference_t, Postprocess_t);
-    callbackUI(modelEntry.modelName + '<br>CAT-lite probability map finished', 0);
-    callbackUI('', -1, '', statData);
-    callbackImg(catLite.probabilities, opts, modelEntry);
-    tf.engine().disposeVariables();
-    return;
-  }
-
-  let outLabelVolume = tf.tidy(() => {
-    // Int32Array, NOT Array.from: Array.from on 16.7M entries builds a boxed JS
-    // array of ~130 MB and takes seconds, which would land inside the number
-    // this path exists to improve.
-    let v = tf.tensor(new Int32Array(out.labels), finalShape, 'int32');
+  const toNativeTensor = (data, dtype) => tf.tidy(() => {
+    let v = tf.tensor(data, finalShape, dtype);
     if (modelEntry.outputPermutation) v = v.transpose(modelEntry.outputPermutation);
     else if (modelEntry.enableTranspose) v = v.transpose();
     return v;
   });
+  if (catLite) {
+    const p0 = performance.now();
+    callbackUI('CAT-lite: smoothing priors and fitting partial-volume classes...', 0.92);
+    smoothAndGateTissuePriors(out.tissues, out.support, dims, modelEntry);
+    out.support = null;
+    const tissues = await runCatLite(out.tissues, catLiteIntensityData, modelEntry, statData, async (prior) => {
+      const volume = toNativeTensor(prior, 'float32');
+      const data = await volume.data();
+      volume.dispose();
+      return data;
+    });
+    const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
+    markSuccess(statData, Inference_t, Postprocess_t);
+    callbackUI(modelEntry.modelName + '<br>CAT-lite probability map finished', 0);
+    callbackUI('', -1, '', statData);
+    callbackImg(tissues, opts, modelEntry);
+    tf.engine().disposeVariables();
+    return;
+  }
+
+  // Int32Array, NOT Array.from: Array.from on 16.7M entries builds a boxed JS
+  // array of ~130 MB and takes seconds, which would land inside the number
+  // this path exists to improve.
+  let outLabelVolume = toNativeTensor(new Int32Array(out.labels), 'int32');
 
   // An all-zero volume is a failure, never a result. Per the standing rule that
   // a silent wrong answer is the cardinal sin, this must not reach the viewer as

@@ -284,6 +284,10 @@ async function main() {
       return;
     }
     const img = nv1.volumes[1].img;
+    if (img instanceof Float32Array) {
+      window.alert("Drawing edits label segmentations, not probability maps.");
+      return;
+    }
     const draw = await nv1.saveImage({ filename: "", isSaveDrawing: true });
     const niiHdrBytes = 352;
     const nvox = img.length;
@@ -404,19 +408,24 @@ async function main() {
     nv1.updateGLVolume();
   };
 
+  // One redraw per frame: updateGLVolume rebuilds every self-modulated
+  // overlay on the CPU (3 × 256³ for CAT-lite), so input events must not queue.
+  let overlayOpacityFrame = 0;
   opacitySlider1.oninput = function () {
-    nv1.setOpacity(1, opacitySlider1.value / 255);
+    cancelAnimationFrame(overlayOpacityFrame);
+    overlayOpacityFrame = requestAnimationFrame(() => {
+      for (const overlay of nv1.volumes.slice(1)) overlay.opacity = opacitySlider1.value / 255;
+      nv1.updateGLVolume();
+    });
   };
 
   function applyModelUnderlayOpacity(modelEntry = null) {
-    const configured = Number(modelEntry?.probabilityUnderlayOpacity);
-    const useTemporaryOpacity = modelEntry?.outputType === 'probability'
-      && Number.isFinite(configured);
-    if (useTemporaryOpacity) {
+    const underlayOpacity = modelEntry?.probabilityUnderlayOpacity;
+    if (underlayOpacity !== undefined) {
       if (probabilityUnderlayRestoreValue === null) {
         probabilityUnderlayRestoreValue = opacitySlider0.value;
       }
-      opacitySlider0.value = Math.round(Math.min(1, Math.max(0, configured)) * 255);
+      opacitySlider0.value = Math.round(underlayOpacity * 255);
       opacitySlider0.oninput();
     } else if (probabilityUnderlayRestoreValue !== null) {
       opacitySlider0.value = probabilityUnderlayRestoreValue;
@@ -439,13 +448,17 @@ async function main() {
     }
     if (isConformed) return;
     const nii2 = await nv1.conform(nii, false);
+    const [nativeNV, nativeName] = [nativeInputNV, nativeInputName];
     await nv1.removeVolume(nv1.volumes[0]);
     await nv1.addVolume(nii2);
+    // addVolume re-ran doLoadImage with the conformed copy; keep the native grid for export.
+    [nativeInputNV, nativeInputName] = [nativeNV, nativeName];
   }
 
   async function closeAllOverlays() {
+    // Remove from the end so remaining overlays' modulationImage indices stay valid.
     while (nv1.volumes.length > 1) {
-      await nv1.removeVolume(nv1.volumes[1]);
+      await nv1.removeVolume(nv1.volumes.at(-1));
     }
   }
 
@@ -636,10 +649,8 @@ async function main() {
       }
     }
 
-    // Probability entries may opt out of the legacy tfjs worker: that path
-    // returns categorical argmax labels. Native WebGL2 runs first because its
-    // classifier can preserve grouped tissue probabilities for CAT-lite.
-    if (modelEntry.webgpuOnly) {
+    // The legacy tfjs paths return categorical argmax labels, never probabilities.
+    if (modelEntry.outputType === 'probability') {
       showBackendFailure(new Error(
         `${modelEntry.modelName} requires WebGPU or the native WebGL2 runner.`
       ));
@@ -797,12 +808,21 @@ async function main() {
     }
   }
 
-  function saveSegmentationConformed() {
+  async function saveSegmentationConformed() {
     if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
     // The overlay already carries the right intent from callbackImg: LABEL for
     // discrete segmentations, none for intensity outputs (e.g. skull-stripped
     // brain). So save it as-is — don't force LABEL here.
-    withPristineLabels(() => nv1.volumes[1].saveToDisk("segmentation.nii.gz"));
+    const overlays = nv1.volumes.slice(1);
+    // Serial: three concurrent 256³ gzips compete for memory.
+    await withPristineLabels(async () => {
+      for (const overlay of overlays) await overlay.saveToDisk(overlayFilename(overlay, overlays.length, ""));
+    });
+  }
+
+  // Multi-overlay results (CAT-lite GM/WM/CSF) save one file per overlay.
+  function overlayFilename(overlay, count, suffix) {
+    return count > 1 ? `segmentation_${overlay.name}${suffix}.nii.gz` : `segmentation${suffix}.nii.gz`;
   }
 
   function saveConformedInput() {
@@ -826,8 +846,11 @@ async function main() {
     callbackUI("Reslicing to native space…", 0);
     await new Promise((r) => setTimeout(r, 30)); // let the status paint before the blocking loop
     try {
-      const outNV = withPristineLabels(() => resliceLabelsToNative());
-      await outNV.saveToDisk("segmentation_native.nii.gz");
+      const overlays = nv1.volumes.slice(1);
+      for (const overlay of overlays) {
+        const outNV = withPristineLabels(() => resliceLabelsToNative(overlay));
+        await outNV.saveToDisk(overlayFilename(overlay, overlays.length, "_native"));
+      }
       callbackUI("Saved native-space segmentation.", 1);
     } catch (e) {
       console.error("Native-space reslice failed:", e);
@@ -842,13 +865,13 @@ async function main() {
   // as Int16 tagged NIFTI_INTENT_LABEL.
   // For an intensity output (e.g. skull-stripped brain): plain nearest-neighbour
   // keeping the native datatype and NOT tagged as a label — it's an image.
+  // For a Float32 probability map (CAT-lite): trilinear, uint8 with scl_slope 1/255.
   //
   // The native→conformed voxel map is built by probing niivue's own verified
   // transforms at four basis points (origin + unit steps), so it is correct for
   // any orientation without us re-deriving affine conventions. Validated: when
   // the two grids are identical the map is the identity.
-  function resliceLabelsToNative() {
-    const seg = nv1.volumes[1];
+  function resliceLabelsToNative(seg) {
     const labels = seg.img;                    // pristine labels (see withPristineLabels)
     const A = nativeInputNV.hdr.affine;        // native storage-voxel -> mm (row-major 4x4)
     const nx = nativeInputNV.hdr.dims[1], ny = nativeInputNV.hdr.dims[2], nz = nativeInputNV.hdr.dims[3];
@@ -935,10 +958,36 @@ async function main() {
     } else {
       // Intensity output (skull-stripped brain): plain nearest-neighbour, keep
       // the native datatype, and do NOT tag as LABEL — this is an image.
-      const out = outNV.img;           // native-datatype typed array, length nvox
+      // Probabilities (0..1 float) would truncate to 0 in the native integer
+      // type: store as uint8 0..255 with scl_slope 1/255 instead.
+      const isProbability = seg.img instanceof Float32Array;
+      const scale = isProbability ? 255 : 1;
+      const round = isProbability ? 0.5 : 0;
+      const out = isProbability ? new Uint8Array(nvox) : outNV.img;
       out.fill(0);
-      outNV.hdr.scl_slope = 1;
+      if (isProbability) {
+        Object.assign(outNV.hdr, { datatypeCode: 2, numBitsPerVoxel: 8, cal_min: 0, cal_max: 1 });
+        outNV.img = out;
+      }
+      outNV.hdr.scl_slope = 1 / scale;
       outNV.hdr.scl_inter = 0;
+      // Partial-volume fractions are continuous: trilinear keeps them smooth
+      // instead of blocky. Integer conformed coordinates are voxel centres.
+      const trilinear = (x, y, z) => {
+        const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
+        const fx = x - x0, fy = y - y0, fz = z - z0;
+        const v000 = sample(x0, y0, z0), v100 = sample(x0 + 1, y0, z0);
+        const v010 = sample(x0, y0 + 1, z0), v110 = sample(x0 + 1, y0 + 1, z0);
+        const v001 = sample(x0, y0, z0 + 1), v101 = sample(x0 + 1, y0, z0 + 1);
+        const v011 = sample(x0, y0 + 1, z0 + 1), v111 = sample(x0 + 1, y0 + 1, z0 + 1);
+        const y0z0 = v000 + fx * (v100 - v000), y1z0 = v010 + fx * (v110 - v010);
+        const y0z1 = v001 + fx * (v101 - v001), y1z1 = v011 + fx * (v111 - v011);
+        const z0v = y0z0 + fy * (y1z0 - y0z0), z1v = y0z1 + fy * (y1z1 - y0z1);
+        return z0v + fz * (z1v - z0v);
+      };
+      const at = isProbability
+        ? trilinear
+        : (x, y, z) => sample(Math.round(x), Math.round(y), Math.round(z));
       let idx = 0;
       for (let k = 0; k < nz; k++) {
         for (let j = 0; j < ny; j++) {
@@ -946,7 +995,7 @@ async function main() {
           let by = o[1] + j * ey[1] + k * ez[1];
           let bz = o[2] + j * ey[2] + k * ez[2];
           for (let i = 0; i < nx; i++) {
-            out[idx++] = sample(Math.round(bx), Math.round(by), Math.round(bz));
+            out[idx++] = at(bx, by, bz) * scale + round;
             bx += ex[0]; by += ex[1]; bz += ex[2];
           }
         }
@@ -1153,6 +1202,11 @@ async function main() {
       window.alert("No segmentation to measure (run a model first).");
       return;
     }
+    // Each distinct float would become its own label (and 256-bin histogram).
+    if (nv1.volumes[1].img instanceof Float32Array) {
+      window.alert("Stats need a label segmentation, not probability maps.");
+      return;
+    }
     const imgArr = nv1.volumes[0].img;   // conformed input intensities
     // Use pristine labels so region stats stay whole-brain even while isolated.
     const labelArr = originalSegImg || nv1.volumes[1].img; // segmentation labels
@@ -1222,12 +1276,14 @@ async function main() {
     // Retain the volume as loaded (native grid) before ensureConformed() may
     // replace volumes[0] with the 256³ conformed copy — needed to reslice the
     // segmentation back to native space on export.
-    nativeInputNV = nv1.volumes[0] || null;
-    nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
-    // addVolume() can also notify Niivue's image-loaded hook. Only treat a
-    // single-volume scene as a newly loaded underlay; an inference overlay must
-    // not immediately restore the opacity we just set for CAT-lite.
-    if (nv1.volumes.length <= 1) applyModelUnderlayOpacity();
+    // addVolume() also notifies Niivue's image-loaded hook. Only treat a
+    // single-volume scene as a newly loaded underlay: an inference overlay must
+    // not replace the native volume or restore the opacity set for CAT-lite.
+    if (nv1.volumes.length <= 1) {
+      nativeInputNV = nv1.volumes[0] || null;
+      nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
+      applyModelUnderlayOpacity();
+    }
     opacitySlider0.oninput();
     modelSelect.value = "-1";
   }
@@ -1257,75 +1313,78 @@ async function main() {
     });
   }
 
+  async function addProbabilityOverlay(img, modelEntry, tissue) {
+    const overlayVolume = await nv1.volumes[0].clone();
+    if (tissue) overlayVolume.name = tissue.name;
+    overlayVolume.img = img instanceof Float32Array ? img : Float32Array.from(img);
+    Object.assign(overlayVolume.hdr, {
+      scl_inter: 0,
+      scl_slope: 1,
+      datatypeCode: 16,       // DT_FLOAT32: preserve partial-volume probabilities
+      numBitsPerVoxel: 32,
+      cal_min: 0,
+      cal_max: 1,
+      intent_code: 1001,      // NIFTI_INTENT_ESTIMATE, not a categorical LABEL
+    });
+    // clone() calibrated the original image before we replaced its pixels.
+    // Refresh NVImage's object-level range as well as the NIfTI header: 2D
+    // slices happened to use the new pixels, while volume rendering retained
+    // the cloned range until save/reload constructed a fresh NVImage.
+    overlayVolume.trustCalMinMax = true;
+    overlayVolume.calMinMax();
+    const probabilityDisplayMin = modelEntry.probabilityDisplayMin ?? 0.005;
+    Object.assign(overlayVolume, {
+      cal_min: probabilityDisplayMin,
+      cal_max: 1,
+      robust_min: probabilityDisplayMin,
+      robust_max: 1,
+      // ZERO_TO_MAX_TRANSPARENT_BELOW_MIN. This is essential for 3D: the
+      // overlay shader otherwise rounds every tiny positive alpha to opaque.
+      colormapType: 1,
+    });
+
+    // A light tinted ramp (floor..tint) avoids the dark false edge a black-based
+    // colormap draws over bright T1 white matter.
+    const { probabilityOverlayAlpha: alpha = 96, probabilityOverlayFloor: floor = 192 } = modelEntry;
+    const tint = tissue?.tint || [255, 255, 255];
+    const colormap = `probability-light-${tint.join('-')}-${floor}-${alpha}`;
+    if (!nv1.colormaps().includes(colormap)) {
+      const [lowR, lowG, lowB] = tint.map((c) => Math.round(c * floor / 255));
+      nv1.addColormap(colormap, {
+        R: [lowR, tint[0]], G: [lowG, tint[1]], B: [lowB, tint[2]],
+        A: [0, alpha], I: [0, 255],
+      });
+    }
+    overlayVolume.colormap = colormap;
+    // Niivue normally rounds any nonzero overlay alpha up to opaque. Use the
+    // probability volume itself as an alpha modulator so zero is genuinely
+    // transparent and intermediate probabilities reveal the T1 underneath.
+    // Each overlay modulates itself: addVolume appends it at this index.
+    overlayVolume.modulationImage = nv1.volumes.length;
+    overlayVolume.modulateAlpha = 1;
+    overlayVolume.opacity = opacitySlider1.value / 255;
+    await nv1.addVolume(overlayVolume);
+  }
+
   async function callbackImg(img, opts, modelEntry) {
-    const isProbabilityMap = modelEntry.outputType === 'probability';
     await closeAllOverlays();
     resetLabelIsolation();
+    lastSegLabelNames = null;
+    lastSegColors = null;
+    if (modelEntry.outputType === 'probability') {
+      // CAT-lite passes [GM, WM, CSF]; other probability models a single map.
+      const maps = Array.isArray(img) ? img : [img];
+      for (let i = 0; i < maps.length; i++) {
+        await addProbabilityOverlay(maps[i], modelEntry, modelEntry.probabilityTissues?.[i]);
+      }
+      applyModelUnderlayOpacity(modelEntry);
+      return;
+    }
     const overlayVolume = await nv1.volumes[0].clone();
     overlayVolume.zeroImage();
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
-    if (isProbabilityMap) {
-      overlayVolume.img = img instanceof Float32Array ? img : Float32Array.from(img);
-      Object.assign(overlayVolume.hdr, {
-        datatypeCode: 16,       // DT_FLOAT32: preserve partial-volume probabilities
-        numBitsPerVoxel: 32,
-        cal_min: 0,
-        cal_max: 1,
-        intent_code: 1001,      // NIFTI_INTENT_ESTIMATE, not a categorical LABEL
-      });
-      // clone() calibrated the original image before we replaced its pixels.
-      // Refresh NVImage's object-level range as well as the NIfTI header: 2D
-      // slices happened to use the new pixels, while volume rendering retained
-      // the cloned range until save/reload constructed a fresh NVImage.
-      overlayVolume.trustCalMinMax = true;
-      overlayVolume.calMinMax();
-      const configuredDisplayMin = Number(modelEntry.probabilityDisplayMin ?? 0.005);
-      const probabilityDisplayMin = Number.isFinite(configuredDisplayMin)
-        ? Math.min(1, Math.max(0, configuredDisplayMin))
-        : 0.005;
-      Object.assign(overlayVolume, {
-        cal_min: probabilityDisplayMin,
-        cal_max: 1,
-        robust_min: probabilityDisplayMin,
-        robust_max: 1,
-        // ZERO_TO_MAX_TRANSPARENT_BELOW_MIN. This is essential for 3D: the
-        // overlay shader otherwise rounds every tiny positive alpha to opaque.
-        colormapType: 1,
-      });
-    } else {
-      overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
-    }
-
-    lastSegLabelNames = null;
-    lastSegColors = null;
-    if (isProbabilityMap) {
-      let colormap = (modelEntry.probabilityColormap || 'gray').toLowerCase();
-      if (modelEntry.probabilityDisplayEncoding === 'light-gray-overlay') {
-        const configuredAlpha = Number(modelEntry.probabilityOverlayAlpha ?? 96);
-        const alpha = Number.isFinite(configuredAlpha)
-          ? Math.round(Math.min(192, Math.max(16, configuredAlpha)))
-          : 96;
-        const configuredFloor = Number(modelEntry.probabilityOverlayFloor ?? 192);
-        const floor = Number.isFinite(configuredFloor)
-          ? Math.round(Math.min(240, Math.max(128, configuredFloor)))
-          : 192;
-        colormap = `probability-light-gray-${floor}-${alpha}`;
-        if (!nv1.colormaps().includes(colormap)) {
-          nv1.addColormap(colormap, {
-            R: [floor, 255], G: [floor, 255], B: [floor, 255],
-            A: [0, alpha], I: [0, 255],
-          });
-        }
-      }
-      if (!nv1.colormaps().includes(colormap)) colormap = 'actc';
-      overlayVolume.colormap = colormap;
-      // Niivue normally rounds any nonzero overlay alpha up to opaque. Use the
-      // probability volume itself as an alpha modulator so zero is genuinely
-      // transparent and intermediate probabilities reveal the T1 underneath.
-      // closeAllOverlays() leaves the T1 at index 0, so this new volume is 1.
-      overlayVolume.modulationImage = 1;
-      overlayVolume.modulateAlpha = 1;
-    } else if (modelEntry.type === 'Brain_Masking') {
+    overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
+    if (modelEntry.type === 'Brain_Masking') {
       const newLabels = ["Background", "Brain Mask"];
       lastSegLabelNames = newLabels.slice();
       const newR = [0, 217];
@@ -1523,6 +1582,7 @@ async function main() {
     modelSelect.appendChild(option);
   }
   nv1.onImageLoaded = doLoadImage;
+  doLoadImage(); // the default volume loaded before the hook existed; capture its native grid
   // Phone/desktop layout: pick the multiplanar tiling that actually maximizes
   // pane size, and offer single-plane views on narrow screens. Installed after
   // onImageLoaded so it can chain onto it. See responsive-layout.js.
