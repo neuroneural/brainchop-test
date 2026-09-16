@@ -29,12 +29,12 @@
     <div class="opacity-stack" title="Layer opacity">
       <div class="opacity-row">
         <span class="opacity-label">BG</span>
-        <input type="range" min="0" max="255" value="255" class="mini-slider" id="opacitySlider0"
+        <input type="range" min="0" max="1" step="0.1" value="1" class="mini-slider" id="opacitySlider0"
           aria-label="Background opacity" />
       </div>
       <div class="opacity-row">
         <span class="opacity-label">OVL</span>
-        <input type="range" min="0" max="255" value="128" class="mini-slider" id="opacitySlider1"
+        <input type="range" min="0" max="1" step="0.1" value="0.5" class="mini-slider" id="opacitySlider1"
           aria-label="Overlay opacity" />
       </div>
     </div>
@@ -48,8 +48,14 @@
 
     <span class="tb-divider"></span>
 
-    <!-- Interaction mode: compact icon toggle (values map to nv.opts.dragMode) -->
+    <!-- Interaction mode: compact icon toggle (values are DRAG_MODE, set as primaryDragMode) -->
     <div class="segmented segmented-icons" id="dragSegmented" role="group" aria-label="Mouse drag mode">
+      <button type="button" data-drag="8" class="active" title="Navigate (move crosshair)" aria-label="Navigate">
+        <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+          <circle cx="12" cy="12" r="7" />
+          <path d="M12 1.5v5M12 17.5v5M1.5 12h5M17.5 12h5" />
+        </svg>
+      </button>
       <button type="button" data-drag="3" title="Pan / zoom" aria-label="Pan / zoom">
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <path d="M12 2v20M2 12h20" />
@@ -68,7 +74,7 @@
           <path d="M7 8.5v3M11 8.5v4M15 8.5v3M19 8.5v3" />
         </svg>
       </button>
-      <button type="button" data-drag="4" class="active" title="Drag to reslice in 3D" aria-label="Reslice in 3D">
+      <button type="button" data-drag="4" title="Drag to reslice in 3D" aria-label="Reslice in 3D">
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <path d="M12 2.5l8.5 4.9v9.2L12 21.5l-8.5-4.9V7.4z" />
           <path d="M12 12v9.5M3.5 7l8.5 5 8.5-5" />

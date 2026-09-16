@@ -260,7 +260,7 @@ const inferenceModelsList = [
     // CAT-lite is much easier to inspect without a bright anatomical volume
     // competing with it. main.js applies this temporarily and restores the
     // user's previous underlay opacity on the next non-probability result.
-    probabilityUnderlayOpacity: 0.05,
+    probabilityUnderlayOpacity: 0.1,   // must land on the BG slider step (0.1)
     probabilityGroups: {
       grayMatter: [2, 6, 7, 8, 9, 10, 14, 15, 16, 17],
       whiteMatter: [1, 5],
