@@ -32,3 +32,5 @@ timing.json
 # Local agent / CLI tooling (do not commit)
 .claude/
 .antigravitycli/
+# lockfile for bun; npm's package-lock.json is the committed one
+bun.lock
