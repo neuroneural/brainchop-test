@@ -76,7 +76,7 @@ Any browser with WebGL2 can run the label models; WebGPU (Chrome/Edge) is the fa
 
 ## Development
 
-Viewer: NiiVue 1.0 (pinned to its WebGL2 backend).
+Viewer: NiiVue 1.0 (pinned to its WebGL2 backend). The toolbar's shading button switches the 3D render between flat and matcap lighting.
 
 ```
 npm install    # bun install also works
@@ -89,6 +89,7 @@ Unit/gate tests (no dev server needed):
 
 ```
 node tests/cat-lite.mjs
+node tests/cortical_relabel.mjs
 node tests/webgl2-probability.mjs
 node tests/webgl2_gate.mjs [chromium|firefox]
 ```

@@ -26,6 +26,7 @@ npm run dev             # vite dev server on :5173, or the next free port; bun r
 npm run build           # production build
 npm test                # `pretest` builds, then playwright against `npm run preview` on :8088
 node tests/cat-lite.mjs
+node tests/cortical_relabel.mjs
 node tests/webgl2-probability.mjs
 node tests/webgl2_gate.mjs [chromium|firefox]
 ```
@@ -35,7 +36,7 @@ node tests/webgl2_gate.mjs [chromium|firefox]
 Order, each stage falling through on failure/refusal (never surfaced individually to the user):
 
 1. **WebGPU** — if `isWebGpuAvailable && modelEntry.webgpu_safetensor` (skippable via `FORCE_WEBGL2_TESTING`).
-2. **Native WebGL2** (`ENABLE_NATIVE_WEBGL2`, skippable via `FORCE_TFJS_WEBGL_TESTING`) — dynamic import of `inference-webgl2.js`; requires `nativeWebgl2Available()` (OffscreenCanvas + webgl2) and a `webgl2_runners/descriptors.js` entry for the model.
+2. **Native WebGL2** (`ENABLE_NATIVE_WEBGL2`, skippable via `FORCE_TFJS_WEBGL_TESTING`) — dynamic import of `inference-webgl2.js`; also needs `modelEntry.webgpu_safetensor`, plus `nativeWebgl2Available()` (OffscreenCanvas + webgl2) and a `webgl2_runners/descriptors.js` entry for the model.
 3. `outputType: 'probability'` models stop here with an error: the legacy tfjs paths only return argmax labels.
 4. **tfjs WebWorker** (`brainchop-webworker.js`) — tried fast, then retried with `enableSeqConv: true` on failure.
 5. **tfjs main thread** (`brainchop-mainthread.js`) — last resort.
@@ -72,8 +73,10 @@ Each entry in `inferenceModelsList` is a plain object read by `runInferenceChain
 
 Upgraded 0.62.0 → 1.0.0-rc.13. Why: 0.62's orient pass forced the opacity uniform to 1.0 whenever `modulateAlpha` was set, so the overlay slider could not affect a self-modulated overlay at all. 1.0 applies modulation and opacity independently.
 
-- Backend is pinned: `new NiiVue({ backend: "webgl2" })`. 1.0 defaults to WebGPU; WebGL2 keeps the viewer aligned with the raw-GLSL runners and `localSystemDetails(nv1.view?.gl)`. Switching to WebGPU is a one-line change and ~2.5x faster for the CAT-lite overlay slider.
-- `NVImage` is plain data in 1.0 — no `clone`/`zeroImage`/`calMinMax`/`getValue`/`mm2vox`/`saveToDisk`/`setColormapLabel` (that one moved to the instance: `nv1.setColormapLabel(volIdx, cmap)`). `cloneVolume` and `downloadVolume` (main.js, module scope) replace the ones we used; `resliceLabelsToNative` now inverts the overlay's own affine with `gl-matrix` instead of `mm2vox`/`toRASvox`.
+- Backend is pinned: `new NiiVue({ backend: "webgl2" })`. 1.0 defaults to WebGPU; WebGL2 keeps the viewer aligned with the raw-GLSL runners and `localSystemDetails(nv1.view?.gl)`. Switching to WebGPU is a one-line change; it is the faster backend for the CAT-lite overlay slider (see Deferred).
+- `NVImage` is plain data in 1.0 — no `clone`/`zeroImage`/`calMinMax`/`getValue`/`mm2vox`/`saveToDisk`/`setColormapLabel`. `cloneVolume` and `downloadVolume` (main.js, module scope) replace the ones we used; `resliceLabelsToNative` now inverts the overlay's own affine with `gl-matrix` instead of `mm2vox`/`toRASvox`.
+- Label colormaps: assign `vol.colormapLabel = makeLabelLut(cmap)` **before** `addVolume`. 1.0's replacement `nv1.setColormapLabel(idx, cmap)` builds the same LUT but also scans all 16.7M voxels for label centroids (only the legend reads them, and it is off) and runs a second `updateGLVolume` over the volume just uploaded — ~0.8 s per displayed segmentation.
+- `loadMatcap(name)` looks `name` up in `opts.matcaps` and, on a miss, treats the name itself as a URL; the failed fetch is swallowed, so the built-in default matcap silently stays in place. Pass the map to the constructor (`matcaps: { Shiny: shiny }` from `@niivue/niivue/assets/matcaps`). Bit us twice. The shading toolbar button toggles `volumeIllumination` 0 <-> 0.5 and loads the matcap on first enable.
 - `cal_min`/`cal_max`/`robust_min`/`robust_max` → `calMin`/`calMax`/`robustMin`/`robustMax`. The NVImage type has an index signature, so the old snake_case names assign silently and do nothing.
 - `conform()` left core: `@niivue/nv-ext-image-processing`, registered via `registerVolumeTransform(conform)` and called as `nv1.volumeTransform.conform(vol, { toRAS: false })`. Easy to miss — `ensureConformed` short-circuits on the already-conformed default image, so a missing registration only fails on a real input.
 - `drawIsEnabled = true` does NOT create the drawing bitmap (0.62's `setDrawingEnabled` did); call `createEmptyDrawing()`. `setPenValue(v, isFilled)` split into `drawPenValue` + `drawPenFilled`; `drawIsFillOverwriting` survives but is a different setting (flood-fill overwrite).
@@ -92,7 +95,7 @@ Use `rasToNativeIndex(vol, [rx, ry, rz])` (`main.js`, module scope) to cross ove
 ## Drag modes and the location readout
 
 - `setDragMode()` writes **only** `secondaryDragMode` (the right button). Button 0 reads `primaryDragMode` (`control/dragModes.ts`). Set `nv1.primaryDragMode` directly, or the toolbar silently controls right-click and does nothing on touch.
-- 1.0 has one mode per button with **no click/drag split**, and only `DRAG_MODE.crosshair` moves the crosshair on a 2D tile. 0.62 moved it on any click and ran `opts.dragMode` only on drag. So a non-crosshair `primaryDragMode` makes the app un-navigable and freezes the location readout. Startup sets `crosshair` (8); every toolbar button (1-4) overrides it and none selects crosshair, so there is no way back from the toolbar.
+- 1.0 has one mode per button with **no click/drag split**, and only `DRAG_MODE.crosshair` moves the crosshair on a 2D tile. 0.62 moved it on any click and ran `opts.dragMode` only on drag. So a non-crosshair `primaryDragMode` makes the app un-navigable and freezes the location readout. Startup sets `crosshair` (8) and the toolbar's Navigate button (`data-drag="8"`, active by default) is the way back; the other four buttons (1-4) replace it.
 - `locationChange` fires on crosshair *change*, not on hover (0.62 updated on mouse move). `e.detail` carries the payload.
 
 ## Testing gotchas
@@ -100,20 +103,17 @@ Use `rasToNativeIndex(vol, [rx, ry, rz])` (`main.js`, module scope) to cross ove
 - Playwright's `mouse.click(x, y, { modifiers: ['Alt'] })` does **not** set `altKey` on the resulting click event. Use `keyboard.down('Alt')` / `keyboard.up('Alt')` around the click, or Alt-click isolation appears broken when it is not.
 - `vite dev`/`preview` silently fall through to the next free port. A stale server elsewhere (including one whose cwd has been deleted) will hold :5173 and serve old code — check the cwd of the listening process before believing a UI bug.
 
-## Open items / audit notes (2026-09-15 audit)
+## Open items / audit notes
 
-Fixed in this audit: native export grid (`nativeInputNV` overwritten by conformed copy — affected every model), Stats/Draw on probability maps, overlay removal order, serial conformed saves, worker buffer transfer, CAT-lite CPU hot-loop allocations (~5x faster), duplicated WebGPU/WebGL2 CAT-lite post-processing, unused stats/options/validation layers, `[object Object]` in diagnostics, trilinear native export of probability maps, WebGPU CAT-lite readback validation skipped (softmax priors).
+Fixed in the 2026-09-15 audits: native export grid (`nativeInputNV` overwritten by conformed copy — affected every model), Stats/Draw on probability maps, overlay removal order, serial conformed saves, worker buffer transfer, CAT-lite CPU hot-loop allocations (~5x faster), duplicated WebGPU/WebGL2 CAT-lite post-processing, unused stats/options/validation layers, `[object Object]` in diagnostics, trilinear native export of probability maps, WebGPU CAT-lite readback validation skipped (softmax priors).
 
 Deferred (not done; candidates for a follow-up):
 - Opacity-slider latency scales with the OVERLAY COUNT, not with modulation (1.0 caches the modulation weights). Measured on this machine, per `updateGLVolume` with 256³ float overlays: 1 overlay 33 ms (frame-locked); 2/3 overlays ~320/~445 ms on WebGL2, ~134/~175 ms on WebGPU. The flat jump at 2 overlays is the multi-layer blend chain. `updateGLVolume` coalesces (one call in flight, newest pending value re-runs on completion) so a drag never queues a backlog, but CAT-lite's three overlays still cannot be dragged smoothly. Real fix if it matters: composite GM/WM/CSF into ONE RGB overlay, or show one tissue at a time.
 - `.nvd` scene save: 1.0's `NVDocumentVolume` schema does carry `modulationImage`/`modulateAlpha`/`colormapType`/`colormapLabel` (0.62 did not, so probability overlays reloaded opaque), but it has no field for colormaps registered with `addColormap` — a reloaded scene should lose the `probability-light-*` ramps. Round-trip not actually run.
 - Dead single-display probability path: WebGPU runner `probabilityDisplay`/`tissue` uniform/`selected_mask` and non-CAT-lite blur/support passes; `isProbabilityOutput` non-CAT-lite branch in `inference-webgpu.js`; `Array.isArray(img)` fallback in `callbackImg`. Model 23 is the only probability model.
-- Validation stacked 3-4 deep in the WebGL2 probability path (`probability.js` `finiteOption`/`maskFor`/nclass checks, `kernels.js`, `meshnet_gl.js`, runner uniform buffer); `DEFAULT_GROUPS` copied 3x; `tissueProbabilityConfig` returns unused `supportPower`/`sigma`.
+- Validation stacked 3-4 deep in the WebGL2 probability path (`probability.js` `finiteOption`/`maskFor`/nclass checks, `kernels.js`, `meshnet_gl.js`, runner uniform buffer); the default GM/WM/CSF group lists are spelled out three times (`brainchop-parameters.js`, the WebGPU runner, `webgl2_runners/probability.js`); `tissueProbabilityConfig` returns unused `supportPower`/`sigma`.
 - `blurAxis` (`webgl2_runners/probability.js`) recomputes axis ternaries per voxel.
-
-## Deferred (2026-09-15 NiiVue 1.0 audit)
-
-- **Isolate labels via the label LUT, not by mutating `.img`.** `applyLabelIsolation` zeroes non-selected voxels only because 0.62's atlas shader feathered alpha from the 6 neighbours; 1.0's label path is a hard LUT lookup with no feather (same reason the `uniform4fv` hack was deleted). Setting `R=G=B=A=0` for the hidden labels via `setColormapLabel(1, cmap)` deletes `originalSegImg`, `withPristineLabels` and its 3 call sites (~38 lines) and makes every export pristine by construction. Two details are load-bearing: zero **RGB as well as A** (the baked RGBA8 texture is non-premultiplied and sampled LINEAR in 3D, so an alpha-0 entry still bleeds colour), and pass a **new** ColorMap object (the GPU cache key is WeakMap object identity). Afterwards `labelUnderCursor` can just read `locationChange.values[1].value`.
+- **Isolate labels via the label LUT, not by mutating `.img`.** `applyLabelIsolation` zeroes non-selected voxels only because 0.62's atlas shader feathered alpha from the 6 neighbours; 1.0's label path is a hard LUT lookup with no feather (same reason the `uniform4fv` hack was deleted). Setting `R=G=B=A=0` for the hidden labels in a fresh `makeLabelLut(cmap)` (never `setColormapLabel`, see the migration notes) deletes `originalSegImg`, `withPristineLabels` and its 3 call sites (~38 lines) and makes every export pristine by construction. Two details are load-bearing: zero **RGB as well as A** (the baked RGBA8 texture is non-premultiplied and sampled LINEAR in 3D, so an alpha-0 entry still bleeds colour), and pass a **new** ColorMap object (the GPU cache key is WeakMap object identity). Afterwards `labelUnderCursor` can just read `locationChange.values[1].value`.
 - **Dependency pinning.** `package.json` allows `^1.0.0-rc.13`, but `@niivue/nv-ext-image-processing@1.0.0-rc.13` declares an **exact** peer on the core. A lockfile-free `npm install` can pair a mismatched core with the extension. Pin both exactly while on release candidates.
 - The isolation HUD reads `view.screenSlices` from the *previous* frame (`drawScene` schedules a rAF rather than rendering), so it lags one frame after a resize or pane switch.
 - `registerVolumeTransform` throws on a duplicate name — fine for one `main()`, fatal under HMR.

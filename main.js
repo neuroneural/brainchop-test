@@ -404,29 +404,14 @@ async function main() {
     showModal("About BrainChop", aboutContent);
   };
 
-  // Matcap lighting for the 3D render. The matcap is always "Shiny"; the button
-  // just toggles how strongly it is applied. Loaded lazily: it fetches a texture
-  // and forces the gradient pass on, neither of which is worth doing for users
-  // who never turn shading on.
+  // Matcap lighting for the 3D render. The matcap itself is fixed: the NiiVue
+  // constructor auto-applies the first entry of opts.matcaps, so calling
+  // loadMatcap() here would only re-assign the same URL and pay a full
+  // updateGLVolume for it. The button just scales how strongly it is applied.
   const shadingBtn = document.getElementById("shadingBtn");
-  let matcapLoaded = false;
-  shadingBtn.onclick = async () => {
+  shadingBtn.onclick = () => {
     const on = shadingBtn.classList.toggle("active");
     shadingBtn.setAttribute("aria-pressed", String(on));
-    if (on && !matcapLoaded) {
-      shadingBtn.disabled = true;
-      try {
-        await nv1.loadMatcap("Shiny");
-        matcapLoaded = true;
-      } catch (e) {
-        console.warn("matcap load failed", e);
-        shadingBtn.classList.remove("active");
-        shadingBtn.setAttribute("aria-pressed", "false");
-        return;
-      } finally {
-        shadingBtn.disabled = false;
-      }
-    }
     nv1.volumeIllumination = on ? 0.5 : 0;
   };
 
