@@ -228,13 +228,10 @@ const inferenceModelsList = [
     id: 23,
     type: 'Probability_Map',
     path: '/models/model24chan18cls_gdice_prio/model.json',
-    modelName: '\u{1F9E0} Gray-matter CAT-lite PVE (24ch, experimental)',
+    modelName: '\u{1F9E0} CAT-lite GM/WM/CSF PVE (24ch, experimental)',
     webgpu_safetensor: './models/model24chan18cls_gdice_prio/model.safetensors',
     webgpu_runner: 'model24chan18cls_gdice_prio_probability',
     forceFP32: false,
-    // The native WebGL2 runner supports CAT-lite; this flag only prevents the
-    // older tfjs worker from misreading categorical labels as probabilities.
-    webgpuOnly: true,
     webgpuStorageSize: 1610612736,
     outputType: 'probability',
     probabilityPostprocess: 'cat-lite',
@@ -248,11 +245,13 @@ const inferenceModelsList = [
     // the three priors before the joint mixed-class fit (not on the final map).
     partialVolumeSigma: 0.65,
     probabilityDisplay: 'grayMatter',
-    probabilityColormap: 'gray',
-    // A light-gray overlay ramp avoids the dark false edge made by compositing
-    // ordinary black-to-white gray probabilities over naturally bright WM,
-    // while retaining probability-dependent contrast for the 3D view.
-    probabilityDisplayEncoding: 'light-gray-overlay',
+    // One overlay per CAT-lite output, in [GM, WM, CSF] order; `tint` colors
+    // the light overlay ramp and `name` suffixes saved files.
+    probabilityTissues: [
+      { name: 'gm', tint: [255, 64, 64] },
+      { name: 'wm', tint: [255, 255, 255] },
+      { name: 'csf', tint: [64, 128, 255] },
+    ],
     // The wider ramp restores depth cues in volume rendering; reduced alpha
     // keeps mid-probability gray from drawing a dark band over bright T1 WM.
     probabilityOverlayFloor: 128,
@@ -276,8 +275,6 @@ const inferenceModelsList = [
     catLiteCsfWmMixelPrior: 6.0,
     catLiteSpatialWeight: 0.25,
     catLiteMinSupport: 0.03,
-    catLiteKeepLargestComponent: true,
-    catLiteComponentThreshold: 0.03,
     catLiteSigmaFloor: 0.025,
     catLiteBiasBlockSize: 16,
     catLiteBiasSmoothPasses: 3,
@@ -294,7 +291,7 @@ const inferenceModelsList = [
       "Experimental neural-assisted mixed-class partial-volume estimate, not CAT12. Requires WebGPU or native WebGL2 and roughly 1.5 GiB of graphics memory.",
     inferenceDelay: 100,
     description:
-      'CAT-inspired gray-matter partial-volume estimate. The 24-channel model supplies joint GM/WM/CSF priors; normalized T1 intensity, a coarse local bias estimate, spatial regularization, and explicit GM-CSF/GM-WM mixture classes produce the displayed continuous GM fraction. Experimental and not a CAT12 result.'
+      'CAT-inspired GM/WM/CSF partial-volume estimate. The 24-channel model supplies joint GM/WM/CSF priors; normalized T1 intensity, a coarse local bias estimate, spatial regularization, and explicit GM-CSF/GM-WM mixture classes produce continuous GM, WM and CSF fractions. Experimental and not a CAT12 result.'
   },
   {
     id: 7,

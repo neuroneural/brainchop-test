@@ -66,6 +66,30 @@ For **v3** click [here](https://neuroneural.github.io/brainchop/v3).
 
 <br>
 
+## Models & Backends
+
+Inference runs through browser GPU backends in order, falling through silently on failure or unsupported hardware: **WebGPU** &rarr; **native WebGL2** (raw GLSL runner, `webgl2_runners/`) &rarr; **tfjs WebWorker** &rarr; **tfjs main thread**. Only a full-chain failure is shown to the user.
+
+Most models output a discrete label segmentation. An experimental **CAT-lite** model (24-channel GM/WM/CSF priors, neural-assisted partial-volume estimation — not a CAT12 result) instead outputs continuous GM/WM/CSF fraction maps, shown as three overlays. Saves write one file per tissue: `segmentation_{gm,wm,csf}.nii.gz` (float32, 256&sup3; conformed) or `segmentation_{gm,wm,csf}_native.nii.gz` (uint8, trilinear resliced to the input grid).
+
+## Development
+
+```
+npm install
+npm run dev    # dev server
+npm run build  # production build
+npm test       # playwright end-to-end tests (builds first)
+```
+
+Unit/gate tests (no dev server needed):
+
+```
+node tests/cat-lite.mjs
+node tests/webgl2-probability.mjs
+node tests/webgl2_gate.mjs [chromium|firefox]
+```
+
+<br>
 
 
 ## Updates
