@@ -201,6 +201,13 @@ header {
   color: #fff;
 }
 
+.tb-btn.active,
+.tb-icon-btn.active {
+  background: #3a424c;
+  border-color: #6b7480;
+  color: #fff;
+}
+
 /* Compact icon-only variant */
 .segmented-icons button {
   display: inline-flex;

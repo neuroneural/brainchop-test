@@ -1,6 +1,7 @@
 import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
 import { conform } from "@niivue/nv-ext-image-processing";
 import { mat4 } from "gl-matrix";
+import { shiny } from "@niivue/niivue/assets/matcaps";
 import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
 import { runInferenceWebGpu } from "./inference-webgpu.js";
 import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
@@ -401,6 +402,32 @@ async function main() {
       </div>
     `;
     showModal("About BrainChop", aboutContent);
+  };
+
+  // Matcap lighting for the 3D render. The matcap is always "Shiny"; the button
+  // just toggles how strongly it is applied. Loaded lazily: it fetches a texture
+  // and forces the gradient pass on, neither of which is worth doing for users
+  // who never turn shading on.
+  const shadingBtn = document.getElementById("shadingBtn");
+  let matcapLoaded = false;
+  shadingBtn.onclick = async () => {
+    const on = shadingBtn.classList.toggle("active");
+    shadingBtn.setAttribute("aria-pressed", String(on));
+    if (on && !matcapLoaded) {
+      shadingBtn.disabled = true;
+      try {
+        await nv1.loadMatcap("Shiny");
+        matcapLoaded = true;
+      } catch (e) {
+        console.warn("matcap load failed", e);
+        shadingBtn.classList.remove("active");
+        shadingBtn.setAttribute("aria-pressed", "false");
+        return;
+      } finally {
+        shadingBtn.disabled = false;
+      }
+    }
+    nv1.volumeIllumination = on ? 0.5 : 0;
   };
 
   diagnosticsBtn.onclick = function () {
@@ -1522,7 +1549,10 @@ async function main() {
 
   // WebGL2 is pinned: the raw-GLSL webgl2_runners path and the diagnostics
   // both expect a GL context, and niivue 1.0 would otherwise pick WebGPU.
-  const nv1 = new NiiVue({ backend: "webgl2" });
+  // matcaps must be supplied by name: loadMatcap() looks the name up here and,
+  // on a miss, treats the name itself as a URL -- a silent 404 that leaves the
+  // built-in default matcap in place rather than throwing.
+  const nv1 = new NiiVue({ backend: "webgl2", matcaps: { Shiny: shiny } });
   await nv1.attachTo("gl1");
   // Match the 2D panes (whose surround is the image's black background) so the
   // 3D render tile no longer reads as a lighter gray box.
