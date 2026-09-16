@@ -1,4 +1,4 @@
-import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume } from "@niivue/niivue";
+import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
 import { conform } from "@niivue/nv-ext-image-processing";
 import { mat4 } from "gl-matrix";
 import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
@@ -1447,9 +1447,11 @@ async function main() {
       overlayVolume.colormap = colormap;
     }
     overlayVolume.opacity = Number(opacitySlider1.value);
+    // Build the LUT before adding. nv1.setColormapLabel() would also scan all
+    // 16.7M voxels for label centroids (only the legend reads them, and it is
+    // off) and run a second updateGLVolume over the freshly uploaded volume.
+    if (labelColormap) overlayVolume.colormapLabel = makeLabelLut(labelColormap);
     await nv1.addVolume(overlayVolume);
-    // setColormapLabel moved to the controller (index-based) in niivue 1.0.
-    if (labelColormap) await nv1.setColormapLabel(nv1.volumes.length - 1, labelColormap);
     // Apply after addVolume: Niivue may fire its image-loaded callback while an
     // overlay is added, and that callback handles real underlay replacements.
     applyModelUnderlayOpacity(modelEntry);
