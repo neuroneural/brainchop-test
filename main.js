@@ -275,12 +275,25 @@ async function main() {
   let nativeInputName = "input.nii.gz";
   let crosshairVox = null; // background voxel index at the crosshair, from locationChange
 
-  // --- Drag mode: segmented control (data-drag maps to nv.opts.dragMode) ---
+  // --- Drag mode: segmented control -----------------------------------------
+  // 0.62's `opts.dragMode` governed the RIGHT-button drag; left click and left
+  // drag always moved the crosshair. 1.0 split the buttons into
+  // primaryDragMode (left) and secondaryDragMode (right), and its
+  // setDragMode() sets the secondary one -- so secondaryDragMode IS 0.62's
+  // opts.dragMode, and that is what these buttons set. Measured mode by mode
+  // with driven right-button drags, 0.62 vs 1.0:
+  //   contrast     cal_min/cal_max   ==   cal_min/cal_max
+  //   measurement  (draws a line)    ==   (draws a line)
+  //   pan          pan2Dxyzmm        ==   pan2Dxyzmm
+  //   slicer3D     pan + zoom        ==   pan + zoom
+  // Do NOT point these at primaryDragMode: that puts the tool on the left
+  // button, which is why "Drag to reslice in 3D" started zooming on a plain
+  // left drag and why the app stopped navigating.
   const dragSegmented = document.getElementById("dragSegmented");
   if (dragSegmented) {
     dragSegmented.querySelectorAll("button").forEach((btn) => {
       btn.onclick = () => {
-        nv1.primaryDragMode = parseInt(btn.dataset.drag, 10);
+        nv1.secondaryDragMode = parseInt(btn.dataset.drag, 10);
         dragSegmented.querySelectorAll("button").forEach((b) =>
           b.classList.toggle("active", b === btn));
       };
@@ -1539,10 +1552,29 @@ async function main() {
   // built-in default matcap in place rather than throwing.
   const nv1 = new NiiVue({ backend: "webgl2", matcaps: { Shiny: shiny } });
   await nv1.attachTo("gl1");
+
   // Match the 2D panes (whose surround is the image's black background) so the
   // 3D render tile no longer reads as a lighter gray box.
   nv1.backgroundColor = [0, 0, 0, 1];
   nv1.is3DCrosshairVisible = true;
+  // 1.0 lowered the clip-plane alpha default from 0.62's 0.5 to 0.4, which is
+  // most of why the cut-plane surface reads dimmer. Measured on the same T1,
+  // same plane: mean plane brightness 89.3 (0.62) vs 72.2 (1.0), and
+  // 72.2/89.3 = 0.808 ~= 0.4/0.5. Restore 0.62's value.
+  nv1.clipPlaneColor = [0.7, 0, 0.7, 0.5];
+  // Brightness for the 3D render is NOT gamma. In 1.0 `gamma` rebuilds the
+  // colormap texture, so it also recolours the 2D slices; in 0.62 it applied to
+  // the render alone. Measured on the real cortex label (LUT RGB 205,62,78),
+  // modal pixel of a flat label region in the axial pane:
+  //   gamma        1.0          1.1          1.2           1.3
+  //   0.62    205,62,78    205,62,78    205,62,78     205,62,78   <- 3D only
+  //   1.0     205,62,78    209,71,87    213,78,95   216,86,103    <- 2D too
+  // Raising it desaturates the labels in the slice viewer (HSV saturation
+  // 0.698 -> 0.634 at gamma 1.2) at constant hue, which reads as "the red is
+  // the wrong colour". Render brightness is handled by RENDER_GAIN in
+  // patch-niivue-render.mjs instead: a flat gain on the composited render
+  // preserves hue AND saturation exactly and cannot reach 2D. Leave neutral.
+  nv1.gamma = 1;
   nv1.registerVolumeTransform(conform); // core dropped nv.conform() in 1.0
   nv1.isLegendVisible = false; // 1.0 defaults it on; it costs ~25% of the canvas width
   nv1.addEventListener("locationChange", (e) => handleLocationChange(e.detail));
@@ -1571,11 +1603,12 @@ async function main() {
     try { drawIsolationHUD(); } catch (e) { console.warn("isolation HUD draw failed", e); }
     return r;
   };
-  // 0.62 moved the crosshair on click and ran opts.dragMode on drag. 1.0 has one
-  // mode per button and only DRAG_MODE.crosshair navigates, so left-click must
-  // stay crosshair or the app cannot be navigated; the toolbar overrides it.
-  // (setDragMode() would set the RIGHT button, which the toolbar does not mean.)
+  // Left button: navigate, always. This is what 0.62 did for every toolbar
+  // selection -- its dragMode never touched the left button at all.
   nv1.primaryDragMode = DRAG_MODE.crosshair;
+  // Right button: whatever the toolbar has selected. Matches 0.62's default of
+  // slicer3D (index.html marks that button active).
+  nv1.secondaryDragMode = DRAG_MODE.slicer3D;
   nv1.showRender = SHOW_RENDER.ALWAYS;
   nv1.isYoked3DTo2DZoom = true;
   nv1.crosshairGap = 11;
@@ -1584,7 +1617,7 @@ async function main() {
   {
     const seg = document.getElementById("dragSegmented");
     if (seg) seg.querySelectorAll("button").forEach((b) =>
-      b.classList.toggle("active", parseInt(b.dataset.drag, 10) === nv1.primaryDragMode));
+      b.classList.toggle("active", parseInt(b.dataset.drag, 10) === nv1.secondaryDragMode));
   }
   nv1.volumeIsNearestInterpolation = true;
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
