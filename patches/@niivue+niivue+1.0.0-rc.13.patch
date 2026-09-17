@@ -1,0 +1,67 @@
+diff --git a/node_modules/@niivue/niivue/dist/fetchOmeZarrChunkedSource-D1vpL_cd.js b/node_modules/@niivue/niivue/dist/fetchOmeZarrChunkedSource-D1vpL_cd.js
+index 430ead5..16b52b0 100644
+--- a/node_modules/@niivue/niivue/dist/fetchOmeZarrChunkedSource-D1vpL_cd.js
++++ b/node_modules/@niivue/niivue/dist/fetchOmeZarrChunkedSource-D1vpL_cd.js
+@@ -18308,7 +18308,8 @@ RayResult rayMarchPass(
+                 // product below alpha once it is multiplied in.
+                 rgb = min(rgb * layerShade(tex, samplePos.xyz, shadeAmount), vec3(1.0));
+             }
+-            vec4 premultiplied = vec4(rgb * colorSample.a, colorSample.a);
++            float aC = mip ? colorSample.a : (1.0 - pow(1.0 - colorSample.a, 1.0 / max(rayVoxSampleRate, 1.0))); // PATCH(overlay-stepsize)
++            vec4 premultiplied = vec4(rgb * aC, aC);
+             if (mip) {
+                 result.color = max(result.color, premultiplied);
+             } else {
+@@ -18650,7 +18651,7 @@ void main() {
+           : texture(volume, volCoord);
+         // Before the classification test, so a transparent-enough volume drops
+         // out of the first-hit depth and the AO stencil too, not just the colour.
+-        colorSample.a *= backOpacity;
++        if (chunkedDraw) { colorSample.a *= backOpacity; }
+         if (colorSample.a >= 0.01) {
+           if (!bgHasHit) {
+             bgHasHit = true;
+@@ -18752,6 +18753,8 @@ void main() {
+       }
+     }
+   }
++  // PATCH(mono#187): fade the background by its ACCUMULATED alpha, once.
++  if (!chunkedDraw) { colAcc *= backOpacity; }
+   // --- Optional passes. By default overlays ignore the clip plane (march the
+   // full original ray); when clipPlaneOverlay is set they are clipped with the
+   // base: solid clip keeps [sampleRange.x, sampleRange.y], cutaway skips it. ---
+@@ -18816,6 +18819,7 @@ void main() {
+   }
+   // Cross-fade a streaming chunk in over the coarse floor (premultiplied, so
+   // scaling the whole vec4 fades presence + coverage together). 1.0 = no-op.
++  FragColor.rgb *= 1.1500; // PATCH(render-gain)
+   FragColor = FragColor * fadeAlpha;
+   gl_FragDepth = fragDepth;
+ }
+@@ -19901,7 +19905,7 @@ let v4 = class extends Xe {
+     if (p.use(e), p.uniforms.volume && e.uniform1i(p.uniforms.volume, 0), e.activeTexture(e.TEXTURE1), e.bindTexture(e.TEXTURE_2D, this.matcapTexture), p.uniforms.matcap && e.uniform1i(p.uniforms.matcap, 1), p.uniforms.volumeGradient && e.uniform1i(p.uniforms.volumeGradient, 2), e.activeTexture(e.TEXTURE3), e.bindTexture(
+       e.TEXTURE_3D,
+       this.overlayTexture || this.placeholderOverlay
+-    ), p.uniforms.overlay && e.uniform1i(p.uniforms.overlay, 3), e.activeTexture(e.TEXTURE4), e.bindTexture(e.TEXTURE_3D, this.paqdTexture || this.placeholderOverlay), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MAG_FILTER, e.NEAREST), p.uniforms.paqd && e.uniform1i(p.uniforms.paqd, 4), e.activeTexture(e.TEXTURE5), e.bindTexture(
++    ), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MIN_FILTER, e.LINEAR), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MAG_FILTER, e.LINEAR), /* PATCH(3d-linear overlay) */ p.uniforms.overlay && e.uniform1i(p.uniforms.overlay, 3), e.activeTexture(e.TEXTURE4), e.bindTexture(e.TEXTURE_3D, this.paqdTexture || this.placeholderOverlay), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MAG_FILTER, e.NEAREST), p.uniforms.paqd && e.uniform1i(p.uniforms.paqd, 4), e.activeTexture(e.TEXTURE5), e.bindTexture(
+       e.TEXTURE_3D,
+       this.drawingTexture || this.placeholderOverlay
+     ), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MIN_FILTER, e.NEAREST), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MAG_FILTER, e.NEAREST), p.uniforms.drawing && e.uniform1i(p.uniforms.drawing, 5), !this.drawingLinearSampler) {
+@@ -19925,7 +19929,7 @@ let v4 = class extends Xe {
+       s,
+       this._activeChunked,
+       !1
+-    ) : (e.activeTexture(e.TEXTURE0), e.bindTexture(e.TEXTURE_3D, this.volumeTexture), e.activeTexture(e.TEXTURE2), e.bindTexture(
++    ) : (e.activeTexture(e.TEXTURE0), e.bindTexture(e.TEXTURE_3D, this.volumeTexture), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MIN_FILTER, e.LINEAR), e.texParameteri(e.TEXTURE_3D, e.TEXTURE_MAG_FILTER, e.LINEAR), /* PATCH(3d-linear volume) */ e.activeTexture(e.TEXTURE2), e.bindTexture(
+       e.TEXTURE_3D,
+       this.volumeGradientTexture || this.placeholderOverlay
+     ), this._setChunkUniforms(e, p, {
+@@ -37918,7 +37922,7 @@ function ev(t) {
+     const a = t.view?.hitTest(r, s);
+     if (!a) return;
+     if (!a.isRender) {
+-      if (t.model.interaction.primaryDragMode === we.pan || t.model.interaction.primaryDragMode === we.slicer3D || t.model.interaction.secondaryDragMode === we.pan || t.model.interaction.secondaryDragMode === we.slicer3D) {
++      if (/* PATCH(wheel-pan-only) */ t.model.interaction.primaryDragMode === we.pan || t.model.interaction.secondaryDragMode === we.pan) {
+         const f = n.deltaY < 0 ? 1 : -1, m = Q_(
+           t.model.scene.pan2Dxyzmm[3],
+           f
