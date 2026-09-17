@@ -1,4 +1,7 @@
-import { Niivue } from "@niivue/niivue";
+import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
+import { conform } from "@niivue/nv-ext-image-processing";
+import { mat4 } from "gl-matrix";
+import { shiny } from "@niivue/niivue/assets/matcaps";
 import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
 import { runInferenceWebGpu } from "./inference-webgpu.js";
 import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
@@ -6,6 +9,39 @@ import { localSystemDetails } from "./brainchop-diagnostics.js";
 import MyWorker from "./brainchop-webworker.js?worker";
 import { installResponsiveLayout } from "./responsive-layout.js";
 import { installTouchViewControls } from "./touch-view.js";
+
+// niivue 1.0 dropped NVImage's methods (clone/saveToDisk/getValue); these
+// replace the three we used. hdr keeps its prototype so the writers can use it.
+function cloneVolume(src, img = src.img.slice(), name = src.name) {
+  const hdr = Object.assign(Object.create(Object.getPrototypeOf(src.hdr)), src.hdr);
+  const vol = nii2volume(hdr, img, name);
+  vol.id = crypto.randomUUID();  // nii2volume defaults id to name; overlays must stay distinct
+  return vol;
+}
+
+// Niivue addresses voxels in RAS order (locationChange.vox, the drawing
+// bitmap); NVImage.img is in the file's own storage order, and the conformed
+// volume is deliberately not RAS (permRAS [-1, 3, -2]). Mirrors niivue's own
+// getVoxelValue.
+function rasToNativeIndex(vol, [rx, ry, rz]) {
+  const d = vol.dimsRAS, start = vol.img2RASstart, step = vol.img2RASstep;
+  if (!d || !start || !step) return null;
+  if (rx < 0 || rx >= d[1] || ry < 0 || ry >= d[2] || rz < 0 || rz >= d[3]) return null;
+  return start[0] + rx * step[0] + start[1] + ry * step[1] + start[2] + rz * step[2];
+}
+
+async function downloadVolume(vol, filename) {
+  // writeVolume appends the buffer verbatim, so hand it exactly this view.
+  const img = vol.img;
+  const bytes = await writeVolume(filename, vol.hdr,
+    img.buffer.byteLength === img.byteLength
+      ? img.buffer
+      : img.buffer.slice(img.byteOffset, img.byteOffset + img.byteLength));
+  const url = URL.createObjectURL(new Blob([bytes]));
+  const a = Object.assign(document.createElement("a"), { href: url, download: filename });
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 // --- Backend State ---
 let gpuDevice = null;
@@ -231,20 +267,20 @@ async function main() {
   let isolatedLabel = null;    // label value shown alone, or null = show all
   let originalSegImg = null;   // pristine label voxels, for restore + stats
   let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
-  const HUD_TEXT_SCALE = 0.9;  // relative to niivue fontPx
   let nativeInputNV = null;    // volume as loaded (native grid), before conform
   // CAT-lite temporarily dims the T1 so a neutral-gray probability map remains
   // readable. Preserve the user's slider value and restore it when leaving the
   // probability view; never force ordinary segmentations to 100%.
   let probabilityUnderlayRestoreValue = null;
   let nativeInputName = "input.nii.gz";
+  let crosshairVox = null; // background voxel index at the crosshair, from locationChange
 
   // --- Drag mode: segmented control (data-drag maps to nv.opts.dragMode) ---
   const dragSegmented = document.getElementById("dragSegmented");
   if (dragSegmented) {
     dragSegmented.querySelectorAll("button").forEach((btn) => {
       btn.onclick = () => {
-        nv1.opts.dragMode = parseInt(btn.dataset.drag, 10);
+        nv1.primaryDragMode = parseInt(btn.dataset.drag, 10);
         dragSegmented.querySelectorAll("button").forEach((b) =>
           b.classList.toggle("active", b === btn));
       };
@@ -264,8 +300,13 @@ async function main() {
   }
 
   function setPen(mode) {
-    nv1.setDrawingEnabled(mode >= 0);
-    if (mode >= 0) nv1.setPenValue(mode & 7, mode > 7);
+    nv1.drawIsEnabled = mode >= 0;
+    if (mode >= 0) {
+      // 1.0's drawIsEnabled only flips the flag; the bitmap is ours to create.
+      if (!nv1.drawingVolume && nv1.volumes.length) nv1.createEmptyDrawing();
+      nv1.drawPenValue = mode & 7;
+      nv1.drawPenFilled = mode > 7;
+    }
     if (penRow) penRow.querySelectorAll(".chip").forEach((b) =>
       b.classList.toggle("active", parseInt(b.dataset.pen, 10) === mode));
   }
@@ -279,7 +320,8 @@ async function main() {
       nv1.drawUndo();
       return;
     }
-    if (!nv1.drawBitmap) {
+    const draw = nv1.drawingVolume?.img;
+    if (!draw) {
       window.alert("Nothing drawn yet — pick a pen and draw on the image first.");
       return;
     }
@@ -288,18 +330,22 @@ async function main() {
       window.alert("Drawing edits label segmentations, not probability maps.");
       return;
     }
-    const draw = await nv1.saveImage({ filename: "", isSaveDrawing: true });
-    const niiHdrBytes = 352;
-    const nvox = img.length;
-    if (mode === 1) { // append
-      for (let i = 0; i < nvox; i++) if (draw[niiHdrBytes + i] > 0) img[i] = 1;
+    // The drawing bitmap is indexed in RAS order, the overlay in storage order.
+    const ov = nv1.volumes[1];
+    const d = ov.dimsRAS;
+    if (!d || draw.length !== d[1] * d[2] * d[3]) {
+      window.alert("The drawing does not match the current image — redraw it.");
+      return;
     }
-    if (mode === 2) { // remove
-      for (let i = 0; i < nvox; i++) if (draw[niiHdrBytes + i] > 0) img[i] = 0;
-    }
+    const value = mode === 1 ? 1 : 0;
+    let r = 0;
+    for (let rz = 0; rz < d[3]; rz++)
+      for (let ry = 0; ry < d[2]; ry++)
+        for (let rx = 0; rx < d[1]; rx++, r++)
+          if (draw[r] > 0) img[rasToNativeIndex(ov, [rx, ry, rz])] = value;
     nv1.closeDrawing();
-    nv1.updateGLVolume();
-    nv1.setDrawingEnabled(false);
+    await nv1.updateGLVolume();
+    nv1.drawIsEnabled = false;
     setPen(-1);
   }
 
@@ -358,6 +404,17 @@ async function main() {
     showModal("About BrainChop", aboutContent);
   };
 
+  // Matcap lighting for the 3D render. The matcap itself is fixed: the NiiVue
+  // constructor auto-applies the first entry of opts.matcaps, so calling
+  // loadMatcap() here would only re-assign the same URL and pay a full
+  // updateGLVolume for it. The button just scales how strongly it is applied.
+  const shadingBtn = document.getElementById("shadingBtn");
+  shadingBtn.onclick = () => {
+    const on = shadingBtn.classList.toggle("active");
+    shadingBtn.setAttribute("aria-pressed", String(on));
+    nv1.volumeIllumination = on ? 0.5 : 0;
+  };
+
   diagnosticsBtn.onclick = function () {
     let msg = diagnosticsString;
 
@@ -372,11 +429,6 @@ async function main() {
 
       // Add browser info
       msg += `User Agent: ${navigator.userAgent}\n`;
-    }
-
-    // If no inference run yet, show startup diagnostics
-    if (msg.length < 1 && window.webgpuDiagnostics) {
-      // ... (existing logic to build msg)
     }
 
     if (msg.length < 1) {
@@ -403,20 +455,15 @@ async function main() {
     });
   };
 
-  opacitySlider0.oninput = function () {
-    nv1.setOpacity(0, opacitySlider0.value / 255);
+  // updateGLVolume already coalesces: one call in flight, newest pending value
+  // re-runs on completion. A drag never queues a backlog of stale redraws.
+  opacitySlider0.oninput = () => {
+    nv1.volumes[0].opacity = Number(opacitySlider0.value);
     nv1.updateGLVolume();
   };
-
-  // One redraw per frame: updateGLVolume rebuilds every self-modulated
-  // overlay on the CPU (3 × 256³ for CAT-lite), so input events must not queue.
-  let overlayOpacityFrame = 0;
-  opacitySlider1.oninput = function () {
-    cancelAnimationFrame(overlayOpacityFrame);
-    overlayOpacityFrame = requestAnimationFrame(() => {
-      for (const overlay of nv1.volumes.slice(1)) overlay.opacity = opacitySlider1.value / 255;
-      nv1.updateGLVolume();
-    });
+  opacitySlider1.oninput = () => {
+    for (const overlay of nv1.volumes.slice(1)) overlay.opacity = Number(opacitySlider1.value);
+    nv1.updateGLVolume();
   };
 
   function applyModelUnderlayOpacity(modelEntry = null) {
@@ -425,7 +472,7 @@ async function main() {
       if (probabilityUnderlayRestoreValue === null) {
         probabilityUnderlayRestoreValue = opacitySlider0.value;
       }
-      opacitySlider0.value = Math.round(underlayOpacity * 255);
+      opacitySlider0.value = underlayOpacity;
       opacitySlider0.oninput();
     } else if (probabilityUnderlayRestoreValue !== null) {
       opacitySlider0.value = probabilityUnderlayRestoreValue;
@@ -447,18 +494,17 @@ async function main() {
       isConformed = false;
     }
     if (isConformed) return;
-    const nii2 = await nv1.conform(nii, false);
+    const nii2 = await nv1.volumeTransform.conform(nii, { toRAS: false });
     const [nativeNV, nativeName] = [nativeInputNV, nativeInputName];
-    await nv1.removeVolume(nv1.volumes[0]);
+    await nv1.removeVolume(0);
     await nv1.addVolume(nii2);
     // addVolume re-ran doLoadImage with the conformed copy; keep the native grid for export.
     [nativeInputNV, nativeInputName] = [nativeNV, nativeName];
   }
 
   async function closeAllOverlays() {
-    // Remove from the end so remaining overlays' modulationImage indices stay valid.
     while (nv1.volumes.length > 1) {
-      await nv1.removeVolume(nv1.volumes.at(-1));
+      await nv1.removeVolume(nv1.volumes.length - 1);
     }
   }
 
@@ -527,43 +573,43 @@ async function main() {
     return { lines, color };
   }
 
-  // Draw the isolated-region readout as fixed screen-space text in the empty
-  // top-left corner of the 3D render tile. Because it's drawn per-frame in
-  // canvas coordinates (not anchored in the scene), it stays put while the head
-  // rotates. niivue's drawText is single-line, so we lay out the lines by hand.
+  // Isolated-region readout, pinned to the top-left of the 3D render tile.
+  // niivue 1.0 has no text API (drawText/drawSceneCore are gone; the overlay
+  // hook is raw GL/WebGPU), so this is a plain DOM layer over the canvas.
+  let hudEl = null;
   function drawIsolationHUD() {
-    if (isolatedLabel === null || !isolationStats || !segOverlay()) return;
-    const tile = nv1.screenSlices && nv1.screenSlices.find((s) => s.axCorSag === 4 /* RENDER */);
-    if (!tile) return;
-    const [L, T] = tile.leftTopWidthHeight; // canvas px, top-left origin
-    const gl = nv1.gl;
-    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-    gl.enable(gl.BLEND);
-    const size = nv1.fontPx * HUD_TEXT_SCALE;
-    const lineH = size * 1.55;
-    const pad = nv1.fontPx * 0.6;
-    const x = L + pad;
-    const y = T + pad;
-    const white = [0.92, 0.92, 0.92, 1];
-    const { lines, color } = isolationStats;
-    nv1.drawText([x, y], lines[0], HUD_TEXT_SCALE, color);
-    for (let i = 1; i < lines.length; i++) {
-      nv1.drawText([x, y + i * lineH], lines[i], HUD_TEXT_SCALE, white);
+    if (!hudEl) {
+      hudEl = document.createElement("div");
+      hudEl.style.cssText =
+        "position:absolute;pointer-events:none;font:13px/1.55 system-ui,sans-serif;" +
+        "text-shadow:0 1px 2px #000;white-space:pre;color:#ebebeb";
+      nv1.canvas.parentElement.appendChild(hudEl);
     }
+    const tile = nv1.view?.screenSlices?.find((s) => s.axCorSag === 4 /* RENDER */);
+    if (isolatedLabel === null || !isolationStats || !segOverlay() || !tile) {
+      hudEl.hidden = true;
+      return;
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const [L, T] = tile.leftTopWidthHeight; // device px, top-left origin
+    Object.assign(hudEl.style, { left: `${L / dpr + 8}px`, top: `${T / dpr + 8}px` });
+    const { lines, color } = isolationStats;
+    const rgb = color.slice(0, 3).map((c) => Math.round(c * 255)).join(",");
+    hudEl.innerHTML =
+      `<span style="color:rgb(${rgb})">${escapeHtml(lines[0])}</span>\n`
+      + lines.slice(1).map(escapeHtml).join("\n");
+    hudEl.hidden = false;
   }
 
   // True (pristine) label under the crosshair, even while a region is isolated,
   // so Alt-clicking a different region switches straight to it.
   function labelUnderCursor() {
     const ov = segOverlay();
-    if (!ov) return null;
-    const mm = nv1.frac2mm(nv1.scene.crosshairPos, 0, true);
-    const vox = ov.mm2vox(mm);
-    const cur = ov.img;
-    if (originalSegImg) ov.img = originalSegImg;
-    const v = Math.round(ov.getValue(vox[0], vox[1], vox[2], ov.frame4D));
-    ov.img = cur;
-    return v;
+    if (!ov || !crosshairVox) return null;
+    const idx = rasToNativeIndex(ov, crosshairVox);
+    if (idx === null) return null;
+    const v = (originalSegImg || ov.img)[idx];
+    return v === undefined ? null : Math.round(v * ov.hdr.scl_slope + ov.hdr.scl_inter);
   }
 
   // Toggle isolation of a specific label value. Background (0) or the already
@@ -816,7 +862,7 @@ async function main() {
     const overlays = nv1.volumes.slice(1);
     // Serial: three concurrent 256³ gzips compete for memory.
     await withPristineLabels(async () => {
-      for (const overlay of overlays) await overlay.saveToDisk(overlayFilename(overlay, overlays.length, ""));
+      for (const overlay of overlays) await downloadVolume(overlay, overlayFilename(overlay, overlays.length, ""));
     });
   }
 
@@ -827,7 +873,7 @@ async function main() {
 
   function saveConformedInput() {
     if (nv1.volumes.length < 1) { window.alert("No image loaded."); return; }
-    nv1.volumes[0].saveToDisk("conformed_input.nii.gz");
+    downloadVolume(nv1.volumes[0], "conformed_input.nii.gz");
   }
 
   async function saveScene() {
@@ -849,7 +895,7 @@ async function main() {
       const overlays = nv1.volumes.slice(1);
       for (const overlay of overlays) {
         const outNV = withPristineLabels(() => resliceLabelsToNative(overlay));
-        await outNV.saveToDisk(overlayFilename(overlay, overlays.length, "_native"));
+        await downloadVolume(outNV, overlayFilename(overlay, overlays.length, "_native"));
       }
       callbackUI("Saved native-space segmentation.", 1);
     } catch (e) {
@@ -867,10 +913,10 @@ async function main() {
   // keeping the native datatype and NOT tagged as a label — it's an image.
   // For a Float32 probability map (CAT-lite): trilinear, uint8 with scl_slope 1/255.
   //
-  // The native→conformed voxel map is built by probing niivue's own verified
-  // transforms at four basis points (origin + unit steps), so it is correct for
-  // any orientation without us re-deriving affine conventions. Validated: when
-  // the two grids are identical the map is the identity.
+  // The native→conformed voxel map is built by probing both grids' own affines
+  // at four basis points (origin + unit steps), so it is correct for any
+  // orientation without us re-deriving affine conventions. Validated: when the
+  // two grids are identical the map is the identity.
   function resliceLabelsToNative(seg) {
     const labels = seg.img;                    // pristine labels (see withPristineLabels)
     const A = nativeInputNV.hdr.affine;        // native storage-voxel -> mm (row-major 4x4)
@@ -882,17 +928,22 @@ async function main() {
       a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2] + a[1][3],
       a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2] + a[2][3],
     ];
-    const applyGL = (m, v) => [ // gl-matrix mat4 is column-major
-      m[0] * v[0] + m[4] * v[1] + m[8] * v[2] + m[12],
-      m[1] * v[0] + m[5] * v[1] + m[9] * v[2] + m[13],
-      m[2] * v[0] + m[6] * v[1] + m[10] * v[2] + m[14],
+    // mm -> conformed storage voxel. niivue 1.0's NVImage has no mm2vox, so
+    // invert the overlay's own storage-voxel -> mm affine instead.
+    const segInv = mat4.create();
+    if (!mat4.invert(segInv, mat4.fromValues(...seg.hdr.affine[0], ...seg.hdr.affine[1],
+                                             ...seg.hdr.affine[2], ...seg.hdr.affine[3]))) {
+      throw new Error("Segmentation affine is not invertible");
+    }
+    // gl-matrix is column-major, and fromValues consumed the rows in order, so
+    // segInv is the inverse's transpose — read it back the same way.
+    const applyInv = (m, v) => [
+      m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3],
+      m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7],
+      m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11],
     ];
     // native storage voxel -> conformed storage voxel (fractional)
-    const f = (v) => {
-      const mm = applyAffine(A, v);
-      const ras = seg.mm2vox([mm[0], mm[1], mm[2]], true); // mm -> conformed RAS voxel
-      return applyGL(seg.toRASvox, [ras[0], ras[1], ras[2]]); // RAS -> storage voxel
-    };
+    const f = (v) => applyInv(segInv, applyAffine(A, v));
     const o = f([0, 0, 0]);
     const ex = f([1, 0, 0]).map((x, i) => x - o[i]);
     const ey = f([0, 1, 0]).map((x, i) => x - o[i]);
@@ -903,7 +954,7 @@ async function main() {
     // overlays carry a colormapLabel; intensity ones use a plain colormap.
     const isLabel = !!seg.colormapLabel;
     const nvox = nx * ny * nz;
-    const outNV = nativeInputNV.clone();
+    const outNV = cloneVolume(nativeInputNV);
     const sample = (x, y, z) =>
       (x >= 0 && x < snx && y >= 0 && y < sny && z >= 0 && z < snz)
         ? labels[x + y * snx + z * snx * sny] : 0;
@@ -1119,7 +1170,6 @@ async function main() {
     URL.revokeObjectURL(url);
   }
 
-  const escHtml = (s) => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const fmtCm3 = (mm3) => { const v = mm3 / 1000; return v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1); };
 
   function buildStatsPanelHtml(rows, totalMm3) {
@@ -1141,7 +1191,7 @@ async function main() {
       body += `
         <div class="stat-row" role="button" tabindex="0" data-label="${r.label}" style="cursor:pointer">
           <div class="stat-line">
-            <span class="stat-name">${escHtml(r.name)}</span>
+            <span class="stat-name">${escapeHtml(r.name)}</span>
             <span class="stat-track">${bar}</span>
             ${val}
             <button type="button" class="stat-iso" title="Show only this region in the viewer">isolate</button>
@@ -1314,9 +1364,10 @@ async function main() {
   }
 
   async function addProbabilityOverlay(img, modelEntry, tissue) {
-    const overlayVolume = await nv1.volumes[0].clone();
-    if (tissue) overlayVolume.name = tissue.name;
-    overlayVolume.img = img instanceof Float32Array ? img : Float32Array.from(img);
+    const overlayVolume = cloneVolume(
+      nv1.volumes[0],
+      img instanceof Float32Array ? img : Float32Array.from(img),
+      tissue?.name ?? nv1.volumes[0].name);
     Object.assign(overlayVolume.hdr, {
       scl_inter: 0,
       scl_slope: 1,
@@ -1326,18 +1377,12 @@ async function main() {
       cal_max: 1,
       intent_code: 1001,      // NIFTI_INTENT_ESTIMATE, not a categorical LABEL
     });
-    // clone() calibrated the original image before we replaced its pixels.
-    // Refresh NVImage's object-level range as well as the NIfTI header: 2D
-    // slices happened to use the new pixels, while volume rendering retained
-    // the cloned range until save/reload constructed a fresh NVImage.
-    overlayVolume.trustCalMinMax = true;
-    overlayVolume.calMinMax();
     const probabilityDisplayMin = modelEntry.probabilityDisplayMin ?? 0.005;
     Object.assign(overlayVolume, {
-      cal_min: probabilityDisplayMin,
-      cal_max: 1,
-      robust_min: probabilityDisplayMin,
-      robust_max: 1,
+      calMin: probabilityDisplayMin,
+      calMax: 1,
+      robustMin: probabilityDisplayMin,
+      robustMax: 1,
       // ZERO_TO_MAX_TRANSPARENT_BELOW_MIN. This is essential for 3D: the
       // overlay shader otherwise rounds every tiny positive alpha to opaque.
       colormapType: 1,
@@ -1348,7 +1393,7 @@ async function main() {
     const { probabilityOverlayAlpha: alpha = 96, probabilityOverlayFloor: floor = 192 } = modelEntry;
     const tint = tissue?.tint || [255, 255, 255];
     const colormap = `probability-light-${tint.join('-')}-${floor}-${alpha}`;
-    if (!nv1.colormaps().includes(colormap)) {
+    if (!nv1.hasColormap(colormap)) {
       const [lowR, lowG, lowB] = tint.map((c) => Math.round(c * floor / 255));
       nv1.addColormap(colormap, {
         R: [lowR, tint[0]], G: [lowG, tint[1]], B: [lowB, tint[2]],
@@ -1356,14 +1401,13 @@ async function main() {
       });
     }
     overlayVolume.colormap = colormap;
-    // Niivue normally rounds any nonzero overlay alpha up to opaque. Use the
-    // probability volume itself as an alpha modulator so zero is genuinely
-    // transparent and intermediate probabilities reveal the T1 underneath.
-    // Each overlay modulates itself: addVolume appends it at this index.
-    overlayVolume.modulationImage = nv1.volumes.length;
-    overlayVolume.modulateAlpha = 1;
-    overlayVolume.opacity = opacitySlider1.value / 255;
+    overlayVolume.opacity = Number(opacitySlider1.value);
     await nv1.addVolume(overlayVolume);
+    // Niivue rounds any nonzero overlay alpha up to opaque. Modulating the
+    // overlay by itself makes zero genuinely transparent and lets intermediate
+    // probabilities reveal the T1 underneath. Ids (not indices) since 1.0, so
+    // this survives overlays being removed in any order.
+    await nv1.setModulationImage(overlayVolume.id, overlayVolume.id, 1);
   }
 
   async function callbackImg(img, opts, modelEntry) {
@@ -1380,10 +1424,10 @@ async function main() {
       applyModelUnderlayOpacity(modelEntry);
       return;
     }
-    const overlayVolume = await nv1.volumes[0].clone();
-    overlayVolume.zeroImage();
+    let labelColormap = null;
+    const overlayVolume = cloneVolume(
+      nv1.volumes[0], img instanceof Uint8Array ? img : new Uint8Array(img.buffer));
     Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
-    overlayVolume.img = img instanceof Uint8Array ? img : new Uint8Array(img.buffer);
     if (modelEntry.type === 'Brain_Masking') {
       const newLabels = ["Background", "Brain Mask"];
       lastSegLabelNames = newLabels.slice();
@@ -1391,7 +1435,7 @@ async function main() {
       const newG = [0, 119];
       const newB = [0, 33];
       lastSegColors = { R: newR, G: newG, B: newB };
-      overlayVolume.setColormapLabel({ R: newR, G: newG, B: newB, labels: newLabels });
+      labelColormap = { R: newR, G: newG, B: newB, labels: newLabels };
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
     } else if (modelEntry.colormapPath) {
       const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
@@ -1401,7 +1445,7 @@ async function main() {
       const pd = nv1.volumes[0].hdr.pixDims || [];
       const voxelVolMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
       const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"], voxelVolMm3);
-      overlayVolume.setColormapLabel({ R: cmap["R"], G: cmap["G"], B: cmap["B"], labels: newLabels });
+      labelColormap = { R: cmap["R"], G: cmap["G"], B: cmap["B"], labels: newLabels };
       overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
     } else {
       let colormap = opts.atlasSelectedColorTable.toLowerCase();
@@ -1411,10 +1455,14 @@ async function main() {
         colormap = 'copper2';
       }
 
-      if (!nv1.colormaps().includes(colormap)) colormap = "actc";
+      if (!nv1.hasColormap(colormap)) colormap = "actc";
       overlayVolume.colormap = colormap;
     }
-    overlayVolume.opacity = opacitySlider1.value / 255;
+    overlayVolume.opacity = Number(opacitySlider1.value);
+    // Build the LUT before adding. nv1.setColormapLabel() would also scan all
+    // 16.7M voxels for label centroids (only the legend reads them, and it is
+    // off) and run a second updateGLVolume over the freshly uploaded volume.
+    if (labelColormap) overlayVolume.colormapLabel = makeLabelLut(labelColormap);
     await nv1.addVolume(overlayVolume);
     // Apply after addVolume: Niivue may fire its image-loaded callback while an
     // overlay is added, and that callback handles real underlay replacements.
@@ -1438,7 +1486,7 @@ async function main() {
         return;
       }
     }
-    statData = await localSystemDetails(statData, nv1.gl);
+    statData = await localSystemDetails(statData, nv1.view?.gl);
     diagnosticsString = ":: Diagnostics https://github.com/neuroneural/brainchop/issues ::\n";
     for (const key in statData) {
       if (statData[key] !== null && statData[key] !== undefined) {
@@ -1475,26 +1523,31 @@ async function main() {
   }
 
   function handleLocationChange(data) {
+    crosshairVox = data.vox;
     document.getElementById("location").innerHTML = data.string
       .split("   ")
       .map((value) => value.trim())
       .filter((value) => value !== "")
-      .map((value) => `<span class="loc-seg">${value}</span>`)
+      .map((value) => `<span class="loc-seg">${escapeHtml(value)}</span>`)
       .join('<span class="loc-sep">&middot;</span>');
   }
 
-  const defaults = {
-    // Match the 2D panes (whose surround is the image's black background) so the
-    // 3D render tile no longer reads as a lighter gray box.
-    backColor: [0, 0, 0, 1],
-    show3Dcrosshair: true,
-    onLocationChange: handleLocationChange,
-  };
-
-  const nv1 = new Niivue(defaults);
+  // WebGL2 is pinned: the raw-GLSL webgl2_runners path and the diagnostics
+  // both expect a GL context, and niivue 1.0 would otherwise pick WebGPU.
+  // matcaps must be supplied by name: loadMatcap() looks the name up here and,
+  // on a miss, treats the name itself as a URL -- a silent 404 that leaves the
+  // built-in default matcap in place rather than throwing.
+  const nv1 = new NiiVue({ backend: "webgl2", matcaps: { Shiny: shiny } });
   await nv1.attachTo("gl1");
+  // Match the 2D panes (whose surround is the image's black background) so the
+  // 3D render tile no longer reads as a lighter gray box.
+  nv1.backgroundColor = [0, 0, 0, 1];
+  nv1.is3DCrosshairVisible = true;
+  nv1.registerVolumeTransform(conform); // core dropped nv.conform() in 1.0
+  nv1.isLegendVisible = false; // 1.0 defaults it on; it costs ~25% of the canvas width
+  nv1.addEventListener("locationChange", (e) => handleLocationChange(e.detail));
   // Alt/Option-click a region to isolate it (see handleIsolateClick).
-  nv1.gl.canvas.addEventListener("click", handleIsolateClick);
+  nv1.canvas.addEventListener("click", handleIsolateClick);
 
   // Esc restores the full segmentation (unless a dialog is open — let it close).
   window.addEventListener("keydown", (e) => {
@@ -1509,52 +1562,31 @@ async function main() {
   // nearest sampling makes big opaque regions (e.g. white matter) accumulate
   // into a flat, noisy "glow" with the folds washed out. LINEAR gives the soft
   // shading that reveals surface structure. 2D panels stay crisp via
-  // setInterpolation(true).
+  // volumeIsNearestInterpolation.
 
-  // Crisp isolation. niivue's atlas shader anti-aliases label edges with a
-  // 7-tap alpha feather (uniform xyzaFrac.xyz = 1/dims). With the full
-  // segmentation every voxel is a label, so the feather is invisible — but an
-  // isolated region borders background (0), and the feather softens that edge,
-  // making the isolated region look blurry/"interpolated" in 2D even though the
-  // texture filter is nearest (the feather is baked into the overlay texture
-  // that both 2D and 3D sample). While a region is isolated we zero the feather
-  // offsets for the atlas shaders so edges stay hard, matching the full-seg
-  // look; the outline component (xyzaFrac.a) is preserved. Passes through
-  // untouched when not isolating, so the full segmentation is unchanged.
-  const _origUniform4fv = nv1.gl.uniform4fv.bind(nv1.gl);
-  nv1.gl.uniform4fv = function (loc, v) {
-    if (isolatedLabel !== null) {
-      const aU = nv1.orientShaderAtlasU && nv1.orientShaderAtlasU.uniforms.xyzaFrac;
-      const aI = nv1.orientShaderAtlasI && nv1.orientShaderAtlasI.uniforms.xyzaFrac;
-      if ((aU && loc === aU) || (aI && loc === aI)) {
-        return _origUniform4fv(loc, [0, 0, 0, v[3]]);
-      }
-    }
-    return _origUniform4fv(loc, v);
-  };
-
-  // Draw the isolated-region readout at the end of every frame (screen-space,
-  // so it doesn't rotate with the 3D head).
-  const _origDrawSceneCore = nv1.drawSceneCore.bind(nv1);
-  nv1.drawSceneCore = function () {
-    const s = _origDrawSceneCore();
+  // Keep the DOM readout pinned to the render tile as the layout moves.
+  const _origDrawScene = nv1.drawScene.bind(nv1);
+  nv1.drawScene = function (needsSync) {
+    const r = _origDrawScene(needsSync);
     try { drawIsolationHUD(); } catch (e) { console.warn("isolation HUD draw failed", e); }
-    return s;
+    return r;
   };
-  Object.assign(nv1.opts, {
-    dragMode: nv1.dragModes.slicer3D,
-    multiplanarForceRender: true,
-    yoke3Dto2DZoom: true,
-    crosshairGap: 11,
-  });
+  // 0.62 moved the crosshair on click and ran opts.dragMode on drag. 1.0 has one
+  // mode per button and only DRAG_MODE.crosshair navigates, so left-click must
+  // stay crosshair or the app cannot be navigated; the toolbar overrides it.
+  // (setDragMode() would set the RIGHT button, which the toolbar does not mean.)
+  nv1.primaryDragMode = DRAG_MODE.crosshair;
+  nv1.showRender = SHOW_RENDER.ALWAYS;
+  nv1.isYoked3DTo2DZoom = true;
+  nv1.crosshairGap = 11;
   // Reflect the actual initial drag mode in the segmented control, so the
   // highlight always matches nv.opts.dragMode regardless of the HTML default.
   {
     const seg = document.getElementById("dragSegmented");
     if (seg) seg.querySelectorAll("button").forEach((b) =>
-      b.classList.toggle("active", parseInt(b.dataset.drag, 10) === nv1.opts.dragMode));
+      b.classList.toggle("active", parseInt(b.dataset.drag, 10) === nv1.primaryDragMode));
   }
-  nv1.setInterpolation(true);
+  nv1.volumeIsNearestInterpolation = true;
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
 
   // Clear loading placeholder
@@ -1581,11 +1613,10 @@ async function main() {
 
     modelSelect.appendChild(option);
   }
-  nv1.onImageLoaded = doLoadImage;
+  nv1.addEventListener("volumeLoaded", doLoadImage);
   doLoadImage(); // the default volume loaded before the hook existed; capture its native grid
-  // Phone/desktop layout: pick the multiplanar tiling that actually maximizes
-  // pane size, and offer single-plane views on narrow screens. Installed after
-  // onImageLoaded so it can chain onto it. See responsive-layout.js.
+  // Phone/desktop layout: single-plane views on narrow screens. 1.0 picks the
+  // multiplanar tiling itself, so the old scoring override is gone.
   installResponsiveLayout(nv1);
   // Pinch guards: keep two-finger gestures zooming the image, not the document.
   installTouchViewControls(nv1);

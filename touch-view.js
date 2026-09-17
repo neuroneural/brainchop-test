@@ -7,20 +7,17 @@
 //    `touch-action` and the viewport meta allows user scaling, so a two-finger
 //    pinch scaled the whole app -- toolbar, canvas and status bar together --
 //    and no in-app control can undo that, which is why only a reload helped.
-//    (niivue's own 2D zoom bottoms out at 0.5x and recovers on the way back in,
-//    so it was never the cause of a "microscopic, stuck" view.) We now block
-//    document scaling: `touch-action` in CSS for Chromium/modern Safari, plus
-//    gesture* preventDefault for older iOS Safari which ignores it.
+//    niivue sets `touch-action: none` on its own canvas, but not on the rest of
+//    the page. We block document scaling: `touch-action` in CSS for
+//    Chromium/modern Safari, plus gesture* preventDefault for older iOS Safari
+//    which ignores it.
 //
-// 2. niivue's pinch handler is not proportional. Every touchmove event with two
-//    fingers applies a fixed +-10% step (sliceScroll2D(+-0.01) -> zoom * 1.1 or
-//    0.9, rounded to one decimal), so zoom depends on how many move events the
-//    OS delivered rather than on how far the fingers travelled -- and the
-//    rounding makes small zooms sticky. It also only zooms while the drag mode
-//    happens to be Pan/zoom; in any other mode a pinch scrolls slices instead,
-//    which is not what a pinch means on a phone. We replace it with a zoom
-//    driven by the distance ratio since the gesture started, clamped, anchored
-//    on the crosshair the same way niivue anchors its own zoom.
+// 2. niivue 1.0 drives all interaction from pointer events and has no notion of
+//    a gesture, so a two-finger pinch is just a second drag: it scrubs the
+//    crosshair (or windows the image) and never zooms. We keep touch pointer
+//    events away from its canvas listeners while two fingers are down, and zoom
+//    from the distance ratio since the gesture started, clamped, anchored on the
+//    crosshair the same way niivue anchors its own wheel zoom.
 
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 8;
@@ -35,10 +32,9 @@ const touchDistance = (t) =>
  * guards below.
  */
 export function resetView(nv) {
-  if (nv?.scene) {
-    nv.scene.pan2Dxyzmm = [0, 0, 0, 1];
-    nv.scene.volScaleMultiplier = 1;
-    nv.drawScene();
+  if (nv) {
+    nv.pan2Dxyzmm = Float32Array.from([0, 0, 0, 1]);
+    nv.scaleMultiplier = 1; // setter redraws
   }
   unzoomDocument();
 }
@@ -76,59 +72,81 @@ function blockDocumentPinchZoom() {
   );
 }
 
+/**
+ * Stop niivue seeing the pinch as a drag. Capture phase on window runs before
+ * its canvas listeners, so the second finger never starts a second drag.
+ * pointerup is let through, so a drag interrupted by the second finger ends as a
+ * zero-length one instead of leaving niivue mid-drag.
+ */
+function hideMultiTouchFromNiivue(canvas) {
+  const fingers = new Set();
+  const swallow = (e) => { if (fingers.size > 1) e.stopPropagation(); };
+  const forget = (e) => fingers.delete(e.pointerId);
+  window.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "touch" && e.target === canvas) fingers.add(e.pointerId);
+    swallow(e);
+  }, true);
+  window.addEventListener("pointermove", swallow, true);
+  window.addEventListener("pointerup", forget, true);
+  window.addEventListener("pointercancel", forget, true);
+}
+
+// niivue's 2D zoom holds a mm anchor by rescaling the pan about the extent
+// centre (NVTransforms.zoomPan2DAbout, not exported); mirror it so a pinch and a
+// wheel zoom land in the same place.
+function panAbout(pan, zoom, mm, extentsMin, extentsMax) {
+  const ratio = pan[3] / zoom;
+  return [0, 1, 2].map((i) => {
+    const offset = mm[i] - (extentsMin[i] + extentsMax[i]) / 2;
+    return ratio * (offset + pan[i]) - offset;
+  });
+}
+
 function installPinchZoom(nv) {
   const canvas = nv.canvas;
   if (!canvas) return;
+  hideMultiTouchFromNiivue(canvas);
   let start = null;
 
   const begin = (e) => {
     if (e.touches.length !== 2) { start = null; return; }
     const rect = canvas.getBoundingClientRect();
-    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
-    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
-    const dpr = nv.uiData?.dpr || 1;
+    const dpr = window.devicePixelRatio || 1;
+    const cx = ((e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left) * dpr;
+    const cy = ((e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top) * dpr;
     start = {
       dist: Math.max(1, touchDistance(e.touches)),
-      zoom: nv.scene.pan2Dxyzmm[3] || 1,
-      pan: Array.from(nv.scene.pan2Dxyzmm).slice(0, 3),
-      scale3d: nv.scene.volScaleMultiplier || 1,
+      pan: Array.from(nv.pan2Dxyzmm),
+      scale3d: nv.scaleMultiplier || 1,
       // Pinching the 3D tile should scale the render, not the slices.
-      inRender: nv.inRenderTile ? nv.inRenderTile(cx * dpr, cy * dpr) >= 0 : false,
+      inRender: nv.view?.hitTest(cx, cy)?.isRender ?? false,
     };
   };
   const end = () => { start = null; };
 
-  canvas.addEventListener("touchstart", begin, { passive: false });
-  canvas.addEventListener("touchend", end, { passive: false });
-  canvas.addEventListener("touchcancel", end, { passive: false });
-
-  // niivue calls this.handlePinchZoom(e) from touchMoveListener for any
-  // 2+ finger move, so an own property on the instance is enough to take over.
-  nv.handlePinchZoom = (e) => {
-    if (!start || !e.touches || e.touches.length !== 2) return;
+  const move = (e) => {
+    if (!start || e.touches.length !== 2) return;
     const ratio = touchDistance(e.touches) / start.dist;
     if (!isFinite(ratio) || ratio <= 0) return;
 
     if (start.inRender) {
-      nv.scene.volScaleMultiplier = clamp(start.scale3d * ratio, MIN_ZOOM, MAX_ZOOM);
-      nv.drawScene();
+      nv.scaleMultiplier = clamp(start.scale3d * ratio, MIN_ZOOM, MAX_ZOOM);
       return;
     }
-    const zoom = clamp(start.zoom * ratio, MIN_ZOOM, MAX_ZOOM);
-    // niivue accumulates pan += (oldZoom - newZoom) * crosshairMM on every zoom
-    // step; the crosshair does not move during a pinch, so computing it once
-    // from the gesture's starting state is the same thing without the drift.
-    const mm = nv.frac2mm(nv.scene.crosshairPos);
-    const d = start.zoom - zoom;
-    nv.scene.pan2Dxyzmm = [
-      start.pan[0] + d * mm[0],
-      start.pan[1] + d * mm[1],
-      start.pan[2] + d * mm[2],
-      zoom,
-    ];
-    if (nv.opts.yoke3Dto2DZoom) nv.scene.volScaleMultiplier = zoom;
-    nv.drawScene();
+    // Computed from the gesture's starting state rather than accumulated per
+    // event, so the zoom tracks the fingers without drifting.
+    const zoom = clamp(start.pan[3] * ratio, MIN_ZOOM, MAX_ZOOM);
+    const p = panAbout(start.pan, zoom, nv.getCrosshairPos(),
+      nv.model.extentsMin, nv.model.extentsMax);
+    nv.pan2Dxyzmm = Float32Array.from([p[0], p[1], p[2], zoom]);
+    if (nv.isYoked3DTo2DZoom) nv.scaleMultiplier = zoom; // setter redraws
+    else nv.drawScene();
   };
+
+  canvas.addEventListener("touchstart", begin, { passive: true });
+  canvas.addEventListener("touchmove", move, { passive: true });
+  canvas.addEventListener("touchend", end, { passive: true });
+  canvas.addEventListener("touchcancel", end, { passive: true });
 }
 
 /**

@@ -1,5 +1,5 @@
 
-# Brainchop  [![Version](https://img.shields.io/badge/Version-4.0.0-brightgreen)]() [![JS ](https://img.shields.io/badge/Types-JavaScript-blue)]() [![MIT-License ](https://img.shields.io/badge/license-MIT-green)](https://github.com/neuroneural/brainchop/blob/master/LICENSE) [![tfjs](https://img.shields.io/badge/tfjs-Pre--trained%20Model-blue)](https://github.com/neuroneural/brainchop/tree/master/models/mnm_tfjs_me_test) [![DOI](https://joss.theoj.org/papers/10.21105/joss.05098/status.svg)](https://doi.org/10.21105/joss.05098)
+# Brainchop  [![Version](https://img.shields.io/badge/Version-5.0.0-brightgreen)]() [![JS ](https://img.shields.io/badge/Types-JavaScript-blue)]() [![MIT-License ](https://img.shields.io/badge/license-MIT-green)](https://github.com/neuroneural/brainchop/blob/master/LICENSE) [![tfjs](https://img.shields.io/badge/tfjs-Pre--trained%20Model-blue)](https://github.com/neuroneural/brainchop/tree/master/models/mnm_tfjs_me_test) [![DOI](https://joss.theoj.org/papers/10.21105/joss.05098/status.svg)](https://doi.org/10.21105/joss.05098)
 
 
 <div align="center">
@@ -23,7 +23,7 @@
  </p>
 
  <p align="justify">
- We make the implementation of brainchop freely available, releasing its pure javascript code as open-source. The user interface (UI)  provides a web-based end-to-end solution for 3D MRI segmentation. <b><a href="v"  style="text-decoration: none">NiiVue</a></b> viewer is integrated with the tool for MRI visualization.  For more information about Brainchop, please refer to this detailed <b><a href="https://github.com/neuroneural/brainchop/wiki/"  style="text-decoration: none">Wiki</a></b> and this <b><a href="https://trendscenter.org/in-browser-3d-mri-segmentation-brainchop-org/"  style="text-decoration: none"> Blog</a></b>.
+ We make the implementation of brainchop freely available, releasing its pure javascript code as open-source. The user interface (UI)  provides a web-based end-to-end solution for 3D MRI segmentation. <b><a href="https://github.com/niivue/niivue"  style="text-decoration: none">NiiVue</a></b> viewer is integrated with the tool for MRI visualization.  For more information about Brainchop, please refer to this detailed <b><a href="https://github.com/neuroneural/brainchop/wiki/"  style="text-decoration: none">Wiki</a></b> and this <b><a href="https://trendscenter.org/in-browser-3d-mri-segmentation-brainchop-org/"  style="text-decoration: none"> Blog</a></b>.
 
   For questions or to share ideas, please refer to our  <b><a href="https://github.com/neuroneural/brainchop/discussions/"  style="text-decoration: none"> Discussions </a></b> board.
 
@@ -72,19 +72,24 @@ Inference runs through browser GPU backends in order, falling through silently o
 
 Most models output a discrete label segmentation. An experimental **CAT-lite** model (24-channel GM/WM/CSF priors, neural-assisted partial-volume estimation — not a CAT12 result) instead outputs continuous GM/WM/CSF fraction maps, shown as three overlays. Saves write one file per tissue: `segmentation_{gm,wm,csf}.nii.gz` (float32, 256&sup3; conformed) or `segmentation_{gm,wm,csf}_native.nii.gz` (uint8, trilinear resliced to the input grid).
 
+Any browser with WebGL2 can run the label models; WebGPU (Chrome/Edge) is the fastest path. CAT-lite needs WebGPU or the native WebGL2 runner and ~1.5&nbsp;GiB of GPU memory — the tfjs fallbacks return label maps only.
+
 ## Development
 
+Viewer: NiiVue 1.0 (pinned to its WebGL2 backend). The toolbar's shading button switches the 3D render between flat and matcap lighting.
+
 ```
-npm install
-npm run dev    # dev server
+npm install    # bun install also works
+npm run dev    # dev server on :5173, or the next free port; bun run dev is equivalent
 npm run build  # production build
-npm test       # playwright end-to-end tests (builds first)
+npm test       # playwright end-to-end tests (builds first, serves on :8088)
 ```
 
 Unit/gate tests (no dev server needed):
 
 ```
 node tests/cat-lite.mjs
+node tests/cortical_relabel.mjs
 node tests/webgl2-probability.mjs
 node tests/webgl2_gate.mjs [chromium|firefox]
 ```

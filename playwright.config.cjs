@@ -69,7 +69,7 @@ module.exports = defineConfig({
   /* Run your local dev server before starting the tests */
   webServer: {
     command: 'npm run preview',
-    url: 'http://127.0.0.1:8088',
+    url: 'http://localhost:8088',  // vite preview binds ::1; 127.0.0.1 never answers
     reuseExistingServer: !process.env.CI,
     timeout: 20 * 1000,
   }
