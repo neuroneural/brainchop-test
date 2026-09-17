@@ -1,4 +1,15 @@
-import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
+// WebGL2-only distribution: the viewer class and its constants come from the
+// /webgl2 entry, which carries no WebGPU renderer (-254 KB raw, -66 KB gzip).
+//
+// The second import is a version-specific workaround, not a design. The /webgl2
+// entry of the PINNED 1.0.0-rc.13 (published 2026-09-02) omits these three pure
+// helpers -- verified at runtime: it exports 109 symbols and none of them is
+// nii2volume, writeVolume or makeLabelLut. niivue fixed exactly this five days
+// later in b19e92e, "close the entry-point export drift and pin it with a test",
+// so the root entry is only here to fill that gap. Collapse both imports into
+// one from "@niivue/niivue/webgl2" as soon as the pin moves past that commit.
+import NiiVue, { DRAG_MODE, SHOW_RENDER } from "@niivue/niivue/webgl2";
+import { nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
 import { conform } from "@niivue/nv-ext-image-processing";
 import { mat4 } from "gl-matrix";
 import { shiny } from "@niivue/niivue/assets/matcaps";
@@ -58,12 +69,15 @@ let isWebGpuAvailable = false;
 let suppressBackendModals = false;
 let backendAttemptMessages = [];
 
-// --- DEBUG OVERRIDE -------------------------------------------------------
-// Normally false: WebGPU is used when available, WebGL2 is the fallback.
-// Set true to force every model through the WebGL2 (WebWorker / tfjs) backend
-// for debugging/benchmarking the fallback path. See the
-// `isWebGpuAvailable && !FORCE_WEBGL2_TESTING` guard in runSelectedInference().
-const FORCE_WEBGL2_TESTING = false;
+// --- BACKEND SELECTION ----------------------------------------------------
+// TRUE IN THIS BUILD: WebGL2 is the only backend, for inference and display.
+// The viewer is already pinned with `new NiiVue({ backend: "webgl2" })`, and
+// the rc.13 render fixes this branch ships (patches/) exist only in the WebGL2
+// shaders -- a WebGPU render path would silently miss all of them. Setting this
+// false restores the original order: WebGPU when available, WebGL2 as fallback.
+// See the `isWebGpuAvailable && !FORCE_WEBGL2_TESTING` guard in
+// runInferenceChain() and the early return in initializeBackend().
+const FORCE_WEBGL2_TESTING = true;
 
 // Set true to skip the NATIVE WebGL2 runner (webgl2_runners/) and force the old
 // tfjs WebWorker path. This is the A/B control for the native runner: with
@@ -108,6 +122,17 @@ async function initializeBackend() {
     f16Support: false,
     error: null
   };
+
+  // WebGL2-only build: do not request an adapter or a device we will never use.
+  // A WebGPU device stays allocated for the session, and CAT-lite already wants
+  // ~1.5 GiB on the GL context.
+  if (FORCE_WEBGL2_TESTING) {
+    diagnostics.error = 'WebGPU not requested: WebGL2-only build';
+    console.log('WebGL2-only build: skipping WebGPU initialization.');
+    updateBackendStatusUI(false, diagnostics);
+    window.webgpuDiagnostics = diagnostics;
+    return diagnostics;
+  }
 
   // Check secure context first
   if (!window.isSecureContext) {
@@ -1550,7 +1575,7 @@ async function main() {
   // matcaps must be supplied by name: loadMatcap() looks the name up here and,
   // on a miss, treats the name itself as a URL -- a silent 404 that leaves the
   // built-in default matcap in place rather than throwing.
-  const nv1 = new NiiVue({ backend: "webgl2", matcaps: { Shiny: shiny } });
+  const nv1 = new NiiVue({ matcaps: { Shiny: shiny } });
   await nv1.attachTo("gl1");
 
   // Match the 2D panes (whose surround is the image's black background) so the
