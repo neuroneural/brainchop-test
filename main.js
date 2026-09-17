@@ -265,6 +265,8 @@ async function main() {
   // macOS), whereas altKey is free for in-canvas clicks.
   const ISOLATE_MODIFIER = "altKey";
   let isolatedLabel = null;    // label value shown alone, or null = show all
+  let isolatedProbabilityIndex = null; // selected CAT-lite tissue, or null = show all
+  let probabilityOverlays = null;      // current [GM, WM, CSF] volumes
   let originalSegImg = null;   // pristine label voxels, for restore + stats
   let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
   let nativeInputNV = null;    // volume as loaded (native grid), before conform
@@ -404,7 +406,7 @@ async function main() {
         • <strong>Drag & Drop</strong> any NIfTI file to open.
         • Press <strong>C</strong> to toggle/cycle the clip-plane.
         • Press <strong>V</strong> repeatedly to cycle through views.
-        • <strong>Option/Alt-click</strong> a region to isolate it (show it alone in all panels + 3D); Alt-click it again, or Alt-click the background, to bring the others back.</p>
+        • <strong>Option/Alt-click</strong> a segmentation label or CAT-lite tissue to show it alone in all panels + 3D. Click it again, click the background, or press Esc to restore all overlays.</p>
 
         <p><strong>🧠 AI Models</strong><br>
         <strong>⚡ Flash Filet:</strong> Small, lightning fast, resource-friendly. Best for HCP-like structural MRIs ("Tissue GWM (light)").<br>
@@ -474,10 +476,15 @@ async function main() {
     nv1.volumes[0].opacity = Number(opacitySlider0.value);
     nv1.updateGLVolume();
   };
-  opacitySlider1.oninput = () => {
-    for (const overlay of nv1.volumes.slice(1)) overlay.opacity = Number(opacitySlider1.value);
+  function applyOverlayOpacity() {
+    const opacity = Number(opacitySlider1.value);
+    nv1.volumes.slice(1).forEach((overlay, i) => {
+      overlay.opacity = probabilityOverlays?.[i] === overlay
+        && isolatedProbabilityIndex !== null && i !== isolatedProbabilityIndex ? 0 : opacity;
+    });
     nv1.updateGLVolume();
-  };
+  }
+  opacitySlider1.oninput = applyOverlayOpacity;
 
   function applyModelUnderlayOpacity(modelEntry = null) {
     const underlayOpacity = modelEntry?.probabilityUnderlayOpacity;
@@ -516,6 +523,8 @@ async function main() {
   }
 
   async function closeAllOverlays() {
+    isolatedProbabilityIndex = null;
+    probabilityOverlays = null;
     while (nv1.volumes.length > 1) {
       await nv1.removeVolume(nv1.volumes.length - 1);
     }
@@ -634,12 +643,42 @@ async function main() {
     applyLabelIsolation();
   }
 
+  // Read the three pristine fraction maps at the crosshair. Their voxel arrays
+  // are in storage order, while locationChange.vox is in RAS order. An all-zero
+  // voxel is background and restores the full view.
+  function dominantProbabilityOverlay() {
+    if (!probabilityOverlays || !crosshairVox ||
+        probabilityOverlays.some((ov, i) => nv1.volumes[i + 1] !== ov)) return undefined;
+    let bestIndex = null;
+    let bestValue = 0;
+    for (let i = 0; i < probabilityOverlays.length; i++) {
+      const ov = probabilityOverlays[i];
+      const idx = rasToNativeIndex(ov, crosshairVox);
+      if (idx === null) return undefined;
+      const value = ov.img[idx];
+      if (Number.isFinite(value) && value > bestValue) {
+        bestValue = value;
+        bestIndex = i;
+      }
+    }
+    return bestIndex;
+  }
+
   function handleIsolateClick(e) {
     if (!e[ISOLATE_MODIFIER]) return;
-    if (!segOverlay()) return;
-    const lbl = labelUnderCursor();
-    if (lbl === null || Number.isNaN(lbl)) return;
-    isolateLabel(lbl);
+    if (segOverlay()) {
+      const lbl = labelUnderCursor();
+      if (lbl === null || Number.isNaN(lbl)) return;
+      isolateLabel(lbl);
+    } else {
+      const selected = dominantProbabilityOverlay();
+      if (selected === undefined) return;
+      const next = selected === isolatedProbabilityIndex ? null : selected;
+      if (next !== isolatedProbabilityIndex) {
+        isolatedProbabilityIndex = next;
+        applyOverlayOpacity();
+      }
+    }
     e.preventDefault();
   }
 
@@ -1415,12 +1454,17 @@ async function main() {
     }
     overlayVolume.colormap = colormap;
     overlayVolume.opacity = Number(opacitySlider1.value);
-    await nv1.addVolume(overlayVolume);
     // Niivue rounds any nonzero overlay alpha up to opaque. Modulating the
     // overlay by itself makes zero genuinely transparent and lets intermediate
-    // probabilities reveal the T1 underneath. Ids (not indices) since 1.0, so
-    // this survives overlays being removed in any order.
-    await nv1.setModulationImage(overlayVolume.id, overlayVolume.id, 1);
+    // probabilities reveal the T1 underneath. Set this before addVolume so
+    // NiiVue includes modulation in its first upload rather than rebuilding
+    // the volume a second time. Ids survive overlays being removed in any order.
+    overlayVolume.modulationImage = overlayVolume.id;
+    overlayVolume.modulateAlpha = 1;
+    await nv1.addVolume(overlayVolume);
+    // NiiVue's addVolume prepares a shallow copy; retain the displayed object
+    // so isolation can match it against nv1.volumes after it is added.
+    return nv1.volumes.at(-1);
   }
 
   async function callbackImg(img, opts, modelEntry) {
@@ -1431,9 +1475,12 @@ async function main() {
     if (modelEntry.outputType === 'probability') {
       // CAT-lite passes [GM, WM, CSF]; other probability models a single map.
       const maps = Array.isArray(img) ? img : [img];
+      const overlays = [];
       for (let i = 0; i < maps.length; i++) {
-        await addProbabilityOverlay(maps[i], modelEntry, modelEntry.probabilityTissues?.[i]);
+        overlays.push(await addProbabilityOverlay(maps[i], modelEntry, modelEntry.probabilityTissues?.[i]));
       }
+      if (modelEntry.probabilityPostprocess === 'cat-lite' && overlays.length === 3)
+        probabilityOverlays = overlays;
       applyModelUnderlayOpacity(modelEntry);
       return;
     }
@@ -1581,12 +1628,17 @@ async function main() {
   // Alt/Option-click a region to isolate it (see handleIsolateClick).
   nv1.canvas.addEventListener("click", handleIsolateClick);
 
-  // Esc restores the full segmentation (unless a dialog is open — let it close).
+  // Esc restores all labels or probability overlays (unless a dialog is open).
   window.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape" || isolatedLabel === null) return;
+    if (e.key !== "Escape") return;
     if (document.querySelector("dialog[open]")) return;
-    isolatedLabel = null;
-    applyLabelIsolation();
+    if (isolatedLabel !== null) {
+      isolatedLabel = null;
+      applyLabelIsolation();
+    } else if (isolatedProbabilityIndex !== null) {
+      isolatedProbabilityIndex = null;
+      applyOverlayOpacity();
+    }
   });
 
   // Note: we intentionally do NOT force the label overlay to NEAREST in the 3D
