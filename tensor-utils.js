@@ -1118,8 +1118,13 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       // atlas parcellation needs.
       binarize = false;
       onlyLargest = true;
-    } else if ([3, 8, 9].includes(modelEntry.id)) {
-      // 18-class: Mixed logic (targets only)
+    } else if ([3, 8, 9, 21].includes(modelEntry.id)) {
+      // 18-class: Mixed logic (targets only). id 21 is the 24-channel
+      // Subcortical + GWM candidate; it shares model16chan18cls's colormap and
+      // label layout exactly, so it must take the same per-class path as id 3.
+      // Left out of this list it falls through to the legacy binarize-then-
+      // largest branch, which keeps ONE blob for the whole brain and never
+      // applies the per-class largest-component filter to white matter.
       binarize = false;
       onlyLargest = false;
     } else {
@@ -1155,7 +1160,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
       const ls = guardLabels;
       const [_mx, filtered] = BWInstance.filter_clusters_by_rank(segmentationData, cl, ls, 2, SMALL_COMPONENT_MIN_RATIO, Vshape, relabelSuppressed, NEAR_BRAIN_MAX_GAP, DIAG_RANK_FILTER, voteFamilyOf);
       segmentationData.set(filtered);
-    } else if (!onlyLargest && [3, 8, 9].includes(modelEntry.id)) {
+    } else if (!onlyLargest && [3, 8, 9, 21].includes(modelEntry.id)) {
       // Mixed case (18-class) - Hierarchical approach:
       // Step 1: Binary largest connected component to establish brain boundary
       // This removes all disconnected noise/artifacts in one sweep
