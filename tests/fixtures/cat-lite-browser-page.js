@@ -47,14 +47,16 @@ export async function prepareInput(variant = 'original') {
   return { shape, length, options, intensity, input };
 }
 
-export async function createDevice() {
+export async function createDevice({ timestampQuery = false } = {}) {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('Chrome has no WebGPU adapter');
   const requiredLimits = {};
   for (const key of ['maxBufferSize', 'maxStorageBufferBindingSize', 'maxComputeInvocationsPerWorkgroup',
     'maxComputeWorkgroupSizeX', 'maxComputeWorkgroupSizeY', 'maxComputeWorkgroupSizeZ',
     'maxComputeWorkgroupStorageSize', 'maxComputeWorkgroupsPerDimension']) requiredLimits[key] = adapter.limits[key];
-  return adapter.requestDevice({ requiredLimits, requiredFeatures: ['shader-f16'] });
+  const requiredFeatures = ['shader-f16'];
+  if (timestampQuery && adapter.features.has('timestamp-query')) requiredFeatures.push('timestamp-query');
+  return adapter.requestDevice({ requiredLimits, requiredFeatures });
 }
 
 export async function benchmark() {
