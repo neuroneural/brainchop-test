@@ -119,7 +119,7 @@ const inferenceModelsList = [
     id: 23,
     type: 'Probability_Map',
     path: '/models/model24chan18cls_gdice_prio/model.json',
-    modelName: '\u{1F9E0} Tissue fraction maps (GM/WM/CSF)',
+    modelName: '\u2154\u{1F9E0} Tissue fraction maps (GM/WM/CSF)',
     webgpu_safetensor: './models/model24chan18cls_gdice_prio/model.safetensors',
     webgpu_runner: 'model24chan18cls_gdice_prio_probability',
     forceFP32: false,
