@@ -44,8 +44,8 @@ function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData
   })
 }
 
-function callbackImg(img, opts, modelEntry) {
-  self.postMessage({ cmd: 'img', img, opts, modelEntry })
+function callbackImg(img, opts, modelEntry, brainMask) {
+  self.postMessage({ cmd: 'img', img, opts, modelEntry, brainMask })
 }
 
 async function inferenceFullVolumePhase1(

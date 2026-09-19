@@ -653,6 +653,37 @@ progress::-moz-progress-bar {
   color: #9aa4af;
 }
 
+.save-mask-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 460px;
+  max-width: 100%;
+  margin: 14px auto 0;
+  color: #e6e8ea;
+  cursor: pointer;
+}
+
+.save-mask-option input {
+  margin: 2px 0 0;
+  accent-color: #3b82f6;
+}
+
+.save-mask-option strong,
+.save-mask-option small {
+  display: block;
+}
+
+.save-mask-option strong {
+  font-size: 13px;
+}
+
+.save-mask-option small {
+  margin-top: 3px;
+  color: #9aa4af;
+  font-size: 12px;
+}
+
 /* Modal Dialog */
 dialog {
   padding: 1.5rem;

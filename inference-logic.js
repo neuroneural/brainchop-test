@@ -594,8 +594,9 @@ export async function runFullVolumeInference(
 
   const postProcessStartTime = performance.now();
   let outimg;
+  const maskResult = {};
   try {
-    outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+    outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts, maskResult);
   } catch (err) {
     // Postprocessing can deliberately bail out on a noise/garbage segmentation
     // (err.code === 'SEGMENTATION_NOISE') instead of freezing the tab on the
@@ -630,7 +631,7 @@ export async function runFullVolumeInference(
   markSuccess(statData, Inference_t, Postprocess_t);
   callbackUI(modelEntry.modelName + '<br>Segmentation finished', 0);
   callbackUI('', -1, '', statData);
-  callbackImg(outimg, opts, modelEntry);
+  callbackImg(outimg, opts, modelEntry, maskResult.mask);
 
   return 0;
 }

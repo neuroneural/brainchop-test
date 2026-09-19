@@ -79,6 +79,12 @@ export const DESCRIPTORS = {
     // than 8, so this model permanently forfeits that 1.41x.
     fullVolume: true,
   },
+  // Refit-synth changes only weights; the native WebGL2 graph is identical.
+  model24chan104cls_infant_refit_synth: {
+    dilations: DEEP13,
+    activation: 'gelu_tanh',
+    fullVolume: true,
+  },
   model32chan18cls: {
     dilations: DEEP13,
     activation: 'gelu_tanh',

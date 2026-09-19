@@ -46,8 +46,10 @@ function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData
 
 // Transfer, not clone: three 256^3 tissue maps are ~200 MB and main.js
 // terminates this worker right after 'img'. Every array here owns a distinct buffer.
-function callbackImg(img, opts, modelEntry) {
-  self.postMessage({ cmd: 'img', img, opts, modelEntry }, (Array.isArray(img) ? img : [img]).map((a) => a.buffer));
+function callbackImg(img, opts, modelEntry, brainMask) {
+  const arrays = Array.isArray(img) ? img : [img];
+  if (brainMask) arrays.push(brainMask);
+  self.postMessage({ cmd: 'img', img, opts, modelEntry, brainMask }, arrays.map((a) => a.buffer));
 }
 
 /** A refusal, not a crash: main.js reads this and starts the tfjs worker. */
@@ -195,7 +197,8 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   }
 
   const p0 = performance.now();
-  const outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+  const maskResult = {};
+  const outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts, maskResult);
   const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
   outLabelVolume.dispose();
   tf.engine().disposeVariables();
@@ -205,7 +208,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   markSuccess(statData, Inference_t, Postprocess_t);
   callbackUI(modelEntry.modelName + '<br>Segmentation finished', 0);
   callbackUI('', -1, '', statData);
-  callbackImg(outimg, opts, modelEntry);
+  callbackImg(outimg, opts, modelEntry, maskResult.mask);
 }
 
 self.addEventListener('message', async (e) => {

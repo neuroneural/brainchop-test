@@ -44,7 +44,7 @@ export function runInferenceWebGl2(opts, modelEntry, niftiHeader, niftiImage, ca
     };
 
     worker.onmessage = (event) => {
-      const { cmd, message, progressFrac, modalMessage, statData, img, opts: o, modelEntry: m, reason } = event.data;
+      const { cmd, message, progressFrac, modalMessage, statData, img, opts: o, modelEntry: m, brainMask, reason } = event.data;
       if (cmd === 'unsupported') {
         done(reject, new Error(`native WebGL2 declined: ${reason}`));
         return;
@@ -58,7 +58,7 @@ export function runInferenceWebGl2(opts, modelEntry, niftiHeader, niftiImage, ca
         return;
       }
       if (cmd === 'img') {
-        callbackImg(img, o, m);
+        callbackImg(img, o, m, brainMask);
         done(resolve);
       }
     };

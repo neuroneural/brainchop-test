@@ -1024,9 +1024,10 @@ export class SequentialConvLayer {
  * @param {Uint8Array|Float32Array} niftiImage The raw data from the original NIfTI file.
  * @param {object} modelEntry The model configuration object.
  * @param {object} opts The options object, containing `isPostProcessEnable`.
+ * @param {object} [maskResult] Receives the binary extraction mask when requested.
  * @returns {Promise<Uint8Array>} The final processed image data as a Uint8Array.
  */
-export async function processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts) {
+export async function processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts, maskResult = null) {
   // --- Step 1: Single Data Transfer from GPU to CPU ---
   console.log('Downloading segmentation data from GPU to CPU...');
   const segmentationData = await outLabelVolume.data(); // This returns a TypedArray (e.g., Int32Array)
@@ -1234,10 +1235,13 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     }
     case 'Brain_Extraction': {
       const maskedData = new Uint8Array(segmentationData.length);
+      const brainMask = maskResult ? new Uint8Array(segmentationData.length) : null;
       for (let i = 0; i < segmentationData.length; i++) {
         const maskValue = segmentationData[i] !== 0 ? 1 : 0;
         maskedData[i] = niftiImage[i] * maskValue;
+        if (brainMask) brainMask[i] = maskValue;
       }
+      if (maskResult) maskResult.mask = brainMask;
       return maskedData;
     }
     default: {

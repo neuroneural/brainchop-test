@@ -254,6 +254,8 @@ async function main() {
   // Raw label names / colors for the current segmentation (index -> value), used by "Save Stats".
   let lastSegLabelNames = null;
   let lastSegColors = null; // { R:[], G:[], B:[] }
+  let lastModelEntry = null;
+  let lastBrainMask = null; // Mindgrab's postprocessed labels, before masking image intensities
 
   // --- Single-label isolation --------------------------------------------
   // Alt/Option-click a region in a 2D panel to show ONLY that label across
@@ -776,7 +778,7 @@ async function main() {
         chopWorker.postMessage({ opts: currentOpts, modelEntry: currentModelEntry, niftiHeader: plainNiftiHeader, niftiImage });
 
         chopWorker.onmessage = function (event) {
-          const { cmd, message, progressFrac, modalMessage, statData, img, opts, modelEntry } = event.data;
+          const { cmd, message, progressFrac, modalMessage, statData, img, opts, modelEntry, brainMask } = event.data;
           if (cmd === "ui") {
             if (modalMessage) {
               chopWorker.terminate();
@@ -797,7 +799,7 @@ async function main() {
           if (cmd === "img") {
             chopWorker.terminate();
             chopWorker = undefined;
-            callbackImg(img, opts, modelEntry);
+            callbackImg(img, opts, modelEntry, brainMask);
             resolve();
           }
         };
@@ -863,8 +865,8 @@ async function main() {
         };
 
         // Proxy callbackImg to resolve
-        const proxyCallbackImg = (img, opts, modelEntry) => {
-          callbackImg(img, opts, modelEntry);
+        const proxyCallbackImg = (img, opts, modelEntry, brainMask) => {
+          callbackImg(img, opts, modelEntry, brainMask);
           resolve();
         };
 
@@ -895,18 +897,36 @@ async function main() {
   // --- Save actions -------------------------------------------------------
   // Each action performs the pristine-label swap where relevant (isolation is
   // a view-only state) so exports always contain the full segmentation.
-  function withPristineLabels(fn) {
+  async function withPristineLabels(fn) {
     const ov = segOverlay();
     const restore = isolatedLabel !== null && ov && originalSegImg;
     if (restore) ov.img = originalSegImg;
     try {
-      return fn();
+      return await fn();
     } finally {
       if (restore) applyLabelIsolation();
     }
   }
 
-  async function saveSegmentationConformed() {
+  function binaryMaskVolume() {
+    const overlay = nv1.volumes[1];
+    const labels = lastModelEntry?.type === 'Brain_Extraction'
+      ? lastBrainMask
+      : (isolatedLabel !== null && originalSegImg ? originalSegImg : overlay.img);
+    if (!labels || labels.length !== overlay.img.length) {
+      throw new Error("The segmentation mask is unavailable. Run the model again.");
+    }
+    const binary = new Uint8Array(labels.length);
+    for (let i = 0; i < labels.length; i++) binary[i] = labels[i] !== 0 ? 1 : 0;
+    const mask = cloneVolume(overlay, binary, "brain_mask");
+    Object.assign(mask.hdr, {
+      datatypeCode: 2, numBitsPerVoxel: 8, scl_slope: 1, scl_inter: 0,
+      cal_min: 0, cal_max: 1, intent_code: 1002,
+    });
+    return mask;
+  }
+
+  async function saveSegmentationConformed(includeMask = false) {
     if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
     // The overlay already carries the right intent from callbackImg: LABEL for
     // discrete segmentations, none for intensity outputs (e.g. skull-stripped
@@ -915,6 +935,7 @@ async function main() {
     // Serial: three concurrent 256³ gzips compete for memory.
     await withPristineLabels(async () => {
       for (const overlay of overlays) await downloadVolume(overlay, overlayFilename(overlay, overlays.length, ""));
+      if (includeMask) await downloadVolume(binaryMaskVolume(), "binary_mask.nii.gz");
     });
   }
 
@@ -935,7 +956,7 @@ async function main() {
 
   // Native-space segmentation: reslice the conformed (256³, 1 mm) labels back
   // onto the original input grid. See resliceLabelsToNative() for the method.
-  async function saveSegmentationNative() {
+  async function saveSegmentationNative(includeMask = false) {
     if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
     if (!nativeInputNV || !nativeInputNV.hdr || !nativeInputNV.hdr.affine) {
       window.alert("Original input grid is unavailable — reload the image and try again.");
@@ -946,8 +967,12 @@ async function main() {
     try {
       const overlays = nv1.volumes.slice(1);
       for (const overlay of overlays) {
-        const outNV = withPristineLabels(() => resliceLabelsToNative(overlay));
+        const outNV = await withPristineLabels(() => resliceLabelsToNative(overlay));
         await downloadVolume(outNV, overlayFilename(overlay, overlays.length, "_native"));
+      }
+      if (includeMask) {
+        const mask = resliceLabelsToNative(binaryMaskVolume());
+        await downloadVolume(mask, "binary_mask_native.nii.gz");
       }
       callbackUI("Saved native-space segmentation.", 1);
     } catch (e) {
@@ -1004,7 +1029,7 @@ async function main() {
     // Is this a discrete label map (segmentation) or a continuous intensity
     // output (e.g. skull-stripped brain from Brain_Extraction/mindgrab)? Label
     // overlays carry a colormapLabel; intensity ones use a plain colormap.
-    const isLabel = !!seg.colormapLabel;
+    const isLabel = !!seg.colormapLabel || seg.hdr.intent_code === 1002;
     const nvox = nx * ny * nz;
     const outNV = cloneVolume(nativeInputNV);
     const sample = (x, y, z) =>
@@ -1117,6 +1142,8 @@ async function main() {
   function openSaveModal() {
     const hasImg = nv1.volumes.length >= 1;
     const hasSeg = nv1.volumes.length >= 2;
+    const hasMask = hasSeg && lastModelEntry && lastModelEntry.outputType !== 'probability'
+      && (lastModelEntry.type !== 'Brain_Extraction' || !!lastBrainMask);
     const ready = (need) => (need === "seg" ? hasSeg : hasImg);
     const rows = SAVE_OPTIONS.map((o, i) => {
       const dis = ready(o.need) ? "" : " disabled";
@@ -1125,15 +1152,20 @@ async function main() {
         <span class="save-opt-sub">${o.sub}</span>
       </button>`;
     }).join("");
-    showModal("Save", `<div class="save-options">${rows}</div>`, { hideClose: true, saveMode: true });
+    const maskOption = hasMask
+      ? '<label class="save-mask-option"><input type="checkbox" id="saveBinaryMask">' +
+        '<span><strong>Also save binary mask</strong><small>Foreground 1 · background 0</small></span></label>'
+      : '';
+    showModal("Save", `<div class="save-options">${rows}</div>${maskOption}`, { hideClose: true, saveMode: true });
     const msg = document.getElementById("dialogMessage");
     if (!msg) return;
     msg.querySelectorAll(".save-opt:not(.disabled)").forEach((btn) => {
       btn.onclick = () => {
         const opt = SAVE_OPTIONS[parseInt(btn.dataset.i, 10)];
+        const includeMask = opt.need === "seg" && !!msg.querySelector("#saveBinaryMask")?.checked;
         const dlg = document.getElementById("appDialog");
         if (dlg && dlg.open) dlg.close();  // dismiss first so the native save dialog is unobstructed
-        opt.act();
+        opt.act(includeMask);
       };
     });
   }
@@ -1384,6 +1416,8 @@ async function main() {
     if (nv1.volumes.length <= 1) {
       nativeInputNV = nv1.volumes[0] || null;
       nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
+      lastModelEntry = null;
+      lastBrainMask = null;
       applyModelUnderlayOpacity();
     }
     opacitySlider0.oninput();
@@ -1467,11 +1501,13 @@ async function main() {
     return nv1.volumes.at(-1);
   }
 
-  async function callbackImg(img, opts, modelEntry) {
+  async function callbackImg(img, opts, modelEntry, brainMask) {
     await closeAllOverlays();
     resetLabelIsolation();
     lastSegLabelNames = null;
     lastSegColors = null;
+    lastModelEntry = modelEntry;
+    lastBrainMask = modelEntry.type === 'Brain_Extraction' ? brainMask || null : null;
     if (modelEntry.outputType === 'probability') {
       // CAT-lite passes [GM, WM, CSF]; other probability models a single map.
       const maps = Array.isArray(img) ? img : [img];

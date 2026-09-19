@@ -422,6 +422,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         const postProcessStartTime = performance.now();
         let finalImage;
+        const maskResult = {};
         if (catLite) {
             // The runner is chosen by name, so a mismatched model entry can return the wrong map count.
             if (inferenceResultArray.length !== 3) {
@@ -444,11 +445,11 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             );
             finalImage = isProbabilityOutput
                 ? await outLabelVolume.data()
-                : await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts);
+                : await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts, maskResult);
         }
         const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
 
-        await callbackImg(finalImage, opts, modelEntry);
+        await callbackImg(finalImage, opts, modelEntry, maskResult.mask);
 
         if (!isProbabilityOutput) {
             // Add label statistics from categorical output.
