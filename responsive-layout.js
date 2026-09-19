@@ -92,6 +92,20 @@ export function installResponsiveLayout(nv) {
   const bar = buildSwitcher(nv, container);
   bar.querySelector('button[data-pane="multi"]').classList.add("active");
 
+  // NiiVue 1.0 uses V to log its version; restore the view shortcut from 0.62.
+  // Capture the key before NiiVue's window listener so it cannot handle V too.
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "v" && e.key !== "V") return;
+    if (e.altKey || e.ctrlKey || e.metaKey || e.repeat) return;
+    const target = e.target;
+    if (target instanceof HTMLElement &&
+        (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const index = PANES.findIndex((pane) => pane.type === nv.sliceType);
+    setPane(nv, bar, PANES[(index + 1) % PANES.length].id);
+  }, true);
+
   const refresh = () =>
     document.body.classList.toggle("nv-narrow", isNarrowViewport());
   window.addEventListener("resize", refresh);
