@@ -1,3 +1,4 @@
+// Frozen pre-optimization reference for byte-exact CAT-lite regression tests.
 // Lightweight, browser-side approximation of CAT's AMAP/PVE idea.
 //
 // This is deliberately separate from the ordinary grouped-softmax output. It
@@ -6,6 +7,8 @@
 // pure/mixed tissue classes. A sixth, zero-GM CSF-WM nuisance class prevents a
 // direct ventricular boundary from being explained as a false gray rim. It is
 // not CAT12 and does not use a hard segmentation boundary.
+
+import { BWLabeler } from '../../bwlabels.js';
 
 const EPSILON = 1e-8;
 // main.js conforms every input to 256^3 before dispatching to a backend.
@@ -23,47 +26,23 @@ function retainPrincipalSupport(volumes, shape, minSupport) {
   const [gm, wm, csf] = volumes;
   const length = gm.length;
   const supportMask = new Uint8Array(length);
-  let supported = 0;
   for (let i = 0; i < length; i++) {
-    if (Math.max(0, gm[i]) + Math.max(0, wm[i]) + Math.max(0, csf[i]) >= minSupport) {
-      supportMask[i] = 1;
-      supported++;
-    }
+    if (Math.max(0, gm[i]) + Math.max(0, wm[i]) + Math.max(0, csf[i]) >= minSupport) supportMask[i] = 1;
   }
 
-  // Binary 6-connected flood fill needs one byte per voxel and one queue
-  // entry per supported voxel, rather than several full Uint32 label maps.
-  // Components are discovered in voxel order, matching BWLabeler numbering;
-  // the last component wins size ties, just like its largest-cluster filter.
-  const [nx, ny, nz] = shape;
-  if (nx < 2 || ny < 2 || nz < 1) return { componentCount: 0, removedVoxels: 0 };
-  const queue = new Uint32Array(supported);
-  const plane = nx * ny;
-  let tail = 0, bestStart = 0, bestEnd = 0, componentCount = 0;
-  for (let seed = 0; seed < length; seed++) {
-    if (supportMask[seed] !== 1) continue;
-    componentCount++;
-    const start = tail;
-    queue[tail++] = seed;
-    supportMask[seed] = 2;
-    for (let head = start; head < tail; head++) {
-      const i = queue[head];
-      const x = i % nx, y = Math.floor(i / nx) % ny;
-      if (x > 0 && supportMask[i - 1] === 1) { supportMask[i - 1] = 2; queue[tail++] = i - 1; }
-      if (x + 1 < nx && supportMask[i + 1] === 1) { supportMask[i + 1] = 2; queue[tail++] = i + 1; }
-      if (y > 0 && supportMask[i - nx] === 1) { supportMask[i - nx] = 2; queue[tail++] = i - nx; }
-      if (y + 1 < ny && supportMask[i + nx] === 1) { supportMask[i + nx] = 2; queue[tail++] = i + nx; }
-      if (i >= plane && supportMask[i - plane] === 1) { supportMask[i - plane] = 2; queue[tail++] = i - plane; }
-      if (i + plane < length && supportMask[i + plane] === 1) { supportMask[i + plane] = 2; queue[tail++] = i + plane; }
-    }
-    if (tail - start >= bestEnd - bestStart) { bestStart = start; bestEnd = tail; }
-  }
+  // Match the ordinary 18-class postprocessor: form a binary anatomical
+  // support and retain its largest 6-connected component. The threshold is the
+  // same low support floor used by the fit, so this removes detached
+  // eyes/neck/shoulders without quantising probabilities inside the brain.
+  const labeler = new BWLabeler();
+  const [componentCount, componentLabels] = labeler.bwlabel(supportMask, shape, 6, true, false);
+  const [, principalMask] = labeler.largest_original_cluster_labels(
+    supportMask, componentCount, componentLabels, shape
+  );
   let removedVoxels = 0;
   if (componentCount > 1) {
-    // Queue spans partition the support; no second full-volume mask is needed.
-    for (let q = 0; q < tail; q++) {
-      if (q >= bestStart && q < bestEnd) continue;
-      const i = queue[q];
+    for (let i = 0; i < length; i++) {
+      if (!supportMask[i] || principalMask[i]) continue;
       gm[i] = 0;
       wm[i] = 0;
       csf[i] = 0;
@@ -73,60 +52,26 @@ function retainPrincipalSupport(volumes, shape, minSupport) {
   return { componentCount, removedVoxels };
 }
 
-// Keep only fitted voxels, in their original accumulation order. Float64
-// caches preserve the JS Number results exactly (Float32 would change the fit).
-// Weights are invariant across both fits and the final variance pass.
-function makeFitData([gm, wm, csf], intensity, { minSupport, priorPower }) {
-  let count = 0;
+// Priors are each tissue's share of the (non-negative) model support; support
+// itself is capped at 1. `!(support >= minSupport)` also rejects NaN.
+function estimateStats(volumes, intensity, biasAt, { priorPower, minSupport, minSeparation, sigmaFloor }) {
+  const [gm, wm, csf] = volumes;
+  const sums = new Float64Array(3);
+  const weights = new Float64Array(3);
+
   for (let i = 0; i < intensity.length; i++) {
-    const raw = Math.max(0, gm[i]) + Math.max(0, wm[i]) + Math.max(0, csf[i]);
-    if (Math.min(raw, 1) >= minSupport && Number.isFinite(intensity[i])) count++;
-  }
-  const indices = new Uint32Array(count);
-  const values = new Float64Array(count);
-  // Bound the total fit cache to 192 MiB at 256³, even for unusually dense
-  // support. Dense inputs recompute weights; indices + values alone fit the cap.
-  const cachedCount = count * 36 <= 192 * 2 ** 20 ? count : 0;
-  const weightCsf = new Float64Array(cachedCount), weightGm = new Float64Array(cachedCount), weightWm = new Float64Array(cachedCount);
-  for (let i = 0, k = 0; i < intensity.length; i++) {
     const g = Math.max(0, gm[i]), w = Math.max(0, wm[i]), c = Math.max(0, csf[i]);
     const raw = g + w + c;
     const support = Math.min(raw, 1);
     if (!(support >= minSupport) || !Number.isFinite(intensity[i])) continue;
-    indices[k] = i;
-    values[k] = intensity[i] - 0;
-    if (cachedCount) {
-      weightCsf[k] = support * Math.pow(c / raw, priorPower);
-      weightGm[k] = support * Math.pow(g / raw, priorPower);
-      weightWm[k] = support * Math.pow(w / raw, priorPower);
-    }
-    k++;
-  }
-  return { indices, values, weightCsf, weightGm, weightWm, volumes: [gm, wm, csf] };
-}
-
-function loadFitWeights([gm, wm, csf], i, priorPower, weights) {
-  const g = Math.max(0, gm[i]), w = Math.max(0, wm[i]), c = Math.max(0, csf[i]);
-  const raw = g + w + c;
-  const support = Math.min(raw, 1);
-  weights[0] = support * Math.pow(c / raw, priorPower);
-  weights[1] = support * Math.pow(g / raw, priorPower);
-  weights[2] = support * Math.pow(w / raw, priorPower);
-}
-
-function estimateStats({ indices, values, weightCsf, weightGm, weightWm, volumes }, { minSeparation, sigmaFloor, priorPower }, meansOnly = false) {
-  const uncached = weightCsf.length === 0 ? new Float64Array(3) : null;
-  const sums = new Float64Array(3);
-  const weights = new Float64Array(3);
-  for (let k = 0; k < values.length; k++) {
-    const value = values[k];
-    if (uncached) loadFitWeights(volumes, indices[k], priorPower, uncached);
-    const wc = uncached ? uncached[0] : weightCsf[k];
-    const wg = uncached ? uncached[1] : weightGm[k];
-    const ww = uncached ? uncached[2] : weightWm[k];
-    sums[0] += wc * value; weights[0] += wc;
-    sums[1] += wg * value; weights[1] += wg;
-    sums[2] += ww * value; weights[2] += ww;
+    const value = intensity[i] - biasAt(i);
+    // T1 ordering: CSF, GM, WM
+    const weightCsf = support * Math.pow(c / raw, priorPower);
+    const weightGm = support * Math.pow(g / raw, priorPower);
+    const weightWm = support * Math.pow(w / raw, priorPower);
+    sums[0] += weightCsf * value; weights[0] += weightCsf;
+    sums[1] += weightGm * value; weights[1] += weightGm;
+    sums[2] += weightWm * value; weights[2] += weightWm;
   }
 
   if (weights.some((weight) => weight < 100)) {
@@ -141,20 +86,17 @@ function estimateStats({ indices, values, weightCsf, weightGm, weightWm, volumes
     };
   }
 
-  // The initial fit only supplies means to the bias estimator.
-  if (meansOnly) return { applied: true, means };
-
   const squareSums = new Float64Array(3);
-  for (let k = 0; k < values.length; k++) {
-    const value = values[k];
-    if (uncached) loadFitWeights(volumes, indices[k], priorPower, uncached);
-    const wc = uncached ? uncached[0] : weightCsf[k];
-    const wg = uncached ? uncached[1] : weightGm[k];
-    const ww = uncached ? uncached[2] : weightWm[k];
+  for (let i = 0; i < intensity.length; i++) {
+    const g = Math.max(0, gm[i]), w = Math.max(0, wm[i]), c = Math.max(0, csf[i]);
+    const raw = g + w + c;
+    const support = Math.min(raw, 1);
+    if (!(support >= minSupport) || !Number.isFinite(intensity[i])) continue;
+    const value = intensity[i] - biasAt(i);
     const dCsf = value - means[0], dGm = value - means[1], dWm = value - means[2];
-    squareSums[0] += wc * dCsf * dCsf;
-    squareSums[1] += wg * dGm * dGm;
-    squareSums[2] += ww * dWm * dWm;
+    squareSums[0] += support * Math.pow(c / raw, priorPower) * dCsf * dCsf;
+    squareSums[1] += support * Math.pow(g / raw, priorPower) * dGm * dGm;
+    squareSums[2] += support * Math.pow(w / raw, priorPower) * dWm * dWm;
   }
 
   const sigmas = Array.from(squareSums, (sum, tissue) =>
@@ -284,9 +226,9 @@ function addNeighbourPrior([gm, wm, csf], j, sums) {
   sums[3]++;
 }
 
-function gaussianLogLikelihood(value, mean, sigma, logSigma) {
+function gaussianLogLikelihood(value, mean, sigma) {
   const z = (value - mean) / sigma;
-  return -0.5 * z * z - logSigma;
+  return -0.5 * z * z - Math.log(sigma);
 }
 
 /**
@@ -312,24 +254,14 @@ export function applyCatLitePartialVolume(volumes, intensity, shape, options = {
   const [nx, ny, nz] = shape;
   const length = intensity.length;
   const supportCleanup = retainPrincipalSupport(volumes, shape, minSupport);
-  const fit = makeFitData(volumes, intensity, statOptions);
-  const initialStats = estimateStats(fit, statOptions, true);
+  const initialStats = estimateStats(volumes, intensity, () => 0, statOptions);
   if (!initialStats.applied) return { tissues: volumes, stats: initialStats };
 
   const biasAt = makeCoarseBiasField(
     volumes, intensity, shape, initialStats.means, { minSupport, block, smoothingPasses }
   );
-  // Interpolate once, then reuse the exact double-precision corrected values
-  // for means, variances, and the mixed-class likelihoods.
-  for (let k = 0; k < fit.indices.length; k++) {
-    const i = fit.indices[k];
-    fit.values[k] = intensity[i] - biasAt(i);
-  }
-  const tissueStats = estimateStats(fit, statOptions);
+  const tissueStats = estimateStats(volumes, intensity, biasAt, statOptions);
   if (!tissueStats.applied) return { tissues: volumes, stats: tissueStats };
-  // Only corrected values are needed from here on. Release the larger caches
-  // before allocating the three full-volume output maps.
-  fit.indices = fit.weightCsf = fit.weightGm = fit.weightWm = null;
 
   const [muCsf, muGm, muWm] = tissueStats.means;
   const [sigmaCsf, sigmaGm, sigmaWm] = tissueStats.sigmas;
@@ -346,13 +278,8 @@ export function applyCatLitePartialVolume(volumes, intensity, shape, options = {
   const mixGwSigma = Math.sqrt((muWm - muGm) ** 2 / 12 + 0.5 * (sigmaGm ** 2 + sigmaWm ** 2));
   const mixCwSigma = Math.sqrt((muWm - muCsf) ** 2 / 12 + 0.5 * (sigmaCsf ** 2 + sigmaWm ** 2));
 
-  // These six logarithms are invariant across the entire volume.
-  const logSigmaCsf = Math.log(sigmaCsf), logSigmaGm = Math.log(sigmaGm), logSigmaWm = Math.log(sigmaWm);
-  const logMixGcSigma = Math.log(mixGcSigma), logMixGwSigma = Math.log(mixGwSigma), logMixCwSigma = Math.log(mixCwSigma);
-
   // [sumG, sumW, sumC, neighbours] of the 6-neighbour priors, reused for every voxel.
   const neighbourSums = new Float64Array(4);
-  let fittedVoxel = 0;
 
   for (let z = 0; z < nz; z++) {
     for (let y = 0; y < ny; y++) {
@@ -379,24 +306,24 @@ export function applyCatLitePartialVolume(volumes, intensity, shape, options = {
             pc = keep * pc + spatialWeight * neighbourSums[2] / neighbours;
           }
         }
-        const value = fit.values[fittedVoxel++];
+        const value = intensity[index] - biasAt(index);
 
         const logCsf = priorStrength * Math.log(pc + EPSILON)
-          + intensityStrength * gaussianLogLikelihood(value, muCsf, sigmaCsf, logSigmaCsf);
+          + intensityStrength * gaussianLogLikelihood(value, muCsf, sigmaCsf);
         const logGm = priorStrength * Math.log(pg + EPSILON)
-          + intensityStrength * gaussianLogLikelihood(value, muGm, sigmaGm, logSigmaGm);
+          + intensityStrength * gaussianLogLikelihood(value, muGm, sigmaGm);
         const logWm = priorStrength * Math.log(pw + EPSILON)
-          + intensityStrength * gaussianLogLikelihood(value, muWm, sigmaWm, logSigmaWm);
+          + intensityStrength * gaussianLogLikelihood(value, muWm, sigmaWm);
         const logGc = priorStrength * Math.log(mixelPrior * 2 * Math.sqrt(pc * pg) + EPSILON)
-          + intensityStrength * gaussianLogLikelihood(value, mixGcMean, mixGcSigma, logMixGcSigma);
+          + intensityStrength * gaussianLogLikelihood(value, mixGcMean, mixGcSigma);
         const logGw = priorStrength * Math.log(mixelPrior * 2 * Math.sqrt(pg * pw) + EPSILON)
-          + intensityStrength * gaussianLogLikelihood(value, mixGwMean, mixGwSigma, logMixGwSigma);
+          + intensityStrength * gaussianLogLikelihood(value, mixGwMean, mixGwSigma);
         // CAT's five-class model has no explicit CSF-WM mixel, but the two
         // tissues do meet at the ventricles. Without this zero-GM nuisance
         // hypothesis, uncertainty at that interface can only be explained by
         // the two GM-containing mixel classes and appears as a spurious rim.
         const logCw = priorStrength * Math.log(csfWmMixelPrior * 2 * Math.sqrt(pc * pw) * (1 - pg) ** 2 + EPSILON)
-          + intensityStrength * gaussianLogLikelihood(value, mixCwMean, mixCwSigma, logMixCwSigma);
+          + intensityStrength * gaussianLogLikelihood(value, mixCwMean, mixCwSigma);
         const maximum = Math.max(logCsf, logGm, logWm, logGc, logGw, logCw);
         const pureCsf = Math.exp(logCsf - maximum);
         const pureGm = Math.exp(logGm - maximum);
