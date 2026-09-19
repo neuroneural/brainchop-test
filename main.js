@@ -59,11 +59,15 @@ let suppressBackendModals = false;
 let backendAttemptMessages = [];
 
 // --- DEBUG OVERRIDE -------------------------------------------------------
-// Normally false: WebGPU is used when available, WebGL2 is the fallback.
-// Set true to force every model through the WebGL2 (WebWorker / tfjs) backend
-// for debugging/benchmarking the fallback path. See the
-// `isWebGpuAvailable && !FORCE_WEBGL2_TESTING` guard in runSelectedInference().
-const FORCE_WEBGL2_TESTING = false;
+// Inference normally tries WebGPU first, then native WebGL2, then tfjs WebGL.
+// Safari takes the latter two paths because its current WebGPU results fail.
+// Safari 26.5 advertises shader-f16, but its WebGPU compute path has returned
+// an all-class-2 cube for the light tissue model and all-zero labels for the
+// 18-class model on this machine. Native WebGL2 produced a real segmentation.
+// Keep Safari on the tested WebGL2 fallback until its WebGPU outputs are sound.
+// ?inference=webgpu is an explicit test override for checking future WebKit builds.
+const IS_SAFARI = /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|FxiOS|Edg|Android/.test(navigator.userAgent);
+const FORCE_WEBGL2_TESTING = IS_SAFARI && new URLSearchParams(window.location.search).get('inference') !== 'webgpu';
 
 // Set true to skip the NATIVE WebGL2 runner (webgl2_runners/) and force the old
 // tfjs WebWorker path. This is the A/B control for the native runner: with
@@ -108,6 +112,14 @@ async function initializeBackend() {
     f16Support: false,
     error: null
   };
+
+  if (FORCE_WEBGL2_TESTING) {
+    diagnostics.error = 'Safari WebGPU inference returned invalid labels; using WebGL2';
+    console.info(diagnostics.error);
+    updateBackendStatusUI(false, diagnostics);
+    window.webgpuDiagnostics = diagnostics;
+    return diagnostics;
+  }
 
   // Check secure context first
   if (!window.isSecureContext) {
@@ -237,7 +249,7 @@ function updateBackendStatusUI(webgpuAvailable, diagnostics) {
     if (!diagnostics.secureContext) {
       tooltip += '\n⚠ Not a secure context (HTTPS required)';
     }
-    if (navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome')) {
+    if (IS_SAFARI && !FORCE_WEBGL2_TESTING) {
       tooltip += '\n\nTo enable WebGPU in Safari:\n1. Settings > Feature Flags\n2. Enable WebGPU flags\n3. Restart Safari';
     }
     if (navigator.userAgent.includes('Firefox')) {

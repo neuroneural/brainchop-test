@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs'
 import { BWLabeler } from './bwlabels.js'
+import { validateCategoricalSegmentation } from './segmentation-quality.js'
 
 // DEBUG ONLY: set true to force the post-processing noise guard to trip on any
 // run, so you can see the "segmentation produced noise" failure path in the UI
@@ -1031,6 +1032,7 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
   // --- Step 1: Single Data Transfer from GPU to CPU ---
   console.log('Downloading segmentation data from GPU to CPU...');
   const segmentationData = await outLabelVolume.data(); // This returns a TypedArray (e.g., Int32Array)
+  validateCategoricalSegmentation(segmentationData);
 
   const Vshape = outLabelVolume.shape;
   console.log('Data download complete. Starting CPU processing.');
