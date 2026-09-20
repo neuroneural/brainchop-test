@@ -1,12 +1,12 @@
 {
   "repository": "https://github.com/neuroneural/brainchopC",
-  "baseRevision": "ecc87b3db1654c5f583afe47f51ecdbb1916d3c0",
+  "baseRevision": "cf90da937fd7681410f4d3d94091067ad81612da",
   "sourceModified": false,
   "compiler": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.6 (ce75e06884093bcefb86a6b8fd56a5d62a4cc245)\nCopyright (C) 2026 the Emscripten authors (see AUTHORS.txt)\nThis is free and open source software under the MIT license.\nThere is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
   "target": "make -C src wasm-cat-lite",
   "sourceSha256": {
-    "src/Makefile": "8dfb3447a09114c437c0e13b5e805d9e525a3eeb15367bf22e52e793866e0d4b",
-    "src/cat_lite.c": "113743a5a24a10ceb5625b1b6d28ce19a62d5c725646827d5168f6ab880d50e4",
+    "src/Makefile": "f2e56078bf0c37d7bfdb528d0c1138fd5d3ffc7fec21c0a1454aa481e9bef3cc",
+    "src/cat_lite.c": "7bf58f904691d451263ff278e15216cebef8d1b66a19138675ad81e853732adf",
     "src/cat_lite.h": "cd992dd8c805712536071efcc5919595f4d5d8ac4fd450f32c91256cd49aa0a4",
     "src/bc_threads.c": "108a531070f98351be7138437218a279d006ed38d43f6669da119d0e7b68f438",
     "src/bc_threads.h": "bde23d97cd836e1ca93ea9f0b21c438f029285b051a7afab729bbcffda63255b",
@@ -18,6 +18,6 @@
   },
   "artifactSha256": {
     "cat-lite.js": "4bd942c68363ddc8b6c727c2011cd4e5be94b4793e3587651c92aa7a8dedae9a",
-    "cat-lite.wasm": "aae771a13e82ef8eeb597b3a4421f6d50e5a403b804d8686c9c3780a86da8354"
+    "cat-lite.wasm": "6ae8f8711a3863c4ebc0b0a01d0a827ebe0f29c38a25f6f34caef5621056b3ae"
   }
 }
