@@ -554,6 +554,7 @@ async function main() {
     isolatedLabel = null;
     originalSegImg = null;
     isolationStats = null;
+    if (hudEl) hudEl.style.display = "none";
   }
 
   // Isolation works on the label DATA, not the color LUT: non-selected voxels
@@ -580,6 +581,9 @@ async function main() {
       isolationStats = buildIsolationStats(isolatedLabel);
     }
     nv1.updateGLVolume();
+    // The readout is a DOM layer, so update it when the isolation state changes.
+    // updateGLVolume can finish without going through our drawScene hook.
+    drawIsolationHUD();
   }
 
   // Full stats for one label, formatted as lines for the on-screen readout.
@@ -623,7 +627,8 @@ async function main() {
     }
     const tile = nv1.view?.screenSlices?.find((s) => s.axCorSag === 4 /* RENDER */);
     if (isolatedLabel === null || !isolationStats || !segOverlay() || !tile) {
-      hudEl.hidden = true;
+      // niivue.css gives all divs a display value, overriding the hidden attribute.
+      hudEl.style.display = "none";
       return;
     }
     const dpr = window.devicePixelRatio || 1;
@@ -634,7 +639,7 @@ async function main() {
     hudEl.innerHTML =
       `<span style="color:rgb(${rgb})">${escapeHtml(lines[0])}</span>\n`
       + lines.slice(1).map(escapeHtml).join("\n");
-    hudEl.hidden = false;
+    hudEl.style.display = "block";
   }
 
   // True (pristine) label under the crosshair, even while a region is isolated,
