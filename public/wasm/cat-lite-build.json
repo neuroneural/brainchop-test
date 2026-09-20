@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/neuroneural/brainchopC",
+  "baseRevision": "ecc87b3db1654c5f583afe47f51ecdbb1916d3c0",
+  "sourceModified": false,
+  "compiler": "emcc (Emscripten gcc/clang-like replacement + linker emulating GNU ld) 6.0.6 (ce75e06884093bcefb86a6b8fd56a5d62a4cc245)\nCopyright (C) 2026 the Emscripten authors (see AUTHORS.txt)\nThis is free and open source software under the MIT license.\nThere is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+  "target": "make -C src wasm-cat-lite",
+  "sourceSha256": {
+    "src/Makefile": "8dfb3447a09114c437c0e13b5e805d9e525a3eeb15367bf22e52e793866e0d4b",
+    "src/cat_lite.c": "113743a5a24a10ceb5625b1b6d28ce19a62d5c725646827d5168f6ab880d50e4",
+    "src/cat_lite.h": "cd992dd8c805712536071efcc5919595f4d5d8ac4fd450f32c91256cd49aa0a4",
+    "src/bc_threads.c": "108a531070f98351be7138437218a279d006ed38d43f6669da119d0e7b68f438",
+    "src/bc_threads.h": "bde23d97cd836e1ca93ea9f0b21c438f029285b051a7afab729bbcffda63255b",
+    "src/bwlabel.c": "8c63fe4d5d942a11384e8468dedc36392ec8ccfcb7ed4f2e980d1ae51a43dd1d",
+    "src/bwlabel.h": "d820533de823a336815753319f3c2d187d8f14622989c42c9efb1a8cb94f384d",
+    "src/model_specs.h": "dc81cafa71cad49378e853030d6ce9294531c74d999ccf2ebc7647de0a059190",
+    "src/models/mindmap/model_def.h": "3b0e6beb12ebc8fa6eab7f481fa480790c48823f29dedec35255376fc448214f",
+    "src/pve_constants.h": "2bcbd8fceab885aba4b04cf0f61a4c878d6c5cab45422157af94e4e090d5ac4c"
+  },
+  "artifactSha256": {
+    "cat-lite.js": "4bd942c68363ddc8b6c727c2011cd4e5be94b4793e3587651c92aa7a8dedae9a",
+    "cat-lite.wasm": "aae771a13e82ef8eeb597b3a4421f6d50e5a403b804d8686c9c3780a86da8354"
+  }
+}

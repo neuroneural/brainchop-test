@@ -1,3 +1,5 @@
+import { tryCatLiteWasm } from './cat-lite-wasm.js';
+
 // Lightweight, browser-side approximation of CAT's AMAP/PVE idea.
 //
 // This is deliberately separate from the ordinary grouped-softmax output. It
@@ -456,7 +458,8 @@ export async function runCatLite(priors, intensity, modelEntry, statData, toNati
     native.push(await toNative(priors[tissue], tissue));
     priors[tissue] = null; // release each model-order map before the next readback
   }
-  const { tissues, stats } = applyCatLitePartialVolume(native, intensity, CONFORMED_SHAPE, modelEntry);
+  const fitted = await tryCatLiteWasm(native, intensity, CONFORMED_SHAPE, modelEntry);
+  const { tissues, stats } = fitted ?? applyCatLitePartialVolume(native, intensity, CONFORMED_SHAPE, modelEntry);
   statData.Output_Type = 'Continuous tissue probability';
   statData.Tissue = 'GM/WM/CSF';
   statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;

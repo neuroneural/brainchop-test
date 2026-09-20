@@ -1,0 +1,18 @@
+<!doctype html>
+<title>CAT-lite wasm integration</title>
+<script type="module">
+import { check, checkUnavailable } from './cat-lite-wasm-check.js';
+window.checkUnavailable = checkUnavailable;
+window.checkCatLite = async () => {
+  const main = await check();
+  const worker = new Worker(new URL('./cat-lite-wasm-worker.js', import.meta.url), { type: 'module' });
+  try {
+    const result = await new Promise((resolve, reject) => {
+      worker.onmessage = ({ data }) => data.error ? reject(new Error(data.error)) : resolve(data.result);
+      worker.onerror = reject;
+      worker.postMessage(null);
+    });
+    return { main, worker: result };
+  } finally { worker.terminate(); }
+};
+</script>
