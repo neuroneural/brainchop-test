@@ -15,6 +15,8 @@
 // Without --arm, the model's shipped runner is the only arm.
 // Needs system Chrome with hardware WebGPU (refuses software adapters). On
 // Linux: CHROME=/usr/bin/google-chrome (default) and access to /dev/dri/renderD*.
+// macOS: Chrome from /Applications (default); runs headed, because headless
+// Chrome has no GPU on macOS. HEADLESS=0/1 overrides either default.
 //
 // Scope: excludes NIfTI decode, normalization, transposes and postprocessing.
 // setup = setupNet (weight upload + pipeline compilation); run = one inference
@@ -265,7 +267,10 @@ async function main() {
     arms: args.arms.map(a => ({ ...a, runnerSha: sha(readFileSync(a.runner)), weightsSha: sha(readFileSync(a.weights)) })),
     scope: 'normalized+transposed input -> runner output readback; setup = setupNet', rows: [],
   }
-  const chromeArgs = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angle=vulkan', '--ignore-gpu-blocklist',
+  const mac = process.platform === 'darwin'
+  const chromePath = process.env.CHROME || (mac ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '/usr/bin/google-chrome')
+  const headless = process.env.HEADLESS ? process.env.HEADLESS === '1' : !mac
+  const chromeArgs = ['--enable-unsafe-webgpu', ...(mac ? [] : ['--enable-features=Vulkan', '--use-angle=vulkan', '--ignore-gpu-blocklist']),
     // Full-resolution GPU timestamps (Chrome quantizes them to 100 us by default).
     '--enable-dawn-features=allow_unsafe_apis', '--disable-dawn-features=timestamp_quantization']
   const reference = new Map()   // round -> first arm's output, for agreement counts
@@ -273,7 +278,7 @@ async function main() {
     for (let round = 0; round < args.rounds; round++) {
       const order = round % 2 ? [...args.arms].reverse() : args.arms
       for (const arm of order) {
-        const browser = await chromium.launch({ executablePath: process.env.CHROME || '/usr/bin/google-chrome', headless: true, args: chromeArgs })
+        const browser = await chromium.launch({ executablePath: chromePath, headless, args: chromeArgs })
         try {
           const page = await browser.newPage()
           page.on('pageerror', e => console.error('pageerror:', e.message))
