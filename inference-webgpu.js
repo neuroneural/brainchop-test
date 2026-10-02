@@ -178,6 +178,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             const response = await fetch(modelEntry.webgpu_safetensor);
             if (!response.ok) throw new Error(`HTTP ${response.status} for ${modelEntry.webgpu_safetensor}`);
             const execute = await setupNativeNet(device, new Uint8Array(await response.arrayBuffer()), callbackUI, modelEntry);
+            execute.kernels = 'hand-written';
             callbackUI('Using hand-written WebGPU kernels.', 0.45);
             return execute;
         } catch (error) {
@@ -424,7 +425,14 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         }
 
         const Inference_t = ((performance.now() - inferenceStartTime) / 1000).toFixed(4);
-        callbackUI(`WebGPU inference took ${Inference_t}s.`, 0.9);
+        // Every buffer this run created is in collectedBuffers and none is freed
+        // before the cleanup below, so their sum is the model's peak GPU memory.
+        const gpuMiB = collectedBuffers.reduce((sum, b) => sum + (Number(b?.size) || 0), 0) / 1048576;
+        statData.GPU_Memory_MiB = Math.round(gpuMiB);
+        statData.WebGPU_Kernels = execute.kernels || 'tinygrad';
+        const gpuMemory = gpuMiB >= 1024 ? `${(gpuMiB / 1024).toFixed(2)} GiB` : `${Math.round(gpuMiB)} MiB`;
+        callbackUI(`WebGPU inference (${statData.WebGPU_Kernels} kernels) took ${Inference_t}s, ` +
+            `${gpuMemory} GPU memory.`, 0.9);
 
         // --- POST-PROCESSING ---
         console.log('Inference result shapes:', inferenceResultArray.map((result) => result?.length));
