@@ -506,10 +506,14 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         markSuccess(statData, Inference_t, Postprocess_t);
 
+        // The timing/memory line above is replaced within a second, so repeat it
+        // here; this message stays until the next click moves the crosshair.
         callbackUI(
             modelEntry.modelName + (isProbabilityOutput
                 ? '<br>Probability map finished.'
-                : '<br>Segmentation finished.'),
+                : '<br>Segmentation finished.') +
+            ` Inference ${Number(Inference_t).toFixed(2)} s · ${gpuMemory} GPU memory` +
+            ` (${statData.WebGPU_Kernels} kernels).`,
             1,
             '',
             statData
