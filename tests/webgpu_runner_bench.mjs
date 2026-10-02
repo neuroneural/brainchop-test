@@ -11,8 +11,12 @@
 //   node tests/webgpu_runner_bench.mjs --model mindgrab \
 //     --arm shipped=webgpu_runners/mindgrab_runner.js,public/models/mindgrab/model.safetensors \
 //     --arm amd=/tmp/amd/mindgrab_runner.js,/tmp/amd/model.safetensors [--split-submit]
+//   node tests/webgpu_runner_bench.mjs --model mindmap --native
+//   node tests/webgpu_runner_bench.mjs --model model30chan50cls --native   (any public/models dir)
 //
-// Without --arm, the model's shipped runner is the only arm.
+// Without --arm, the model's shipped runner is the only arm. --native adds the
+// hand-written kernels (webgpu_native/, bundled here with esbuild) next to it;
+// `--arm name=native,weights.safetensors` does the same with explicit weights.
 // Needs system Chrome with hardware WebGPU (refuses software adapters). On
 // Linux: CHROME=/usr/bin/google-chrome (default) and access to /dev/dri/renderD*.
 // macOS: Chrome from /Applications (default); runs headed, because headless
@@ -34,12 +38,27 @@ import { chromium } from 'playwright'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 const MODELS = {
-  mindgrab: { runner: 'mindgrab', weights: 'public/models/mindgrab/model.safetensors', nclass: 2 },
-  mindmap: { runner: 'model24chan18cls_gdice_prio', weights: 'public/models/model24chan18cls_gdice_prio/model.safetensors', nclass: 18 },
-  model16: { runner: 'model16chan18cls', weights: 'public/models/model16chan18cls/model.safetensors', nclass: 18 },
+  mindgrab: { runner: 'mindgrab', dir: 'mindgrab', weights: 'public/models/mindgrab/model.safetensors', nclass: 2 },
+  mindmap: { runner: 'model24chan18cls_gdice_prio', dir: 'model24chan18cls_gdice_prio', weights: 'public/models/model24chan18cls_gdice_prio/model.safetensors', nclass: 18 },
+  model16: { runner: 'model16chan18cls', dir: 'model16chan18cls', weights: 'public/models/model16chan18cls/model.safetensors', nclass: 18 },
 }
 
-function parseArgs(argv) {
+// Any other --model is a public/models/<dir> name: its runner comes from the
+// app's labels entry for that directory, its class count from the weights.
+async function lookupModel(dir) {
+  const { inferenceModelsList } = await import(join(root, 'brainchop-parameters.js'))
+  const e = inferenceModelsList.find(x => x.outputType !== 'probability' && x.webgpu_runner &&
+    String(x.webgpu_safetensor || '').includes(`/models/${dir}/`))
+  if (!e) throw Error(`--model ${dir}: no labels model with a WebGPU runner uses public/models/${dir}`)
+  const weights = `public/models/${dir}/model.safetensors`
+  const b = readFileSync(join(root, weights)), n = Number(b.readBigUInt64LE(0))
+  const head = Object.entries(JSON.parse(b.subarray(8, 8 + n).toString()))
+    .filter(([k, v]) => /^m\.model\.\d+\.weight$/.test(k) && v.shape.length === 5)
+    .sort((x, y) => Number(x[0].split('.')[2]) - Number(y[0].split('.')[2])).pop()
+  return { runner: e.webgpu_runner, dir, weights, nclass: head[1].shape[0] }
+}
+
+async function parseArgs(argv) {
   const a = { model: 'mindgrab', rounds: 3, repeats: 3, arms: [], input: 'public/t1_crop.nii.gz', out: null, splitSubmit: false }
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i], v = argv[i + 1]
@@ -49,16 +68,18 @@ function parseArgs(argv) {
     else if (k === '--input') { a.input = v; i++ }
     else if (k === '--out') { a.out = v; i++ }
     else if (k === '--split-submit') a.splitSubmit = true
+    else if (k === '--native') a.native = true
     else if (k === '--arm') {
       const m = /^([\w.-]+)=([^,]+),(.+)$/.exec(v)
       if (!m) throw Error(`--arm wants name=runner.js,weights.safetensors, got ${v}`)
-      a.arms.push({ name: m[1], runner: resolve(m[2]), weights: resolve(m[3]) }); i++
+      a.arms.push({ name: m[1], native: m[2] === 'native', runner: m[2] === 'native' ? null : resolve(m[2]), weights: resolve(m[3]) }); i++
     } else throw Error(`unknown argument ${k}`)
   }
-  const model = MODELS[a.model]
-  if (!model) throw Error(`--model must be one of ${Object.keys(MODELS).join(', ')}`)
+  const model = MODELS[a.model] || await lookupModel(a.model)
   if (!a.arms.length) a.arms.push({ name: 'shipped', runner: join(root, `webgpu_runners/${model.runner}_runner.js`), weights: join(root, model.weights) })
-  for (const arm of a.arms) for (const f of [arm.runner, arm.weights]) if (!existsSync(f)) throw Error(`missing ${f}`)
+  if (a.native) a.arms.push({ name: 'native', native: true, runner: null, weights: join(root, model.weights) })
+  for (const arm of a.arms) for (const f of [arm.runner, arm.weights]) if (f !== null && !existsSync(f)) throw Error(`missing ${f}`)
+  a.modelDir = model.dir
   if (!Number.isInteger(a.rounds) || a.rounds < 1 || !Number.isInteger(a.repeats) || a.repeats < 1) throw Error('invalid --rounds/--repeats')
   a.nclass = model.nclass
   a.out = resolve(a.out ?? join(root, 'bench-results', `${a.model}-${new Date().toISOString().replace(/[:.]/g, '-')}`))
@@ -240,8 +261,23 @@ async function pageBench({ armName, repeats, n, nclass, splitSubmit }) {
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2))
+  const args = await parseArgs(process.argv.slice(2))
   mkdirSync(args.out, { recursive: true })
+  // Hand-written arms: bundle webgpu_native/ for this model into one ES module
+  // exposing the tinygrad-runner interface, setupNet(device, weights).
+  for (const arm of args.arms.filter(x => x.native)) {
+    const { build } = await import('esbuild')
+    arm.runner = join(args.out, `native-${arm.name}.js`)
+    await build({
+      stdin: {
+        contents: `import { setupNet } from ${JSON.stringify(join(root, 'webgpu_native/meshnet_gpu.js'))};\n` +
+          `export default { setupNet: (device, weights) => setupNet(device, weights, null, ` +
+          `{ path: '/models/${args.modelDir}/model.json', webgpu_safetensor: 'bench' }) };\n`,
+        resolveDir: root, loader: 'js',
+      },
+      bundle: true, format: 'esm', outfile: arm.runner, logLevel: 'warning',
+    })
+  }
   const n = 256 ** 3
   console.log(`model=${args.model} arms=${args.arms.map(a => a.name).join(',')} rounds=${args.rounds} repeats=${args.repeats}${args.splitSubmit ? ' split-submit' : ''}`)
   const input = loadInput(args.input)

@@ -8,7 +8,8 @@ Guidance for AI sessions working on this repo: browser MRI segmentation app (Vit
 - `responsive-layout.js` — `nv-narrow` body class on phone-like viewports (CSS slims the toolbar) plus the single-plane pane switcher. 1.0 scores the multiplanar tiling itself and re-measures its canvas from a ResizeObserver, so the old layout-scoring override, draw hook and resize nudge are gone.
 - `touch-view.js` — blocks document pinch-zoom, then implements canvas pinch zoom. 1.0 drives everything from pointer events and has no gesture concept, so two-finger pointer events are stopped in the capture phase before niivue reads them as a second drag; zoom is anchored on the crosshair by mirroring the unexported `zoomPan2DAbout`.
 - `brainchop-parameters.js` — `inferenceModelsList`: one entry per model, drives dispatch/postprocess/UI (see below).
-- `inference-webgpu.js` — WebGPU runner, main thread. Loads `webgpu_runners/<name>`, runs `model.safetensors`.
+- `inference-webgpu.js` — WebGPU runner, main thread. `setupNetwork()` tries the hand-written kernels (`webgpu_native/`) first, then loads the tinygrad runner `webgpu_runners/<name>`; both run `model.safetensors` and share pre/postprocessing.
+- `webgpu_native/` — hand-written WGSL MeshNet ported from brainchopC (`src/webgpu_kernels.h`, `src/backend_webgpu.c`): `kernels.js` generates the WGSL for any channel count and all three families, `meshnet_gpu.js` is the host (same `setupNet` → `execute(input)` interface as the tinygrad runners; weights via `webgl2_runners/weights.js`, descriptors via `webgl2_runners/descriptors.js`), `presets.js` picks threads × voxels per vendor (AMD 256×1, else 64×2; `?wgPreset=128x2` overrides). Not yet: probability/CAT-lite output, TTA, fp32.
 - `inference-webgl2.js` — thin wrapper that spawns `brainchop-webgl2-worker.js` and normalizes its result to resolve/reject.
 - `brainchop-webgl2-worker.js` — native WebGL2 path: raw GLSL via `webgl2_runners/` (descriptors, kernels, weights, MeshNet GL driver, probability postprocess), no tfjs inference (tfjs used only for pre/post tensor ops). Mirrors `inference-webgpu.js` pre/postprocessing exactly (load-bearing: same transpose convention as the safetensors export).
 - `brainchop-webworker.js` / `brainchop-mainthread.js` — legacy tfjs paths (`inference-logic.js`, `tensor-utils.js`), fallback when WebGPU and native WebGL2 both decline/fail.
@@ -29,13 +30,14 @@ node tests/cat-lite.mjs
 node tests/cortical_relabel.mjs
 node tests/webgl2-probability.mjs
 node tests/webgl2_gate.mjs [chromium|firefox]
+node tests/webgpu_runner_bench.mjs --model mindmap --native   # hand-written vs tinygrad, needs system Chrome + WebGPU
 ```
 
 ## Backend dispatch (`main.js: runInferenceChain`)
 
 Order, each stage falling through on failure/refusal (never surfaced individually to the user):
 
-1. **WebGPU** — if `isWebGpuAvailable && modelEntry.webgpu_safetensor` (skippable via `FORCE_WEBGL2_TESTING`).
+1. **WebGPU** — if `isWebGpuAvailable && modelEntry.webgpu_safetensor` (skippable via `FORCE_WEBGL2_TESTING`). Hand-written kernels when the model has a descriptor and the device has `shader-f16`, else the tinygrad runner; `?webgpuKernels=tinygrad` forces the latter for A/B checks. Per-layer submissions keep each GPU job under the driver watchdog (amdgpu reset a slow single-submission runner during testing).
 2. **Native WebGL2** (`ENABLE_NATIVE_WEBGL2`, skippable via `FORCE_TFJS_WEBGL_TESTING`) — dynamic import of `inference-webgl2.js`; also needs `modelEntry.webgpu_safetensor`, plus `nativeWebgl2Available()` (OffscreenCanvas + webgl2) and a `webgl2_runners/descriptors.js` entry for the model.
 3. `outputType: 'probability'` models stop here with an error: the legacy tfjs paths only return argmax labels.
 4. **tfjs WebWorker** (`brainchop-webworker.js`) — tried fast, then retried with `enableSeqConv: true` on failure.
