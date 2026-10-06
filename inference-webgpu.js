@@ -12,6 +12,23 @@ import {
     ExecutionModes
 } from './diagnostic-stats.js';
 import { isCatLite, runCatLite } from './cat-lite.js';
+import { setupNet as setupNativeNet, nativeUnsupportedReason } from './webgpu_native/meshnet_gpu.js';
+
+// Hand-written WGSL kernels (webgpu_native/, ported from brainchopC) run first
+// when the model has a webgl2_runners/descriptors.js entry; the tinygrad runner
+// in webgpu_runners/ is the fallback. ?webgpuKernels=tinygrad forces the
+// tinygrad runner, for side-by-side comparison.
+const ENABLE_NATIVE_WEBGPU = true;
+
+function nativeWebGpuDisabledReason() {
+    if (!ENABLE_NATIVE_WEBGPU) return 'disabled (ENABLE_NATIVE_WEBGPU)';
+    try {
+        if (new URLSearchParams(globalThis.location?.search || '').get('webgpuKernels') === 'tinygrad') {
+            return 'disabled by ?webgpuKernels=tinygrad';
+        }
+    } catch { /* no location (worker/test) */ }
+    return null;
+}
 
 // Use relative paths and eager loading for better error detection
 const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js', { eager: true });
@@ -154,6 +171,23 @@ function logDeviceCapabilities(device, modelEntry) {
 // Helper to safely setup the network
 async function setupNetwork(device, modelEntry, callbackUI) {
     logDeviceCapabilities(device, modelEntry);
+
+    const nativeReason = nativeWebGpuDisabledReason() ?? nativeUnsupportedReason(device, modelEntry);
+    if (!nativeReason) {
+        try {
+            const response = await fetch(modelEntry.webgpu_safetensor);
+            if (!response.ok) throw new Error(`HTTP ${response.status} for ${modelEntry.webgpu_safetensor}`);
+            const execute = await setupNativeNet(device, new Uint8Array(await response.arrayBuffer()), callbackUI, modelEntry);
+            execute.kernels = 'hand-written';
+            callbackUI('Using hand-written WebGPU kernels.', 0.45);
+            return execute;
+        } catch (error) {
+            console.warn('[WebGPU-native] falling back to the tinygrad runner:', error?.message || error);
+        }
+    } else {
+        console.log(`[WebGPU-native] not used for ${modelEntry.modelName || modelEntry.webgpu_runner}: ${nativeReason}`);
+    }
+
     let runnerName = modelEntry.webgpu_runner;
     let weightsPath = modelEntry.webgpu_safetensor;
 
@@ -391,7 +425,14 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         }
 
         const Inference_t = ((performance.now() - inferenceStartTime) / 1000).toFixed(4);
-        callbackUI(`WebGPU inference took ${Inference_t}s.`, 0.9);
+        // Every buffer this run created is in collectedBuffers and none is freed
+        // before the cleanup below, so their sum is the model's peak GPU memory.
+        const gpuMiB = collectedBuffers.reduce((sum, b) => sum + (Number(b?.size) || 0), 0) / 1048576;
+        statData.GPU_Memory_MiB = Math.round(gpuMiB);
+        statData.WebGPU_Kernels = execute.kernels || 'tinygrad';
+        const gpuMemory = gpuMiB >= 1024 ? `${(gpuMiB / 1024).toFixed(2)} GiB` : `${Math.round(gpuMiB)} MiB`;
+        callbackUI(`WebGPU inference (${statData.WebGPU_Kernels} kernels) took ${Inference_t}s, ` +
+            `${gpuMemory} GPU memory.`, 0.9);
 
         // --- POST-PROCESSING ---
         console.log('Inference result shapes:', inferenceResultArray.map((result) => result?.length));
@@ -465,10 +506,14 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         markSuccess(statData, Inference_t, Postprocess_t);
 
+        // The timing/memory line above is replaced within a second, so repeat it
+        // here; this message stays until the next click moves the crosshair.
         callbackUI(
             modelEntry.modelName + (isProbabilityOutput
                 ? '<br>Probability map finished.'
-                : '<br>Segmentation finished.'),
+                : '<br>Segmentation finished.') +
+            ` Inference ${Number(Inference_t).toFixed(2)} s · ${gpuMemory} GPU memory` +
+            ` (${statData.WebGPU_Kernels} kernels).`,
             1,
             '',
             statData

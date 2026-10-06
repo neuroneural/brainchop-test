@@ -34,3 +34,4 @@ timing.json
 .antigravitycli/
 # lockfile for bun; npm's package-lock.json is the committed one
 bun.lock
+bench-results/
