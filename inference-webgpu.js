@@ -169,15 +169,22 @@ function logDeviceCapabilities(device, modelEntry) {
 }
 
 // Helper to safely setup the network
-async function setupNetwork(device, modelEntry, callbackUI) {
+// `timings` receives 'fetch weights' and 'build network' (pipelines, weight
+// packing and upload) in ms.
+async function setupNetwork(device, modelEntry, callbackUI, timings = {}) {
     logDeviceCapabilities(device, modelEntry);
 
     const nativeReason = nativeWebGpuDisabledReason() ?? nativeUnsupportedReason(device, modelEntry);
     if (!nativeReason) {
         try {
+            let mark = performance.now();
             const response = await fetch(modelEntry.webgpu_safetensor);
             if (!response.ok) throw new Error(`HTTP ${response.status} for ${modelEntry.webgpu_safetensor}`);
-            const execute = await setupNativeNet(device, new Uint8Array(await response.arrayBuffer()), callbackUI, modelEntry);
+            const weights = new Uint8Array(await response.arrayBuffer());
+            timings['fetch weights'] = performance.now() - mark;
+            mark = performance.now();
+            const execute = await setupNativeNet(device, weights, callbackUI, modelEntry);
+            timings['build network'] = performance.now() - mark;
             execute.kernels = 'hand-written';
             callbackUI('Using hand-written WebGPU kernels.', 0.45);
             return execute;
@@ -253,6 +260,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
 
     // Try to fetch the weights file with error handling
     let weightsBuffer;
+    const fetchStarted = performance.now();
     try {
         const response = await fetch(weightsPath);
         if (!response.ok) {
@@ -265,18 +273,23 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         );
     }
 
+    timings['fetch weights'] = performance.now() - fetchStarted;
+
     // Get setupNet function (handle both named and default exports)
     const setupNet = runnerModule.setupNet || runnerModule.default?.setupNet;
 
     // Setup the network with proper error context
     try {
+        const buildStarted = performance.now();
         let weights = new Uint8Array(weightsBuffer);
         // fp16 runner: if the file holds fp32 master weights, cast to fp16 now
         // (no-op when the file is already fp16). The fp32 runner keeps fp32 as-is.
         if (!useF32) weights = castSafetensorsToF16(weights, callbackUI);
         // Generated runners ignore the fourth argument. Probability-map runners
         // use it for softmax temperature, tissue grouping, and display choice.
-        return await setupNet(device, weights, callbackUI, modelEntry);
+        const execute = await setupNet(device, weights, callbackUI, modelEntry);
+        timings['build network'] = performance.now() - buildStarted;
+        return execute;
     } catch (error) {
         throw new Error(
             `Failed to setup network for '${runnerName}': ${error.message}`
@@ -284,9 +297,39 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     }
 }
 
+// Same categories and line format as brainchop-next's src/timings.js, so the
+// two apps' consoles can be compared (and parsed) the same way. 'setup' is
+// 'fetch weights' + 'build network'; reslice and write happen only on a
+// native-space save and are logged there.
+function logStageTimings(modelEntry, kernels, stages, totalMs) {
+    const round = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Math.round(v * 10) / 10]));
+    const categories = {
+        'read input': 0,
+        conform: stages.conform,
+        preprocess: stages.preprocess,
+        setup: (stages['fetch weights'] ?? 0) + (stages['build network'] ?? 0),
+        inference: stages.inference,
+        'post-process': stages['post-process'],
+        display: stages.display,
+        total: totalMs,
+    };
+    console.log(`[stage-timings] ${JSON.stringify({ app: 'brainchop-test', model: modelEntry.modelName,
+        backend: `webgpu (${kernels} kernels)`, ...round(categories), stages: round(stages) })}`);
+    console.table(round(stages));
+}
+
 export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
     callbackUI('Starting WebGPU inference...', 0);
     const inferenceStartTime = performance.now();
+    // Per-stage ms, logged as one [stage-timings] line at the end. Conform ran
+    // before this call (main.js ensureConformed) and arrives in opts.conformMs.
+    const stageTimings = { conform: opts.conformMs ?? 0 };
+    let stageMark = inferenceStartTime;
+    const lap = (stage) => {
+        const now = performance.now();
+        stageTimings[stage] = now - stageMark;
+        stageMark = now;
+    };
     const statData = createStatData(modelEntry, ExecutionModes.WEBGPU);
     statData.isModelFullVol = true;
 
@@ -362,6 +405,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         const inputData = await tensor.data();
         const finalShape = tensor.shape;
         tensor.dispose();
+        lap('preprocess');
         callbackUI('Input data prepared (full volume).', 0.3);
 
         // --- DYNAMIC RUNNER & INFERENCE ---
@@ -392,7 +436,10 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         device.pushErrorScope('out-of-memory');
         oomScopeOpen = true; // ensure the scope is balanced even if the steps below throw
 
-        const execute = await setupNetwork(device, modelEntry, callbackUI);
+        // No queue sync around setup: as in brainchopC, queued weight writes
+        // finish inside 'inference' rather than 'build network'.
+        const execute = await setupNetwork(device, modelEntry, callbackUI, stageTimings);
+        stageMark = performance.now();
 
         if (typeof execute !== 'function') {
             throw new Error(
@@ -416,6 +463,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
                 `- falling back to WebGL2.`
             );
         }
+        lap('inference');
 
         if (!inferenceResultArray || !Array.isArray(inferenceResultArray)) {
             throw new Error(
@@ -490,7 +538,12 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         }
         const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
 
+        stageTimings['post-process'] = Number(Postprocess_t) * 1000;
+        stageMark = performance.now();
         await callbackImg(finalImage, opts, modelEntry, maskResult.mask);
+        lap('display');
+        logStageTimings(modelEntry, statData.WebGPU_Kernels, stageTimings,
+            performance.now() - inferenceStartTime + stageTimings.conform);
 
         if (!isProbabilityOutput) {
             // Add label statistics from categorical output.

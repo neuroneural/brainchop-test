@@ -720,11 +720,13 @@ async function main() {
 
     await closeAllOverlays();
     resetLabelIsolation(); // drop any active single-label view + its HUD
-    await ensureConformed();
+    const conformStarted = performance.now();
+    await ensureConformed(); // a no-op, ~0 ms, once this image has been conformed
+    const conformMs = performance.now() - conformStarted;
 
     const modelEntry = inferenceModelsList[selectedModelIndex];
 
-    const opts = { ...brainChopOpts };
+    const opts = { ...brainChopOpts, conformMs };
     // Fix URL construction to handle './' base correctly and allow subfolders
     const rootUrl = new URL(import.meta.env.BASE_URL, window.location.href).href;
     // Remove trailing slash if present to avoid double slashes when appending paths starting with /
@@ -984,8 +986,14 @@ async function main() {
     try {
       const overlays = nv1.volumes.slice(1);
       for (const overlay of overlays) {
+        let mark = performance.now();
         const outNV = await withPristineLabels(() => resliceLabelsToNative(overlay));
+        const resliceMs = performance.now() - mark;
+        mark = performance.now();
         await downloadVolume(outNV, overlayFilename(overlay, overlays.length, "_native"));
+        const writeMs = performance.now() - mark;
+        console.log(`[stage-timings] ${JSON.stringify({ app: "brainchop-test", export: "native",
+          reslice: Math.round(resliceMs * 10) / 10, write: Math.round(writeMs * 10) / 10 })}`);
       }
       if (includeMask) {
         const mask = resliceLabelsToNative(binaryMaskVolume());
