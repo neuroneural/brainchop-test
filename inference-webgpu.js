@@ -315,7 +315,10 @@ function logStageTimings(modelEntry, kernels, stages, totalMs) {
     };
     console.log(`[stage-timings] ${JSON.stringify({ app: 'brainchop-test', model: modelEntry.modelName,
         backend: `webgpu (${kernels} kernels)`, ...round(categories), stages: round(stages) })}`);
+    console.table(round(categories));
+    console.groupCollapsed('stage detail');
     console.table(round(stages));
+    console.groupEnd();
 }
 
 export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
