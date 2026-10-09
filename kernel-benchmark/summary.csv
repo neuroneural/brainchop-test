@@ -1,0 +1,8 @@
+model,inference_ms_handwritten,inference_ms_tinygrad,speedup,gpu_mib_handwritten,gpu_mib_tinygrad,memory_change_pct,total_ms_handwritten,total_ms_tinygrad
+"Aparc+Aseg 104",965.1,2030.0,2.10,1710,2652,-35.5,1962,3150
+"Aparc+Aseg 104 (lesion)",967.1,1994.5,2.06,1710,2652,-35.5,1976,3119
+"Subcortical + GWM (fast)",471.5,787.1,1.67,1188,1311,-9.4,1655,2059
+"Aparc+Aseg 50",844.3,1284.1,1.52,2222,2365,-6.1,1974,2514
+"Subcortical + GWM",951.7,1400.8,1.47,1710,2529,-32.4,2218,2709
+"Skull stripping (MindGrab)",838.1,989.4,1.18,1188,1638,-27.5,1712,1949
+"Tissue GWM (light)",130.2,127.4,0.98,676,512,32.0,1008,1070

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="748" viewBox="0 0 1600 748" font-family="'Inter', 'Helvetica Neue', Arial, sans-serif">
+<rect width="1600" height="748" fill="#ffffff"/>
+<text x="40" y="58" font-size="34" font-weight="650" fill="#0b0b0b">End-to-end run time (conform → overlay shown)</text>
+<text x="40" y="96" font-size="21" fill="#52514e">brainchop-test · WebGPU · 256³ volume · AMD Radeon 8060S, Chrome · mean of runs 2–4</text>
+<g transform="translate(330,122)" font-size="19" fill="#52514e">
+  <rect x="0" y="-14" width="16" height="16" rx="3" fill="#2a78d6"/><text x="24" y="0">Hand-written kernels</text>
+  <rect x="250" y="-14" width="16" height="16" rx="3" fill="#eb6834"/><text x="274" y="0">tinygrad kernels</text>
+</g>
+<text x="1560" y="122" font-size="19" fill="#52514e" text-anchor="end">speedup</text><line x1="330" x2="330" y1="142" y2="668" stroke="#e8e7e2" stroke-width="1.5"/>
+<text x="330" y="698" font-size="18" fill="#8a8984" text-anchor="middle">0</text><line x1="627.1428571428571" x2="627.1428571428571" y1="142" y2="668" stroke="#e8e7e2" stroke-width="1.5"/>
+<text x="627.1428571428571" y="698" font-size="18" fill="#8a8984" text-anchor="middle">1,000</text><line x1="924.2857142857142" x2="924.2857142857142" y1="142" y2="668" stroke="#e8e7e2" stroke-width="1.5"/>
+<text x="924.2857142857142" y="698" font-size="18" fill="#8a8984" text-anchor="middle">2,000</text><line x1="1221.4285714285713" x2="1221.4285714285713" y1="142" y2="668" stroke="#e8e7e2" stroke-width="1.5"/>
+<text x="1221.4285714285713" y="698" font-size="18" fill="#8a8984" text-anchor="middle">3,000 ms</text><text x="312" y="194" font-size="21" fill="#0b0b0b" text-anchor="end">Aparc+Aseg 104</text><path d="M330,159 h578.9051428571428 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-578.9051428571428 z" fill="#2a78d6"/>
+<text x="922.9051428571428" y="179" font-size="18" fill="#52514e">1,962</text><path d="M330,189 h932.0594285714287 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-932.0594285714287 z" fill="#eb6834"/>
+<text x="1276.0594285714287" y="209" font-size="18" fill="#52514e">3,150</text><text x="1560" y="196" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.61×</text><text x="312" y="268" font-size="21" fill="#0b0b0b" text-anchor="end">Aparc+Aseg 104 (lesion)</text><path d="M330,233 h583.0453333333334 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-583.0453333333334 z" fill="#2a78d6"/>
+<text x="927.0453333333334" y="253" font-size="18" fill="#52514e">1,976</text><path d="M330,263 h922.9173333333333 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-922.9173333333333 z" fill="#eb6834"/>
+<text x="1266.9173333333333" y="283" font-size="18" fill="#52514e">3,119</text><text x="1560" y="270" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.58×</text><text x="312" y="342" font-size="21" fill="#0b0b0b" text-anchor="end">Subcortical + GWM (fast)</text><path d="M330,307 h487.78133333333335 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-487.78133333333335 z" fill="#2a78d6"/>
+<text x="831.7813333333334" y="327" font-size="18" fill="#52514e">1,655</text><path d="M330,337 h607.9062857142857 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-607.9062857142857 z" fill="#eb6834"/>
+<text x="951.9062857142857" y="357" font-size="18" fill="#52514e">2,059</text><text x="1560" y="344" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.24×</text><text x="312" y="416" font-size="21" fill="#0b0b0b" text-anchor="end">Aparc+Aseg 50</text><path d="M330,381 h582.5996190476191 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-582.5996190476191 z" fill="#2a78d6"/>
+<text x="926.5996190476191" y="401" font-size="18" fill="#52514e">1,974</text><path d="M330,411 h742.9279999999999 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-742.9279999999999 z" fill="#eb6834"/>
+<text x="1086.9279999999999" y="431" font-size="18" fill="#52514e">2,514</text><text x="1560" y="418" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.27×</text><text x="312" y="490" font-size="21" fill="#0b0b0b" text-anchor="end">Subcortical + GWM</text><path d="M330,455 h654.9539047619049 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-654.9539047619049 z" fill="#2a78d6"/>
+<text x="998.9539047619049" y="475" font-size="18" fill="#52514e">2,218</text><path d="M330,485 h800.8213333333333 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-800.8213333333333 z" fill="#eb6834"/>
+<text x="1144.8213333333333" y="505" font-size="18" fill="#52514e">2,709</text><text x="1560" y="492" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.22×</text><text x="312" y="564" font-size="21" fill="#0b0b0b" text-anchor="end">Skull stripping (MindGrab)</text><path d="M330,529 h504.6689523809524 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-504.6689523809524 z" fill="#2a78d6"/>
+<text x="848.6689523809524" y="549" font-size="18" fill="#52514e">1,712</text><path d="M330,559 h575.0224761904761 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-575.0224761904761 z" fill="#eb6834"/>
+<text x="919.0224761904761" y="579" font-size="18" fill="#52514e">1,949</text><text x="1560" y="566" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.14×</text><text x="312" y="638" font-size="21" fill="#0b0b0b" text-anchor="end">Tissue GWM (light)</text><path d="M330,603 h295.4605714285715 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-295.4605714285715 z" fill="#2a78d6"/>
+<text x="639.4605714285715" y="623" font-size="18" fill="#52514e">1,008</text><path d="M330,633 h314.0022857142858 a4,4 0 0 1 4,4 v18 a4,4 0 0 1 -4,4 h-314.0022857142858 z" fill="#eb6834"/>
+<text x="658.0022857142858" y="653" font-size="18" fill="#52514e">1,070</text><text x="1560" y="640" font-size="25" font-weight="650" text-anchor="end" fill="#0f6b2f">1.06×</text>
+</svg>
