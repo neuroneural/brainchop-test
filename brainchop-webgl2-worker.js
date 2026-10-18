@@ -33,7 +33,7 @@ import {
   createStatData, addLabelStats, markSuccess, markFailure, ExecutionModes,
 } from './diagnostic-stats.js';
 import { descriptorFor } from './webgl2_runners/descriptors.js';
-import { parseSafetensors, describeSafetensors, packWeights, deriveDescriptor } from './webgl2_runners/weights.js';
+import { parseSafetensors, describeSafetensors, applyClassifierBias, packWeights, deriveDescriptor } from './webgl2_runners/weights.js';
 import { probeWebgl2, runMeshNetGL } from './webgl2_runners/meshnet_gl.js';
 import { tissueProbabilityConfig, smoothAndGateTissuePriors } from './webgl2_runners/probability.js';
 import { isCatLite, runCatLite } from './cat-lite.js';
@@ -87,7 +87,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   if (!stRes.ok) { refuse(`could not fetch ${stUrl}: ${stRes.status}`); return; }
   const raw = await stRes.arrayBuffer();
   const tensors = parseSafetensors(raw);
-  const desc = describeSafetensors(tensors);
+  const desc = applyClassifierBias(describeSafetensors(tensors), modelEntry.classifierBias);
   const d = deriveDescriptor(desc, {
     nx: dim, ny: dim, nz: dim,
     activation: entry.activation,
