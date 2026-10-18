@@ -126,6 +126,16 @@ export function describeSafetensors(t) {
   return { convs, affines, classifier };
 }
 
+/** Restore a trained classifier bias omitted by an export, replacing any existing bias. */
+export function applyClassifierBias(desc, bias) {
+  if (bias == null) return desc;
+  if (bias.length !== desc.classifier?.outC || !Array.from(bias).every(Number.isFinite)) {
+    throw new Error('Classifier bias must contain one finite value per exported class');
+  }
+  desc.classifier.bias = Float32Array.from(bias);
+  return desc;
+}
+
 /**
  * Pack every layer's weights into one Float32Array laid out for the RGBA16F
  * weight texture, in brainchopC's order:

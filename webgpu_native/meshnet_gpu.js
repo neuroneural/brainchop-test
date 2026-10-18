@@ -19,7 +19,7 @@
 // ---------------------------------------------------------------------------
 
 import { descriptorFor } from '../webgl2_runners/descriptors.js';
-import { parseSafetensors, describeSafetensors, packWeights, deriveDescriptor } from '../webgl2_runners/weights.js';
+import { parseSafetensors, describeSafetensors, applyClassifierBias, packWeights, deriveDescriptor } from '../webgl2_runners/weights.js';
 import { buildWgsl } from './kernels.js';
 import { choosePreset } from './presets.js';
 
@@ -77,8 +77,8 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry) 
   const entry = descriptorFor(modelEntry);
   if (!entry) throw new Error(`webgpu-native: no descriptor for ${modelEntry.path}`);
   const bytes = safetensorBytes instanceof Uint8Array ? safetensorBytes : new Uint8Array(safetensorBytes);
-  const desc = describeSafetensors(parseSafetensors(
-    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
+  const desc = applyClassifierBias(describeSafetensors(parseSafetensors(
+    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))), modelEntry.classifierBias);
   const d = deriveDescriptor(desc, {
     nx: DIM, ny: DIM, nz: DIM, activation: entry.activation, dilations: entry.dilations,
   });

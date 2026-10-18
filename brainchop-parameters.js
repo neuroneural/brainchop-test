@@ -55,8 +55,11 @@ const inferenceModelsList = [
     path: '/models/mindgrab/model.json',
     modelName: '\u{1FA93}\u{1F9E0} omnimodal Skull Stripping',
     webgpu_safetensor: './models/mindgrab/model.safetensors',
-      webgpu_runner: 'mindgrab',
-      webgpuTTArunner: true,      
+    webgpu_runner: 'mindgrab',
+    // Exact output/bias values from the trained model.bin / model.25.bias.
+    // The GPU safetensors exports omit this tensor; restore it in every GPU path.
+    classifierBias: [1.525439739227295, -1.5258055925369263],
+    webgpuTTArunner: false, // The old TTA export also omits the classifier bias.
     webgpuStorageSize: 503316480, // 15 * 256^3 * 2 = 480 MiB largest full-volume fp16 activation buffer.
     preModelId: null, // Model run first e.g.  crop the brain  { null, 1, 2, ..  }
     preModelPostProcess: false, // If true, perform postprocessing to remove noisy regions after preModel inference generate output.
