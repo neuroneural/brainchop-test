@@ -1084,8 +1084,8 @@ export async function processSegmentationVolume(outLabelVolume, niftiImage, mode
     // --- Noise guard -------------------------------------------------------
     // A garbage/noise segmentation fragments into a huge number of tiny
     // connected components (we've seen ~1.5M). The labeling pass itself stays
-    // fast, but the per-component filtering below (O(cl^2) scans, per-class
-    // Maps and sorts) would then freeze the tab for minutes. So we run ONE
+    // fast, but downstream per-class Maps, sorting and neighbour voting can
+    // still be expensive for unusable output. So we run ONE
     // cheap plain labeling pass first (no filtering), and if the component
     // count is implausibly high we abort before any heavy work. Healthy
     // segmentations yield hundreds-to-few-thousand components, far below the
