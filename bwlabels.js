@@ -1,4 +1,12 @@
+// WeakMap keeps component metadata off the Uint32Array instance so assert.deepStrictEqual on `ls` stays identical.
+const labelMetaMap = new WeakMap()
+
 export class BWLabeler {
+  /** Return cached metadata associated with a conn=6 component-label map `ls`, if any. */
+  getLabelMeta(ls) {
+    return labelMetaMap.get(ls) || null
+  }
+
   // port of https://github.com/rordenlab/niimath/blob/master/src/bwlabel.c
   // return voxel address given row A, column B, and slice C
   idx(A, B, C, DIM) {
@@ -79,18 +87,181 @@ export class BWLabeler {
   } // check_previous_slice()
 
   // provisionally label all voxels in volume
-  do_initial_labelling(bw, dim, conn) {
-    const naboPS = new Uint32Array(32)
-    const tn = new Uint32Array(32)
+  do_initial_labelling(bw, dim, conn, scratch = null) {
+    const nx = dim[0] | 0
+    const ny = dim[1] | 0
+    const nz = dim[2] | 0
+    const plane = nx * ny
+    const nvox = plane * nz
     let label = 1
     const kGrowArrayBy = 8192
     let ttn = kGrowArrayBy
-    let tt = new Uint32Array(ttn).fill(0)
-    const il = new Uint32Array(dim[0] * dim[1] * dim[2]).fill(0)
+    let tt = new Uint32Array(ttn)
+    let il
+    if (conn === 6 && scratch && scratch.il && scratch.il.length === nvox) {
+      il = scratch.il
+      if (scratch.dirty) {
+        il.fill(0)
+      } else if (scratch.runs && scratch.runLen > 0) {
+        const prevRuns = scratch.runs
+        const prevLen = scratch.runLen
+        for (let k = 0; k < prevLen; k += 2) {
+          il.fill(0, prevRuns[k], prevRuns[k + 1])
+        }
+      }
+    } else {
+      il = new Uint32Array(nvox)
+      if (conn === 6 && scratch) {
+        scratch.il = il
+        scratch.runs = null
+        scratch.runLen = 0
+        scratch.dirty = false
+      }
+    }
+
+    if (conn === 6) {
+      if (scratch) scratch.dirty = true
+      const u32 =
+        (bw instanceof Uint8Array || bw instanceof Uint8ClampedArray) &&
+        (bw.byteOffset & 3) === 0 &&
+        (nx & 3) === 0 &&
+        bw.length >= nvox
+          ? new Uint32Array(bw.buffer, bw.byteOffset, nvox >> 2)
+          : null
+      let runs = scratch && scratch.runs ? scratch.runs : new Uint32Array(8192)
+      let runsCap = runs.length
+      let runLen = 0
+      let n0 = 0
+      let n1 = 0
+      let n2 = 0
+      let fgStart = -1
+      let fgEnd = -1
+      let minSl = nz
+      let maxSl = -1
+      for (let sl = 0; sl < nz; sl++) {
+        const slOff = sl * plane
+        for (let c = 0; c < ny; c++) {
+          const rowOff = slOff + c * nx
+          let r = 0
+          if (u32) {
+            const qRowEnd = (rowOff + nx) >> 2
+            let q = rowOff >> 2
+            while (q < qRowEnd && u32[q] === 0) q++
+            if (q === qRowEnd) continue
+            r = (q << 2) - rowOff
+          }
+          let inRun = false
+          for (; r < nx; r++) {
+            const i = rowOff + r
+            if (u32 && !inRun && (r & 3) === 0 && u32[i >> 2] === 0) {
+              r += 3
+              continue
+            }
+            const val = bw[i]
+            if (val === 0) {
+              if (inRun) {
+                runs[runLen++] = i
+                inRun = false
+              }
+              continue
+            }
+            if (!inRun) {
+              if (runLen + 2 > runsCap) {
+                runsCap <<= 1
+                const ext = new Uint32Array(runsCap)
+                ext.set(runs)
+                runs = ext
+              }
+              runs[runLen++] = i
+              inRun = true
+            }
+            if (fgStart < 0) {
+              fgStart = i
+              minSl = sl
+            }
+            fgEnd = i
+            maxSl = sl
+            let nr_set = 0
+            if (sl > 0 && bw[i - plane] === val) {
+              n0 = il[i - plane]
+              nr_set = 1
+            }
+            if (r > 0 && bw[i - 1] === val) {
+              const lbl = il[i - 1]
+              if (nr_set === 0) n0 = lbl
+              else if (nr_set === 1) n1 = lbl
+              else n2 = lbl
+              nr_set++
+            }
+            if (c > 0 && bw[i - nx] === val) {
+              const lbl = il[i - nx]
+              if (nr_set === 0) n0 = lbl
+              else if (nr_set === 1) n1 = lbl
+              else n2 = lbl
+              nr_set++
+            }
+            if (nr_set === 0) {
+              il[i] = label
+              if (label >= ttn) {
+                ttn += kGrowArrayBy
+                const ext = new Uint32Array(ttn)
+                ext.set(tt)
+                tt = ext
+              }
+              tt[label - 1] = label
+              label++
+            } else {
+              il[i] = n0
+              if (nr_set === 2 && n1 !== n0) {
+                let r0 = n0
+                while (tt[r0 - 1] !== r0) r0 = tt[r0 - 1]
+                let r1 = n1
+                while (tt[r1 - 1] !== r1) r1 = tt[r1 - 1]
+                const ltn = r0 < r1 ? r0 : r1
+                tt[r0 - 1] = ltn
+                tt[r1 - 1] = ltn
+              } else if (nr_set === 3 && (n1 !== n0 || n2 !== n0)) {
+                let r0 = n0
+                while (tt[r0 - 1] !== r0) r0 = tt[r0 - 1]
+                let r1 = n1
+                while (tt[r1 - 1] !== r1) r1 = tt[r1 - 1]
+                let r2 = n2
+                while (tt[r2 - 1] !== r2) r2 = tt[r2 - 1]
+                let ltn = r0 < r1 ? r0 : r1
+                if (r2 < ltn) ltn = r2
+                tt[r0 - 1] = ltn
+                tt[r1 - 1] = ltn
+                tt[r2 - 1] = ltn
+              }
+            }
+          }
+          if (inRun) {
+            runs[runLen++] = rowOff + nx
+          }
+        }
+      }
+      for (let i = 0; i < label - 1; i++) {
+        let j = i
+        while (tt[j] !== j + 1) {
+          j = tt[j] - 1
+        }
+        tt[i] = j + 1
+      }
+      if (scratch) {
+        scratch.runs = runs
+        scratch.runLen = runLen
+        scratch.dirty = false
+      }
+      this._lastInitialRange = { conn: 6, fgStart, fgEnd, minSl, maxSl, runs, runLen }
+      return [label - 1, tt, il]
+    }
+
+    const naboPS = new Uint32Array(32)
+    const tn = new Uint32Array(32)
     const nabo = new Uint32Array(27)
-    for (let sl = 0; sl < dim[2]; sl++) {
-      for (let c = 0; c < dim[1]; c++) {
-        for (let r = 0; r < dim[0]; r++) {
+    for (let sl = 0; sl < nz; sl++) {
+      for (let c = 0; c < ny; c++) {
+        for (let r = 0; r < nx; r++) {
           let nr_set = 0
           const val = bw[this.idx(r, c, sl, dim)]
           if (val === 0) {
@@ -121,7 +292,7 @@ export class BWLabeler {
                 nabo[nr_set++] = il[idx]
               }
             }
-            if (c && r < dim[0] - 1) {
+            if (c && r < nx - 1) {
               const idx = this.idx(r + 1, c - 1, sl, dim)
               if (val === bw[idx]) {
                 nabo[nr_set++] = il[idx]
@@ -152,6 +323,7 @@ export class BWLabeler {
       }
       tt[i] = j + 1
     }
+    this._lastInitialRange = null
     return [label - 1, tt, il]
   } // do_initial_labelling()
 
@@ -180,26 +352,102 @@ export class BWLabeler {
     }
   } // fill_tratab()
 
-  // remove any residual gaps so label numbers are dense rather than sparse
-  translate_labels(il, dim, tt, ttn) {
+  // remove any residual gaps so label numbers are dense rather than sparse (mutates `il` in-place)
+  translate_labels(il, dim, tt, ttn, bw = null, range = null) {
     const nvox = dim[0] * dim[1] * dim[2]
-    let ml = 0
-    const l = new Uint32Array(nvox).fill(0)
-    for (let i = 0; i < ttn; i++) {
-      ml = Math.max(ml, tt[i])
-    }
-    const fl = new Uint32Array(ml).fill(0)
-    let cl = 0
-    for (let i = 0; i < nvox; i++) {
-      if (il[i]) {
-        if (!fl[tt[il[i] - 1] - 1]) {
-          cl += 1
-          fl[tt[il[i] - 1] - 1] = cl
+    if (range && (ttn === 0 || range.fgStart < 0)) {
+      if (bw) {
+        this._lastMeta = {
+          conn: range.conn,
+          cl: 0,
+          fgStart: 0,
+          fgEnd: -1,
+          minSl: 0,
+          maxSl: -1,
+          ls2bw: new Uint32Array(1),
+          sumls: new Uint32Array(1),
+          distinctFgClasses: 0,
+          bw,
         }
-        l[i] = fl[tt[il[i] - 1] - 1]
+      }
+      return [0, il]
+    }
+    let ml = 0
+    for (let i = 0; i < ttn; i++) {
+      if (tt[i] > ml) ml = tt[i]
+    }
+    const fl = new Uint32Array(ml + 1)
+    const ls2bwTmp = (bw && range) ? new Uint32Array(ttn + 1) : null
+    const sumlsTmp = (bw && range) ? new Uint32Array(ttn + 1) : null
+    const start = range ? range.fgStart : 0
+    const end = range ? range.fgEnd : nvox - 1
+    let cl = 0
+    if (range && range.runs) {
+      const runs = range.runs
+      const runLen = range.runLen
+      for (let rk = 0; rk < runLen; rk += 2) {
+        const s = runs[rk]
+        const e = runs[rk + 1]
+        for (let i = s; i < e; i++) {
+          const root = tt[il[i] - 1]
+          let mapped = fl[root]
+          if (!mapped) {
+            cl += 1
+            mapped = cl
+            fl[root] = mapped
+            if (ls2bwTmp) ls2bwTmp[mapped] = bw[i]
+          }
+          il[i] = mapped
+          if (sumlsTmp) sumlsTmp[mapped]++
+        }
+      }
+    } else {
+      for (let i = start; i <= end; i++) {
+        const lbl = il[i]
+        if (lbl) {
+          const root = tt[lbl - 1]
+          let mapped = fl[root]
+          if (!mapped) {
+            cl += 1
+            mapped = cl
+            fl[root] = mapped
+            if (ls2bwTmp) ls2bwTmp[mapped] = bw[i]
+          }
+          il[i] = mapped
+          if (sumlsTmp) sumlsTmp[mapped]++
+        }
       }
     }
-    return [cl, l]
+    if (bw && range) {
+      const ls2bw = ls2bwTmp.slice(0, cl + 1)
+      const sumls = sumlsTmp.slice(0, cl + 1)
+      let distinctFgClasses = 0
+      if (cl > 0) {
+        const firstCls = ls2bw[1]
+        distinctFgClasses = 1
+        for (let c = 2; c <= cl; c++) {
+          if (ls2bw[c] !== firstCls) {
+            distinctFgClasses = 2
+            break
+          }
+        }
+      }
+      this._lastMeta = {
+        conn: range.conn,
+        cl,
+        fgStart: range.fgStart,
+        fgEnd: range.fgEnd,
+        minSl: range.minSl,
+        maxSl: range.maxSl,
+        runs: range.runs,
+        runLen: range.runLen,
+        ls2bw,
+        sumls,
+        distinctFgClasses,
+        bw,
+      }
+    }
+    return [cl, il]
   } // translate_labels()
 
   /**
@@ -238,6 +486,22 @@ export class BWLabeler {
     const sliceXY = nx * ny
     // Per-suppressed-component family id (-1 = not yet seen, 0 = unrestricted).
     const useFamily = !!(familyOf && bw)
+    let anySuppressed = false
+    for (let c = 1; c <= cl; c++) {
+      if (!kept[c]) {
+        anySuppressed = true
+        break
+      }
+    }
+    if (!anySuppressed) {
+      if (useFamily) {
+        console.log(
+          `[relabel] 0/0 suppressed components resolved within their own class family` +
+            ` (0 fell back to the unrestricted neighbour vote)`
+        )
+      }
+      return new Uint32Array(cl + 1)
+    }
     const compFam = useFamily ? new Int32Array(cl + 1).fill(-1) : null
     // hist: compId -> Map(class -> contact count)
     const hist = new Map()
@@ -249,14 +513,21 @@ export class BWLabeler {
       }
       h.set(klass, (h.get(klass) || 0) + 1)
     }
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        for (let x = 0; x < nx; x++) {
-          const i = z * sliceXY + y * nx + x
+    const meta = labelMetaMap.get(ls)
+    const hasMeta = meta && meta.cl === cl && ls.length === sliceXY * nz
+    if (hasMeta && meta.runs) {
+      const runs = meta.runs
+      const runLen = meta.runLen
+      for (let rk = 0; rk < runLen; rk += 2) {
+        const s = runs[rk]
+        const e = runs[rk + 1]
+        const z = (s / sliceXY) | 0
+        const rem = s - z * sliceXY
+        const y = (rem / nx) | 0
+        let x = rem - y * nx
+        for (let i = s; i < e; i++, x++) {
           const c = ls[i]
-          if (c === 0 || kept[c]) {
-            continue
-          } // only suppressed (non-bg, not-kept) voxels
+          if (kept[c]) continue // only suppressed (non-bg, not-kept) voxels
           if (useFamily && compFam[c] < 0) {
             compFam[c] = familyOf(bw[i])
           }
@@ -267,6 +538,30 @@ export class BWLabeler {
           if (y < ny - 1 && (k = kept[ls[i + nx]])) bump(c, k)
           if (z > 0 && (k = kept[ls[i - sliceXY]])) bump(c, k)
           if (z < nz - 1 && (k = kept[ls[i + sliceXY]])) bump(c, k)
+        }
+      }
+    } else {
+      const zStart = hasMeta ? meta.minSl : 0
+      const zEnd = hasMeta ? meta.maxSl : nz - 1
+      let i = zStart * sliceXY
+      for (let z = zStart; z <= zEnd; z++) {
+        for (let y = 0; y < ny; y++) {
+          for (let x = 0; x < nx; x++, i++) {
+            const c = ls[i]
+            if (c === 0 || kept[c]) {
+              continue
+            } // only suppressed (non-bg, not-kept) voxels
+            if (useFamily && compFam[c] < 0) {
+              compFam[c] = familyOf(bw[i])
+            }
+            let k
+            if (x > 0 && (k = kept[ls[i - 1]])) bump(c, k)
+            if (x < nx - 1 && (k = kept[ls[i + 1]])) bump(c, k)
+            if (y > 0 && (k = kept[ls[i - nx]])) bump(c, k)
+            if (y < ny - 1 && (k = kept[ls[i + nx]])) bump(c, k)
+            if (z > 0 && (k = kept[ls[i - sliceXY]])) bump(c, k)
+            if (z < nz - 1 && (k = kept[ls[i + sliceXY]])) bump(c, k)
+          }
         }
       }
     }
@@ -328,24 +623,86 @@ export class BWLabeler {
    *   vote - see neighbor_winners. Omit for the original unrestricted vote.
    * @returns {[number, Uint32Array]} [maxClass, volume].
    */
-  finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw = null, familyOf = null) {
+  finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw = null, familyOf = null, inPlace = false) {
     const nvox = ls.length
-    const vxs = new Uint32Array(nvox).fill(0)
     const winner = relabelSuppressed ? this.neighbor_winners(ls, dim, kept, cl, bw, familyOf) : null
-    let mxbw = 0
-    for (let i = 0; i < nvox; i++) {
-      const c = ls[i]
-      if (c === 0) {
-        continue
-      }
+    const eff = winner ? new Uint32Array(cl + 1) : kept
+    let maxKept = 0
+    for (let c = 1; c <= cl; c++) {
       let v = kept[c]
-      if (!v && winner) {
-        v = winner[c]
+      if (winner) {
+        if (!v) v = winner[c]
+        eff[c] = v
       }
-      if (v) {
-        vxs[i] = v
-        if (v > mxbw) {
-          mxbw = v
+      if (v > maxKept) maxKept = v
+    }
+    const meta = labelMetaMap.get(ls)
+    const hasMeta = meta && meta.cl === cl && meta.ls2bw.length === cl + 1 && meta.fgEnd < nvox
+    let mxbw = 0
+    if (hasMeta && meta.runs) {
+      const runs = meta.runs
+      const runLen = meta.runLen
+      for (let c = 1; c <= cl; c++) {
+        if (meta.sumls[c] > 0 && eff[c] > mxbw) mxbw = eff[c]
+      }
+      if (meta.bw === bw && bw instanceof Uint8Array && maxKept <= 255) {
+        const patchFlag = new Uint8Array(cl + 1)
+        let anyPatch = false
+        for (let c = 1; c <= cl; c++) {
+          if (meta.sumls[c] > 0 && eff[c] !== meta.ls2bw[c]) {
+            patchFlag[c] = 1
+            anyPatch = true
+          }
+        }
+        const vxs = inPlace ? bw : bw.slice()
+        if (anyPatch) {
+          for (let rk = 0; rk < runLen; rk += 2) {
+            const s = runs[rk]
+            const e = runs[rk + 1]
+            for (let i = s; i < e; i++) {
+              const c = ls[i]
+              if (patchFlag[c]) vxs[i] = eff[c]
+            }
+          }
+        }
+        return [mxbw, vxs]
+      }
+      const outU8 = (bw instanceof Uint8Array) && maxKept <= 255
+      const vxs = outU8 ? new Uint8Array(nvox) : new Uint32Array(nvox)
+      for (let rk = 0; rk < runLen; rk += 2) {
+        const s = runs[rk]
+        const e = runs[rk + 1]
+        for (let i = s; i < e; i++) {
+          const v = eff[ls[i]]
+          if (v) vxs[i] = v
+        }
+      }
+      return [mxbw, vxs]
+    }
+    const outU8 = (bw instanceof Uint8Array) && maxKept <= 255
+    const vxs = outU8 ? new Uint8Array(nvox) : new Uint32Array(nvox)
+    if (hasMeta) {
+      if (meta.fgStart >= 0 && meta.fgEnd >= meta.fgStart) {
+        for (let i = meta.fgStart; i <= meta.fgEnd; i++) {
+          const c = ls[i]
+          if (c !== 0) {
+            const v = eff[c]
+            if (v) {
+              vxs[i] = v
+              if (v > mxbw) mxbw = v
+            }
+          }
+        }
+      }
+    } else {
+      for (let i = 0; i < nvox; i++) {
+        const c = ls[i]
+        if (c !== 0) {
+          const v = eff[c]
+          if (v) {
+            vxs[i] = v
+            if (v > mxbw) mxbw = v
+          }
         }
       }
     }
@@ -511,73 +868,93 @@ export class BWLabeler {
     return rows
   }
 
+  /** Collect per-component class id and voxel count in a single pass. */
+  _collectComponentStats(bw, cl, ls) {
+    const meta = labelMetaMap.get(ls)
+    if (meta && meta.cl === cl && meta.bw === bw && ls.length === bw.length) {
+      return [meta.ls2bw, meta.sumls]
+    }
+    const nvox = bw.length
+    const ls2bw = new Uint32Array(cl + 1)
+    const sumls = new Uint32Array(cl + 1)
+    for (let i = 0; i < nvox; i++) {
+      const lsVal = ls[i]
+      if (lsVal > 0) {
+        ls2bw[lsVal] = bw[i]
+        sumls[lsVal]++
+      }
+    }
+    return [ls2bw, sumls]
+  }
+
+  /** Build per-component keep map in O(cl) preserving exact tie-break semantics. */
+  _buildKeptMap(ls2bw, sumls, cl, targetClasses, largerIndexWins) {
+    const kept = new Uint32Array(cl + 1)
+    let maxClass = 0
+    for (let i = 1; i <= cl; i++) {
+      if (ls2bw[i] > maxClass) maxClass = ls2bw[i]
+    }
+    const filterAll = targetClasses === 'all'
+    if (maxClass <= 65535) {
+      const bestSize = new Uint32Array(maxClass + 1)
+      const bestComp = new Uint32Array(maxClass + 1)
+      for (let i = 1; i <= cl; i++) {
+        const klass = ls2bw[i]
+        if (klass === 0) continue
+        if (filterAll || (targetClasses && targetClasses.has && targetClasses.has(klass))) {
+          const sz = sumls[i]
+          if (!bestComp[klass] || (largerIndexWins ? sz >= bestSize[klass] : sz > bestSize[klass])) {
+            bestSize[klass] = sz
+            bestComp[klass] = i
+          }
+        } else {
+          kept[i] = klass
+        }
+      }
+      for (let klass = 1; klass <= maxClass; klass++) {
+        const c = bestComp[klass]
+        if (c > 0) kept[c] = klass
+      }
+    } else {
+      const bestByClass = new Map()
+      for (let i = 1; i <= cl; i++) {
+        const klass = ls2bw[i]
+        if (klass === 0) continue
+        if (filterAll || (targetClasses && targetClasses.has && targetClasses.has(klass))) {
+          const sz = sumls[i]
+          const prev = bestByClass.get(klass)
+          if (!prev || (largerIndexWins ? sz >= prev.sz : sz > prev.sz)) {
+            bestByClass.set(klass, { c: i, sz })
+          }
+        } else {
+          kept[i] = klass
+        }
+      }
+      for (const [klass, { c }] of bestByClass) {
+        kept[c] = klass
+      }
+    }
+    return kept
+  }
+
   // retain only the largest cluster for each region
   // dim + relabelSuppressed are optional: when relabelSuppressed is true, blobs
   // that lose the per-class "largest" contest are repainted with their
   // surrounding surviving label instead of background (requires dim).
-  largest_original_cluster_labels(bw, cl, ls, dim = null, relabelSuppressed = false, familyOf = null) {
-    const nvox = bw.length
-    const ls2bw = new Uint32Array(cl + 1).fill(0)
-    const sumls = new Uint32Array(cl + 1).fill(0)
-    for (let i = 0; i < nvox; i++) {
-      const bwVal = bw[i]
-      const lsVal = ls[i]
-      ls2bw[lsVal] = bwVal
-      sumls[lsVal]++
-    }
-    // Track one winner per class instead of comparing every component pair.
-    // >= preserves the original tie rule: the last component wins.
-    const largest = new Map()
-    for (let i = 0; i <= cl; i++) {
-      const cls = ls2bw[i]
-      const previous = largest.get(cls)
-      if (previous === undefined || sumls[i] >= sumls[previous]) largest.set(cls, i)
-    }
-    for (let i = 0; i <= cl; i++) {
-      if (largest.get(ls2bw[i]) !== i) ls2bw[i] = 0
-    }
-    // ls2bw now holds the surviving class per label (0 for suppressed). Reuse it
-    // directly as the `kept` map for finalize_volume.
-    return this.finalize_volume(ls, dim, ls2bw, cl, relabelSuppressed, bw, familyOf)
+  largest_original_cluster_labels(bw, cl, ls, dim = null, relabelSuppressed = false, familyOf = null, inPlace = false) {
+    const [ls2bw, sumls] = this._collectComponentStats(bw, cl, ls)
+    const kept = this._buildKeptMap(ls2bw, sumls, cl, 'all', true)
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf, inPlace)
   }
 
   // Filter clusters based on target classes rules
   // targetClasses: 'all', or Set of class IDs.
   // If 'all' or class in targetClasses: keep only largest component of that class.
   // Else: keep all components of that class.
-  filter_clusters(bw, cl, ls, targetClasses, dim = null, relabelSuppressed = false, familyOf = null) {
-    const nvox = bw.length
-    const ls2bw = new Uint32Array(cl + 1).fill(0)
-    const sumls = new Uint32Array(cl + 1).fill(0)
-
-    // 1. Map labels to original classes and count sizes
-    for (let i = 0; i < nvox; i++) {
-      const bwVal = bw[i]
-      const lsVal = ls[i]
-      // Only track if non-background (assuming 0 is bg)
-      if (lsVal > 0) {
-        ls2bw[lsVal] = bwVal
-        sumls[lsVal]++
-      }
-    }
-
-    // 2. Select one winner for each targeted class in O(cl).
-    // Strict > preserves this filter's tie rule: the first component wins.
-    const largest = new Map()
-    for (let i = 1; i <= cl; i++) {
-      const cls = ls2bw[i]
-      if (targetClasses !== 'all' && !(targetClasses.has && targetClasses.has(cls))) continue
-      const previous = largest.get(cls)
-      if (previous === undefined || sumls[i] > sumls[previous]) largest.set(cls, i)
-    }
-
-    // 3. Non-target classes retain every component; suppress losing targets.
-    for (let i = 1; i <= cl; i++) {
-      const winner = largest.get(ls2bw[i])
-      if (winner !== undefined && winner !== i) ls2bw[i] = 0
-    }
-    const kept = ls2bw
-    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf)
+  filter_clusters(bw, cl, ls, targetClasses, dim = null, relabelSuppressed = false, familyOf = null, inPlace = false) {
+    const [ls2bw, sumls] = this._collectComponentStats(bw, cl, ls)
+    const kept = this._buildKeptMap(ls2bw, sumls, cl, targetClasses, false)
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf, inPlace)
   }
 
   /**
@@ -638,34 +1015,320 @@ export class BWLabeler {
   }
 
   // given a 3D image, return a clustered label map
+  /**
+   * Merge 6-connected per-class guard components (`ls`, `1..cl`) into binary
+   * foreground connected components via single-pass union-find, returning the
+   * winning largest binary component root (larger root wins ties) along with
+   * per-component sizes and optional class IDs.
+   */
+  _binaryComponentsFromLabels(bw, cl, ls, dim, collectClass = false) {
+    const nx = dim[0] | 0
+    const ny = dim[1] | 0
+    const nz = dim[2] | 0
+    const plane = nx * ny
+    const meta = labelMetaMap.get(ls)
+    const hasMeta = meta && meta.cl === cl && ls.length === plane * nz && (!collectClass || meta.bw === bw)
+    if (hasMeta && meta.conn === 6 && meta.distinctFgClasses <= 1) {
+      const parent = new Uint32Array(cl + 1)
+      let bestRoot = 0
+      let bestBinSize = 0
+      for (let r = 1; r <= cl; r++) {
+        parent[r] = r
+        const sz = meta.sumls[r]
+        if (sz > 0 && sz >= bestBinSize) {
+          bestBinSize = sz
+          bestRoot = r
+        }
+      }
+      return { parent, compSize: meta.sumls, compClass: collectClass ? meta.ls2bw : null, bestRoot }
+    }
+    const compSize = hasMeta ? meta.sumls : new Uint32Array(cl + 1)
+    const compClass = hasMeta ? (collectClass ? meta.ls2bw : null) : (collectClass ? new Uint32Array(cl + 1) : null)
+    const parent = new Uint32Array(cl + 1)
+    for (let c = 1; c <= cl; c++) parent[c] = c
+
+    if (hasMeta && meta.conn === 6 && meta.runs && meta.bw === bw) {
+      const unite = (a, b) => {
+        while (parent[a] !== a) {
+          parent[a] = parent[parent[a]]
+          a = parent[a]
+        }
+        while (parent[b] !== b) {
+          parent[b] = parent[parent[b]]
+          b = parent[b]
+        }
+        if (a !== b) {
+          if (a < b) parent[b] = a
+          else parent[a] = b
+        }
+      }
+      const runs = meta.runs
+      const runLen = meta.runLen
+      for (let rk = 0; rk < runLen; rk += 2) {
+        const s = runs[rk]
+        const e = runs[rk + 1]
+        const sl = (s / plane) | 0
+        const rem = s - sl * plane
+        const r = (rem / nx) | 0
+        let c0 = rem - r * nx
+        for (let i = s; i < e; i++, c0++) {
+          const val = bw[i]
+          let myComp = 0
+          if (sl > 0) {
+            const vZ = bw[i - plane]
+            if (vZ !== 0 && vZ !== val) {
+              myComp = ls[i]
+              unite(myComp, ls[i - plane])
+            }
+          }
+          if (r > 0) {
+            const vY = bw[i - nx]
+            if (vY !== 0 && vY !== val) {
+              if (!myComp) myComp = ls[i]
+              unite(myComp, ls[i - nx])
+            }
+          }
+          if (c0 > 0) {
+            const vX = bw[i - 1]
+            if (vX !== 0 && vX !== val) {
+              if (!myComp) myComp = ls[i]
+              unite(myComp, ls[i - 1])
+            }
+          }
+        }
+      }
+    } else {
+      const slStart = hasMeta ? meta.minSl : 0
+      const slEnd = hasMeta ? meta.maxSl : nz - 1
+      let i = slStart * plane
+      for (let sl = slStart; sl <= slEnd; sl++) {
+        for (let r = 0; r < ny; r++) {
+          for (let c0 = 0; c0 < nx; c0++, i++) {
+            const c = ls[i]
+            if (c === 0) continue
+            if (!hasMeta) {
+              compSize[c]++
+              if (compClass && compClass[c] === 0) compClass[c] = bw[i]
+            }
+            let rc = c
+            while (parent[rc] !== rc) {
+              parent[rc] = parent[parent[rc]]
+              rc = parent[rc]
+            }
+            if (sl > 0) {
+              const nb = ls[i - plane]
+              if (nb !== 0 && nb !== c) {
+                let rn = nb
+                while (parent[rn] !== rn) {
+                  parent[rn] = parent[parent[rn]]
+                  rn = parent[rn]
+                }
+                if (rc !== rn) {
+                  if (rc < rn) parent[rn] = rc
+                  else {
+                    parent[rc] = rn
+                    rc = rn
+                  }
+                }
+              }
+            }
+            if (r > 0) {
+              const nb = ls[i - nx]
+              if (nb !== 0 && nb !== c) {
+                let rn = nb
+                while (parent[rn] !== rn) {
+                  parent[rn] = parent[parent[rn]]
+                  rn = parent[rn]
+                }
+                if (rc !== rn) {
+                  if (rc < rn) parent[rn] = rc
+                  else {
+                    parent[rc] = rn
+                    rc = rn
+                  }
+                }
+              }
+            }
+            if (c0 > 0) {
+              const nb = ls[i - 1]
+              if (nb !== 0 && nb !== c) {
+                let rn = nb
+                while (parent[rn] !== rn) {
+                  parent[rn] = parent[parent[rn]]
+                  rn = parent[rn]
+                }
+                if (rc !== rn) {
+                  if (rc < rn) parent[rn] = rc
+                  else parent[rc] = rn
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const binSize = new Uint32Array(cl + 1)
+    for (let c = 1; c <= cl; c++) {
+      let r = c
+      while (parent[r] !== r) r = parent[r]
+      parent[c] = r
+      binSize[r] += compSize[c]
+    }
+    let bestRoot = 0
+    let bestBinSize = 0
+    for (let r = 1; r <= cl; r++) {
+      const sz = binSize[r]
+      if (sz > 0 && sz >= bestBinSize) {
+        bestBinSize = sz
+        bestRoot = r
+      }
+    }
+    return { parent, compSize, compClass, bestRoot }
+  }
+
+  /** Zero out voxels outside the largest 6-connected binary foreground component using guard labels. */
+  applyLargestBinaryMaskInPlace(bw, cl, ls, dim) {
+    const nvox = bw.length
+    if (cl === 0) {
+      bw.fill(0)
+      return bw
+    }
+    const meta = labelMetaMap.get(ls)
+    const hasMeta = meta && meta.cl === cl && ls.length === nvox
+    if (hasMeta && meta.conn === 6 && meta.distinctFgClasses <= 1) {
+      let bestRoot = 0
+      let bestBinSize = 0
+      for (let r = 1; r <= cl; r++) {
+        const sz = meta.sumls[r]
+        if (sz > 0 && sz >= bestBinSize) {
+          bestBinSize = sz
+          bestRoot = r
+        }
+      }
+      if (meta.runs && meta.bw === bw) {
+        if (cl > 1) {
+          const runs = meta.runs
+          const runLen = meta.runLen
+          for (let rk = 0; rk < runLen; rk += 2) {
+            const s = runs[rk]
+            const e = runs[rk + 1]
+            for (let i = s; i < e; i++) {
+              if (ls[i] !== bestRoot) bw[i] = 0
+            }
+          }
+        }
+        return bw
+      }
+      if (meta.fgStart > 0) bw.fill(0, 0, meta.fgStart)
+      if (meta.fgEnd >= meta.fgStart) {
+        for (let i = meta.fgStart; i <= meta.fgEnd; i++) {
+          if (ls[i] !== bestRoot) bw[i] = 0
+        }
+        if (meta.fgEnd + 1 < nvox) bw.fill(0, meta.fgEnd + 1)
+      } else {
+        bw.fill(0)
+      }
+      return bw
+    }
+    const { parent, bestRoot } = this._binaryComponentsFromLabels(bw, cl, ls, dim, false)
+    if (hasMeta && meta.runs && meta.bw === bw) {
+      const runs = meta.runs
+      const runLen = meta.runLen
+      for (let rk = 0; rk < runLen; rk += 2) {
+        const s = runs[rk]
+        const e = runs[rk + 1]
+        for (let i = s; i < e; i++) {
+          if (parent[ls[i]] !== bestRoot) bw[i] = 0
+        }
+      }
+      return bw
+    }
+    if (hasMeta && meta.fgEnd >= meta.fgStart) {
+      if (meta.fgStart > 0) bw.fill(0, 0, meta.fgStart)
+      for (let i = meta.fgStart; i <= meta.fgEnd; i++) {
+        const c = ls[i]
+        if (c === 0 || parent[c] !== bestRoot) bw[i] = 0
+      }
+      if (meta.fgEnd + 1 < nvox) bw.fill(0, meta.fgEnd + 1)
+    } else {
+      for (let i = 0; i < nvox; i++) {
+        const c = ls[i]
+        if (c === 0 || parent[c] !== bestRoot) bw[i] = 0
+      }
+    }
+    return bw
+  }
+
+  /**
+   * Single-pass hierarchical 18-class filter reusing conn=6 per-class guard labels:
+   * selects largest binary foreground component (larger root wins ties) and within it
+   * retains only the largest component for classes in `targetClasses` (smaller component
+   * index wins ties), keeping all other classes intact.
+   */
+  filter18ClassFromLabels(bw, cl, ls, dim, targetClasses, relabelSuppressed = false, familyOf = null, inPlace = false) {
+    if (cl === 0) {
+      return [0, new Uint8Array(bw.length)]
+    }
+    const { parent, compSize, compClass, bestRoot } = this._binaryComponentsFromLabels(bw, cl, ls, dim, true)
+    const activeCompClass = new Uint32Array(cl + 1)
+    for (let c = 1; c <= cl; c++) {
+      if (parent[c] === bestRoot) activeCompClass[c] = compClass[c]
+    }
+    const kept = this._buildKeptMap(activeCompClass, compSize, cl, targetClasses, false)
+    return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf, inPlace)
+  }
+
   // for an explanation and optimized C code see
   // https://github.com/seung-lab/connected-components-3d
-  bwlabel(img, dim, conn = 26, binarize = false, onlyLargestClusterPerClass = false) {
+  bwlabel(img, dim, conn = 26, binarize = false, onlyLargestClusterPerClass = false, scratch = null) {
     const start = Date.now()
     const nvox = dim[0] * dim[1] * dim[2]
-    const bw = new Uint32Array(nvox).fill(0)
     if (![6, 18, 26].includes(conn)) {
       console.log('bwlabel: conn must be 6, 18 or 26.')
-      return [0, bw]
+      return [0, new Uint32Array(nvox)]
     }
     if (dim[0] < 2 || dim[1] < 2 || dim[2] < 1) {
       console.log('bwlabel: img must be 2 or 3-dimensional')
-      return [0, bw]
+      return [0, new Uint32Array(nvox)]
     }
+    let bw
     if (binarize) {
+      bw = new Uint8Array(nvox)
       for (let i = 0; i < nvox; i++) {
         if (img[i] !== 0.0) {
           bw[i] = 1
         }
       }
+    } else if (
+      img instanceof Uint8Array ||
+      img instanceof Uint8ClampedArray ||
+      img instanceof Uint16Array ||
+      img instanceof Uint32Array ||
+      img instanceof Int8Array ||
+      img instanceof Int16Array ||
+      img instanceof Int32Array
+    ) {
+      if (img.length === nvox) {
+        bw = img
+      } else {
+        bw = new Uint32Array(nvox)
+        bw.set(img.subarray(0, nvox))
+      }
     } else {
+      bw = new Uint32Array(nvox)
       bw.set(img)
     }
-    let [ttn, tt, il] = this.do_initial_labelling(bw, dim, conn)
+    this._lastInitialRange = null
+    this._lastMeta = null
+    let [ttn, tt, il] = this.do_initial_labelling(bw, dim, conn, scratch)
     if (tt === undefined) {
       tt = new Uint32Array(0)
     }
-    const [cl, ls] = this.translate_labels(il, dim, tt, ttn)
+    const [cl, ls] = this.translate_labels(il, dim, tt, ttn, bw, this._lastInitialRange)
+    if (this._lastMeta) {
+      labelMetaMap.set(ls, this._lastMeta)
+    }
     console.log(conn + ' neighbor clustering into ' + cl + ' regions in ' + (Date.now() - start) + 'ms')
     if (onlyLargestClusterPerClass) {
       const [nbw, bwMx] = this.largest_original_cluster_labels(bw, cl, ls)

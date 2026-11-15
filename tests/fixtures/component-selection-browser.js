@@ -1,7 +1,6 @@
-import * as tf from '@tensorflow/tfjs'
 import { BWLabeler } from '../../bwlabels.js'
 import { QuadraticBWLabeler } from './component-selection-reference.js'
-import { quantileNormalizeVolumeData, processSegmentationVolume } from '../../tensor-utils.js'
+import { computeQuantiles, linearScaleVolume, transposeVolume3D, processSegmentationVolume } from '../../tensor-utils.js'
 import { inferenceModelsList } from '../../brainchop-parameters.js'
 import { setupNet } from '../../webgpu_native/meshnet_gpu.js'
 import { descriptorFor } from '../../webgl2_runners/descriptors.js'
@@ -29,17 +28,14 @@ export async function benchmark({ id, backend, pairs = 9 }) {
   if (![5, 14].includes(id) || !entry.enableTranspose || !entry.enableQuantileNorm) throw Error('Expected a 104-class model')
   const nii = await (await fetch('/input.nii')).arrayBuffer(), header = new DataView(nii)
   if (header.getInt16(70, true) !== 2 || [42, 44, 46].some(i => header.getInt16(i, true) !== 256)) throw Error('Expected uint8 256³ sample')
-  await tf.setBackend('webgl'); await tf.ready()
-  tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0)
-  const tensor = tf.tensor(new Uint8Array(nii, header.getFloat32(108, true), length), shape, 'float32')
-  let seed = 123, normalized
+  const rawVoxels = new Uint8Array(nii, header.getFloat32(108, true), length)
+  let seed = 123, qmin, qmax
   const random = Math.random
   Math.random = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32)
-  try { normalized = await quantileNormalizeVolumeData(tensor) }
-  finally { Math.random = random; tensor.dispose() }
-  const transposed = normalized.transpose(), input = await transposed.data()
-  normalized.dispose(); transposed.dispose()
-  tf.engine().reset() // Release preprocessing textures before full-volume inference.
+  try { ({ qmin, qmax } = computeQuantiles(rawVoxels)) }
+  finally { Math.random = random }
+  const normalized = linearScaleVolume(rawVoxels, qmin, (qmax - qmin) || 1)
+  const input = transposeVolume3D(normalized, shape, [2, 1, 0])
   const weights = new Uint8Array(await (await fetch(entry.webgpu_safetensor)).arrayBuffer())
   let raw, adapterInfo, inferenceMs
   if (backend === 'webgl2') {

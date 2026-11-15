@@ -1,5 +1,4 @@
-import * as tf from '@tensorflow/tfjs';
-import { quantileNormalizeVolumeData } from '../../tensor-utils.js';
+import { quantileNormalizeVolumeData, transposeVolume3D } from '../../tensor-utils.js';
 import { inferenceModelsList } from '../../brainchop-parameters.js';
 import runner from '../../webgpu_runners/model24chan18cls_gdice_prio_probability_runner.js';
 import { applyCatLitePartialVolume as current } from '../../cat-lite.js';
@@ -18,17 +17,14 @@ export async function prepareInput(variant = 'original') {
       || header.getInt16(44, true) !== 256 || header.getInt16(46, true) !== 256) {
     throw new Error('This benchmark expects the bundled uint8 256³ sample.');
   }
-  await tf.setBackend('webgl');
-  await tf.ready();
-  const tensor = tf.tensor(new Uint8Array(nii, header.getFloat32(108, true), length), shape, 'float32');
+  const rawU8 = new Uint8Array(nii, header.getFloat32(108, true), length);
   // Reproducible sampling while using the app's actual normalization code.
   const random = Math.random;
   let seed = 123;
   Math.random = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32);
-  let normalized;
-  try { normalized = await quantileNormalizeVolumeData(tensor); }
-  finally { Math.random = random; tensor.dispose(); }
-  let intensity = await normalized.data();
+  let intensity;
+  try { intensity = quantileNormalizeVolumeData(rawU8); }
+  finally { Math.random = random; }
   if (variant !== 'original') {
     const transformed = new Float32Array(length);
     if (variant === 'flip') {
@@ -37,26 +33,26 @@ export async function prepareInput(variant = 'original') {
       const gamma = Number(variant.slice(5));
       for (let i = 0; i < length; i++) transformed[i] = Math.pow(Math.max(0, intensity[i]), gamma);
     } else throw new Error(`Unknown input variant: ${variant}`);
-    normalized.dispose();
     intensity = transformed;
-    normalized = tf.tensor(intensity, shape, 'float32');
   }
-  const transposed = normalized.transpose();
-  const input = await transposed.data();
-  normalized.dispose(); transposed.dispose();
+  const input = transposeVolume3D(intensity, shape, [2, 1, 0]);
   return { shape, length, options, intensity, input };
 }
 
-export async function createDevice({ timestampQuery = false } = {}) {
+export async function createDevice({ timestampQuery = false, disableSubgroups = false, disableF16 = false } = {}) {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('Chrome has no WebGPU adapter');
   const requiredLimits = {};
   for (const key of ['maxBufferSize', 'maxStorageBufferBindingSize', 'maxComputeInvocationsPerWorkgroup',
     'maxComputeWorkgroupSizeX', 'maxComputeWorkgroupSizeY', 'maxComputeWorkgroupSizeZ',
     'maxComputeWorkgroupStorageSize', 'maxComputeWorkgroupsPerDimension']) requiredLimits[key] = adapter.limits[key];
-  const requiredFeatures = ['shader-f16'];
+  const requiredFeatures = [];
+  if (!disableF16 && adapter.features.has('shader-f16')) requiredFeatures.push('shader-f16');
+  if (!disableSubgroups && adapter.features.has('subgroups')) requiredFeatures.push('subgroups');
   if (timestampQuery && adapter.features.has('timestamp-query')) requiredFeatures.push('timestamp-query');
-  return adapter.requestDevice({ requiredLimits, requiredFeatures });
+  const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+  device.__adapterInfo = adapter.info || null;
+  return device;
 }
 
 export async function benchmark() {
@@ -74,9 +70,7 @@ export async function benchmark() {
     const oom = await device.popErrorScope(), validation = await device.popErrorScope();
     if (oom || validation) throw new Error((oom || validation).message);
     for (const prior of priors) {
-      const native = tf.tidy(() => tf.tensor(prior, shape, 'float32').transpose());
-      volumes.push(await native.data());
-      native.dispose();
+      volumes.push(transposeVolume3D(prior, shape, [2, 1, 0]));
     }
   } finally { device.destroy(); }
   const times = { reference: [], current: [] };

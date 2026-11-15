@@ -2,7 +2,7 @@
 // ---------------------------------------------------------------------------
 // Per-model residue: the two things the safetensors file cannot tell us.
 //
-//   dilations  lives in the tfjs model.json, not in the weights.
+//   dilations  lives in the model.json descriptor, not in the weights.
 //   activation every export declares "gelu" or nothing; the family-A models
 //              actually compute relu/elu, and brainchopC records that its two
 //              models both declare "gelu" while computing DIFFERENT,
@@ -71,9 +71,8 @@ export const DESCRIPTORS = {
     // What actually costs is the 24 CHANNELS: P=6 planes x 2 sets x 128 MiB =
     // 1.5 GiB of activations, against 1.0 GiB for the 16-channel models. That is
     // 1.5x, not a different order, so it is measured rather than assumed --
-    // probeWebgl2 now allocates the real working set and the runner checks
-    // isContextLost, so a device that cannot hold it refuses cleanly and the
-    // tfjs channel-list path takes over.
+    // probeWebgl2 allocates the real working set and checks isContextLost
+    // so an underspecified WebGL2 device refuses cleanly.
     //
     // No VOX=2 at P=6: it would need 12 draw buffers and no browser offers more
     // than 8, so this model permanently forfeits that 1.41x.
@@ -81,6 +80,18 @@ export const DESCRIPTORS = {
   },
   // Refit-synth changes only weights; the native WebGL2 graph is identical.
   model24chan104cls_infant_refit_synth: {
+    dilations: DEEP13,
+    activation: 'gelu_tanh',
+    fullVolume: true,
+  },
+  // Folded RepWNConv3d + d=31 DeepSup (WiSE-RepBN v3 preview): identical runtime graph.
+  model24chan104cls_v3_repbn: {
+    dilations: DEEP13,
+    activation: 'gelu_tanh',
+    fullVolume: true,
+  },
+  // Omnimodal v3 champion (RepWNConv3d + d=31/d=7 DeepSup SWA + 0.08 WiSE): identical runtime graph.
+  model24chan104cls_v3_omnimodal: {
     dilations: DEEP13,
     activation: 'gelu_tanh',
     fullVolume: true,

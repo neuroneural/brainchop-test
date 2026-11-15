@@ -36,6 +36,9 @@ export function nativeWebgl2Available() {
 export function runInferenceWebGl2(opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
   return new Promise((resolve, reject) => {
     let worker = new MyWebgl2Worker({ type: 'module' });
+    let msgQueue = Promise.resolve();
+    let displaySec = null;
+
     const done = (fn, arg) => {
       if (!worker) return;
       worker.terminate();          // releases the module heap and the GL context
@@ -44,7 +47,7 @@ export function runInferenceWebGl2(opts, modelEntry, niftiHeader, niftiImage, ca
     };
 
     worker.onmessage = (event) => {
-      const { cmd, message, progressFrac, modalMessage, statData, img, opts: o, modelEntry: m, brainMask, reason } = event.data;
+      const { cmd, message, progressFrac, modalMessage, statData, img, opts: o, modelEntry: m, brainMask, reason, timings } = event.data;
       if (cmd === 'unsupported') {
         done(reject, new Error(`native WebGL2 declined: ${reason}`));
         return;
@@ -54,12 +57,32 @@ export function runInferenceWebGl2(opts, modelEntry, niftiHeader, niftiImage, ca
           done(reject, new Error(statData.Error_Type || modalMessage || 'native WebGL2 failed'));
           return;
         }
-        callbackUI(message, progressFrac, modalMessage, statData);
+        msgQueue = msgQueue.then(() => {
+          callbackUI(message, progressFrac, modalMessage, statData);
+        }).catch((err) => done(reject, err));
         return;
       }
       if (cmd === 'img') {
-        callbackImg(img, o, m, brainMask);
-        done(resolve);
+        msgQueue = msgQueue.then(async () => {
+          const dispStart = performance.now();
+          await callbackImg(img, o, m, brainMask);
+          displaySec = ((performance.now() - dispStart) / 1000).toFixed(4);
+        }).catch((err) => done(reject, err));
+        return;
+      }
+      if (cmd === 'complete') {
+        msgQueue = msgQueue.then(() => {
+          const fullStat = statData && typeof statData === 'object' ? { ...statData } : {};
+          if (displaySec != null) fullStat.Display_t = displaySec;
+          const t = timings || {};
+          console.log(
+            `[Timing] WebGL2 | ${modelEntry.modelName} | setup=${(Number(t.Setup_t || 0) * 1000).toFixed(1)}ms ` +
+            `prep=${(Number(t.Preprocess_t || 0) * 1000).toFixed(1)}ms infer=${(Number(t.Inference_t || 0) * 1000).toFixed(1)}ms ` +
+            `post=${(Number(t.Postprocess_t || 0) * 1000).toFixed(1)}ms disp=${(Number(displaySec || 0) * 1000).toFixed(1)}ms`
+          );
+          callbackUI(message, 0, '', JSON.stringify(fullStat));
+          done(resolve);
+        }).catch((err) => done(reject, err));
       }
     };
 

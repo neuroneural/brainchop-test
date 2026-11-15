@@ -48,8 +48,11 @@ function createStatData(modelEntry, executionMode) {
         NumLabels_Match: null,
         Missing_Labels: null,
         // Timing - populated by markSuccess
+        Preprocess_t: null,
+        Setup_t: null,
         Inference_t: null,
         Postprocess_t: null,
+        Display_t: null,
         // Status - populated by markSuccess/markFailure
         Status: null,
         Error_Type: null,
@@ -107,10 +110,16 @@ function addLabelStats(statData, expectedLabels, actualLabels, missingLabelNames
  * @param {Object} statData - The stat data object to update
  * @param {string|number} inferenceTime - Inference time in seconds
  * @param {string|number} postprocessTime - Post-processing time in seconds
+ * @param {Object|null} [extraTimings=null] - Optional additional timing fields (Preprocess_t, Setup_t, Display_t)
  */
-function markSuccess(statData, inferenceTime, postprocessTime) {
+function markSuccess(statData, inferenceTime, postprocessTime, extraTimings = null) {
     statData.Inference_t = inferenceTime;
     statData.Postprocess_t = postprocessTime;
+    if (extraTimings) {
+        if (extraTimings.Preprocess_t !== undefined) statData.Preprocess_t = extraTimings.Preprocess_t;
+        if (extraTimings.Setup_t !== undefined) statData.Setup_t = extraTimings.Setup_t;
+        if (extraTimings.Display_t !== undefined) statData.Display_t = extraTimings.Display_t;
+    }
     statData.Status = 'OK';
 }
 

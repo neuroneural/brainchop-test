@@ -36,7 +36,8 @@ function retainPrincipalSupport(volumes, shape, minSupport) {
   // Components are discovered in voxel order, matching BWLabeler numbering;
   // the last component wins size ties, just like its largest-cluster filter.
   const [nx, ny, nz] = shape;
-  if (nx < 2 || ny < 2 || nz < 1) return { componentCount: 0, removedVoxels: 0 };
+  if (nx < 2 || ny < 2 || nz < 1) return { componentCount: 0, removedVoxels: 0, supportMask };
+  const is256 = nx === 256 && ny === 256;
   const queue = new Uint32Array(supported);
   const plane = nx * ny;
   let tail = 0, bestStart = 0, bestEnd = 0, componentCount = 0;
@@ -48,7 +49,8 @@ function retainPrincipalSupport(volumes, shape, minSupport) {
     supportMask[seed] = 2;
     for (let head = start; head < tail; head++) {
       const i = queue[head];
-      const x = i % nx, y = Math.floor(i / nx) % ny;
+      const x = is256 ? (i & 255) : (i % nx);
+      const y = is256 ? ((i >>> 8) & 255) : (Math.floor(i / nx) % ny);
       if (x > 0 && supportMask[i - 1] === 1) { supportMask[i - 1] = 2; queue[tail++] = i - 1; }
       if (x + 1 < nx && supportMask[i + 1] === 1) { supportMask[i + 1] = 2; queue[tail++] = i + 1; }
       if (y > 0 && supportMask[i - nx] === 1) { supportMask[i - nx] = 2; queue[tail++] = i - nx; }
@@ -67,18 +69,21 @@ function retainPrincipalSupport(volumes, shape, minSupport) {
       gm[i] = 0;
       wm[i] = 0;
       csf[i] = 0;
+      supportMask[i] = 0;
       removedVoxels++;
     }
   }
-  return { componentCount, removedVoxels };
+  return { componentCount, removedVoxels, supportMask };
 }
 
 // Keep only fitted voxels, in their original accumulation order. Float64
 // caches preserve the JS Number results exactly (Float32 would change the fit).
 // Weights are invariant across both fits and the final variance pass.
-function makeFitData([gm, wm, csf], intensity, { minSupport, priorPower }) {
+function makeFitData([gm, wm, csf], intensity, { minSupport, priorPower }, supportMask = null) {
+  const useMask = Boolean(supportMask && minSupport > 0 && minSupport <= 1);
   let count = 0;
   for (let i = 0; i < intensity.length; i++) {
+    if (useMask && supportMask[i] !== 2) continue;
     const raw = Math.max(0, gm[i]) + Math.max(0, wm[i]) + Math.max(0, csf[i]);
     if (Math.min(raw, 1) >= minSupport && Number.isFinite(intensity[i])) count++;
   }
@@ -89,6 +94,7 @@ function makeFitData([gm, wm, csf], intensity, { minSupport, priorPower }) {
   const cachedCount = count * 36 <= 192 * 2 ** 20 ? count : 0;
   const weightCsf = new Float64Array(cachedCount), weightGm = new Float64Array(cachedCount), weightWm = new Float64Array(cachedCount);
   for (let i = 0, k = 0; i < intensity.length; i++) {
+    if (useMask && supportMask[i] !== 2) continue;
     const g = Math.max(0, gm[i]), w = Math.max(0, wm[i]), c = Math.max(0, csf[i]);
     const raw = g + w + c;
     const support = Math.min(raw, 1);
@@ -163,9 +169,10 @@ function estimateStats({ indices, values, weightCsf, weightGm, weightWm, volumes
   return { applied: true, means, sigmas };
 }
 
-function makeCoarseBiasField(volumes, intensity, shape, means, { minSupport, block, smoothingPasses }) {
+function makeCoarseBiasField(volumes, intensity, shape, means, { minSupport, block, smoothingPasses }, supportMask = null) {
   const [gm, wm, csf] = volumes;
   const [nx, ny, nz] = shape;
+  const useMask = Boolean(supportMask && minSupport > 0 && minSupport <= 1);
   const gx = Math.ceil(nx / block);
   const gy = Math.ceil(ny / block);
   const gz = Math.ceil(nz / block);
@@ -182,6 +189,7 @@ function makeCoarseBiasField(volumes, intensity, shape, means, { minSupport, blo
       let voxel = z * plane + y * nx;
       const base = (bz * gy + by) * gx;
       for (let x = 0; x < nx; x++, voxel++) {
+        if (useMask && supportMask[voxel] !== 2) continue;
         const g = Math.max(0, gm[voxel]), w = Math.max(0, wm[voxel]), c = Math.max(0, csf[voxel]);
         const raw = g + w + c;
         const support = Math.min(raw, 1);
@@ -256,11 +264,19 @@ function makeCoarseBiasField(volumes, intensity, shape, means, { minSupport, blo
     return { low, high, t };
   };
   const ax = axisTable(nx, gx), ay = axisTable(ny, gy), az = axisTable(nz, gz);
+  const is256 = nx === 256 && ny === 256;
   return (index) => {
-    const z = Math.floor(index / plane);
-    const remainder = index - z * plane;
-    const y = Math.floor(remainder / nx);
-    const x = remainder - y * nx;
+    let x, y, z;
+    if (is256) {
+      z = index >>> 16;
+      y = (index >>> 8) & 255;
+      x = index & 255;
+    } else {
+      z = Math.floor(index / plane);
+      const remainder = index - z * plane;
+      y = Math.floor(remainder / nx);
+      x = remainder - y * nx;
+    }
     const x0 = ax.low[x], x1 = ax.high[x], tx = ax.t[x];
     const row00 = (az.low[z] * gy + ay.low[y]) * gx, row01 = (az.low[z] * gy + ay.high[y]) * gx;
     const row10 = (az.high[z] * gy + ay.low[y]) * gx, row11 = (az.high[z] * gy + ay.high[y]) * gx;
@@ -311,13 +327,15 @@ export function applyCatLitePartialVolume(volumes, intensity, shape, options = {
   const statOptions = { priorPower, minSupport, minSeparation, sigmaFloor };
   const [nx, ny, nz] = shape;
   const length = intensity.length;
-  const supportCleanup = retainPrincipalSupport(volumes, shape, minSupport);
-  const fit = makeFitData(volumes, intensity, statOptions);
+  const useMask = minSupport > 0 && minSupport <= 1;
+  const { componentCount, removedVoxels, supportMask } = retainPrincipalSupport(volumes, shape, minSupport);
+  const supportCleanup = { componentCount, removedVoxels };
+  const fit = makeFitData(volumes, intensity, statOptions, supportMask);
   const initialStats = estimateStats(fit, statOptions, true);
   if (!initialStats.applied) return { tissues: volumes, stats: initialStats };
 
   const biasAt = makeCoarseBiasField(
-    volumes, intensity, shape, initialStats.means, { minSupport, block, smoothingPasses }
+    volumes, intensity, shape, initialStats.means, { minSupport, block, smoothingPasses }, supportMask
   );
   // Interpolate once, then reuse the exact double-precision corrected values
   // for means, variances, and the mixed-class likelihoods.
@@ -350,33 +368,55 @@ export function applyCatLitePartialVolume(volumes, intensity, shape, options = {
   const logSigmaCsf = Math.log(sigmaCsf), logSigmaGm = Math.log(sigmaGm), logSigmaWm = Math.log(sigmaWm);
   const logMixGcSigma = Math.log(mixGcSigma), logMixGwSigma = Math.log(mixGwSigma), logMixCwSigma = Math.log(mixCwSigma);
 
-  // [sumG, sumW, sumC, neighbours] of the 6-neighbour priors, reused for every voxel.
-  const neighbourSums = new Float64Array(4);
   let fittedVoxel = 0;
 
   for (let z = 0; z < nz; z++) {
     for (let y = 0; y < ny; y++) {
       let index = z * plane + y * nx;
       for (let x = 0; x < nx; x++, index++) {
+        if (useMask && supportMask[index] !== 2) continue;
         const g = Math.max(0, gm[index]), w = Math.max(0, wm[index]), c = Math.max(0, csf[index]);
         const raw = g + w + c;
         const support = Math.min(raw, 1);
         if (!(support >= minSupport) || !Number.isFinite(intensity[index])) continue;
         let pg = g / raw, pw = w / raw, pc = c / raw;
         if (spatialWeight > 0) {
-          neighbourSums.fill(0);
-          if (x > 0) addNeighbourPrior(volumes, index - 1, neighbourSums);
-          if (x + 1 < nx) addNeighbourPrior(volumes, index + 1, neighbourSums);
-          if (y > 0) addNeighbourPrior(volumes, index - nx, neighbourSums);
-          if (y + 1 < ny) addNeighbourPrior(volumes, index + nx, neighbourSums);
-          if (z > 0) addNeighbourPrior(volumes, index - plane, neighbourSums);
-          if (z + 1 < nz) addNeighbourPrior(volumes, index + plane, neighbourSums);
-          const neighbours = neighbourSums[3];
+          let sumG = 0, sumW = 0, sumC = 0, neighbours = 0;
+          if (x > 0) {
+            const j = index - 1;
+            const njG = Math.max(0, gm[j]), njW = Math.max(0, wm[j]), njC = Math.max(0, csf[j]), njRaw = njG + njW + njC;
+            if (njRaw > EPSILON) { sumG += njG / njRaw; sumW += njW / njRaw; sumC += njC / njRaw; neighbours++; }
+          }
+          if (x + 1 < nx) {
+            const j = index + 1;
+            const njG = Math.max(0, gm[j]), njW = Math.max(0, wm[j]), njC = Math.max(0, csf[j]), njRaw = njG + njW + njC;
+            if (njRaw > EPSILON) { sumG += njG / njRaw; sumW += njW / njRaw; sumC += njC / njRaw; neighbours++; }
+          }
+          if (y > 0) {
+            const j = index - nx;
+            const njG = Math.max(0, gm[j]), njW = Math.max(0, wm[j]), njC = Math.max(0, csf[j]), njRaw = njG + njW + njC;
+            if (njRaw > EPSILON) { sumG += njG / njRaw; sumW += njW / njRaw; sumC += njC / njRaw; neighbours++; }
+          }
+          if (y + 1 < ny) {
+            const j = index + nx;
+            const njG = Math.max(0, gm[j]), njW = Math.max(0, wm[j]), njC = Math.max(0, csf[j]), njRaw = njG + njW + njC;
+            if (njRaw > EPSILON) { sumG += njG / njRaw; sumW += njW / njRaw; sumC += njC / njRaw; neighbours++; }
+          }
+          if (z > 0) {
+            const j = index - plane;
+            const njG = Math.max(0, gm[j]), njW = Math.max(0, wm[j]), njC = Math.max(0, csf[j]), njRaw = njG + njW + njC;
+            if (njRaw > EPSILON) { sumG += njG / njRaw; sumW += njW / njRaw; sumC += njC / njRaw; neighbours++; }
+          }
+          if (z + 1 < nz) {
+            const j = index + plane;
+            const njG = Math.max(0, gm[j]), njW = Math.max(0, wm[j]), njC = Math.max(0, csf[j]), njRaw = njG + njW + njC;
+            if (njRaw > EPSILON) { sumG += njG / njRaw; sumW += njW / njRaw; sumC += njC / njRaw; neighbours++; }
+          }
           if (neighbours) {
             const keep = 1 - spatialWeight;
-            pg = keep * pg + spatialWeight * neighbourSums[0] / neighbours;
-            pw = keep * pw + spatialWeight * neighbourSums[1] / neighbours;
-            pc = keep * pc + spatialWeight * neighbourSums[2] / neighbours;
+            pg = keep * pg + spatialWeight * sumG / neighbours;
+            pw = keep * pw + spatialWeight * sumW / neighbours;
+            pc = keep * pc + spatialWeight * sumC / neighbours;
           }
         }
         const value = fit.values[fittedVoxel++];
