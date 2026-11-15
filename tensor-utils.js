@@ -20,6 +20,40 @@ const sharedGuardScratch = { il: null, runs: null, runLen: 0, dirty: false };
 export function computeQuantiles(data, lowerQuantile = 0.05, upperQuantile = 0.95) {
   const totalSize = data.length;
   const sampleSize = Math.min(100000, totalSize);
+  const lowIndex = Math.floor(sampleSize * lowerQuantile);
+  const highIndex = Math.ceil(sampleSize * upperQuantile) - 1;
+
+  // Fast 256-bin histogram path for Uint8 volumes: skips Float64Array(100k) alloc + JS sort.
+  if (data instanceof Uint8Array || data instanceof Uint8ClampedArray) {
+    if (sampleSize === 0) return { qmin: 0, qmax: 0 };
+    const hist = new Uint32Array(256);
+    if (sampleSize >= totalSize) {
+      for (let i = 0; i < totalSize; i++) hist[data[i]]++;
+    } else {
+      for (let i = 0; i < sampleSize; i++) {
+        hist[data[Math.floor(Math.random() * totalSize)]]++;
+      }
+    }
+    let cum = 0;
+    let qmin = 0;
+    let qmax = 0;
+    let foundLow = false;
+    for (let b = 0; b < 256; b++) {
+      const c = hist[b];
+      if (c === 0) continue;
+      cum += c;
+      if (!foundLow && cum > lowIndex) {
+        qmin = b;
+        foundLow = true;
+      }
+      if (cum > highIndex) {
+        qmax = b;
+        break;
+      }
+    }
+    return { qmin, qmax };
+  }
+
   const sample = new Float64Array(sampleSize);
 
   if (sampleSize >= totalSize) {
@@ -33,8 +67,6 @@ export function computeQuantiles(data, lowerQuantile = 0.05, upperQuantile = 0.9
 
   sample.sort();
 
-  const lowIndex = Math.floor(sampleSize * lowerQuantile);
-  const highIndex = Math.ceil(sampleSize * upperQuantile) - 1;
   return {
     qmin: sample[lowIndex],
     qmax: sample[highIndex],

@@ -17,6 +17,7 @@ import {
 } from './diagnostic-stats.js';
 import { isCatLite, runCatLite } from './cat-lite.js';
 import { setupNet as setupNativeNet, nativeUnsupportedReason } from './webgpu_native/meshnet_gpu.js';
+import * as fastV4Runner from './webgpu_runners/meshnet_fast_v4_runner.js';
 
 // Hand-written WGSL kernels (webgpu_native/, ported from brainchopC) run first
 // for FP16 label models that have a webgl2_runners/descriptors.js entry (when
@@ -34,20 +35,45 @@ function nativeWebGpuDisabledReason() {
     return null;
 }
 
+const FAST_V4_RUNNERS = new Set([
+    'meshnet_fast_v4',
+    'dkatlas24_int8',
+    'mindmap24_int8',
+    'model16chan18cls_int8',
+    'mindgrab_int8',
+]);
+
+function isFastV4RunnerName(runnerName) {
+    return FAST_V4_RUNNERS.has(runnerName);
+}
+
 // Keep the runner catalog for capability checks, but import only the selected
-// model. The generated runners are large and the five-channel demo needs one.
-const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js');
+// model. Static V4 aliases resolve directly to fastV4Runner so Vite avoids mixed
+// static/dynamic chunk warnings.
+const runnerModules = import.meta.glob([
+    './webgpu_runners/*_runner.js',
+    '!./webgpu_runners/meshnet_fast_v4_runner.js',
+    '!./webgpu_runners/dkatlas24_int8_runner.js',
+    '!./webgpu_runners/mindmap24_int8_runner.js',
+    '!./webgpu_runners/model16chan18cls_int8_runner.js',
+    '!./webgpu_runners/mindgrab_int8_runner.js',
+]);
 
 // Helper to get available runners for debugging
 function getAvailableRunners() {
-    return Object.keys(runnerModules).map(path => {
+    const globNames = Object.keys(runnerModules).map(path => {
         const match = path.match(/\/([^\/]+)_runner\.js$/);
         return match ? match[1] : null;
     }).filter(Boolean);
+    return Array.from(new Set([...FAST_V4_RUNNERS, ...globNames]));
 }
 
 // Helper to find runner module with flexible matching
 function findRunnerModule(runnerName) {
+    if (FAST_V4_RUNNERS.has(runnerName)) {
+        return async () => fastV4Runner;
+    }
+
     // Try exact path first
     const exactPath = `./webgpu_runners/${runnerName}_runner.js`;
     if (runnerModules[exactPath]) {
@@ -56,6 +82,11 @@ function findRunnerModule(runnerName) {
 
     // Try case-insensitive match
     const lowerName = runnerName.toLowerCase();
+    for (const v4Name of FAST_V4_RUNNERS) {
+        if (v4Name.toLowerCase() === lowerName) {
+            return async () => fastV4Runner;
+        }
+    }
     for (const [path, module] of Object.entries(runnerModules)) {
         if (path.toLowerCase().includes(`/${lowerName}_runner.js`)) {
             return module;
@@ -75,9 +106,14 @@ function findRunnerModule(runnerName) {
 // Strict existence check for a runner (exact name only, no partial matching) --
 // used to decide whether an fp32 variant is actually available before switching.
 function runnerExists(runnerName) {
+    if (FAST_V4_RUNNERS.has(runnerName)) return true;
     const exact = `./webgpu_runners/${runnerName}_runner.js`;
     if (runnerModules[exact]) return true;
-    const lowerSuffix = `/${runnerName.toLowerCase()}_runner.js`;
+    const lowerName = runnerName.toLowerCase();
+    for (const v4Name of FAST_V4_RUNNERS) {
+        if (v4Name.toLowerCase() === lowerName) return true;
+    }
+    const lowerSuffix = `/${lowerName}_runner.js`;
     return Object.keys(runnerModules).some(p => p.toLowerCase().endsWith(lowerSuffix));
 }
 
@@ -173,16 +209,50 @@ function logDeviceCapabilities(device, modelEntry) {
     }
 }
 
+export function yieldForPaint() {
+    if (typeof requestAnimationFrame !== 'function') {
+        return new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            resolve();
+        };
+        const fallback = setTimeout(finish, 25);
+        requestAnimationFrame(() => {
+            clearTimeout(fallback);
+            setTimeout(finish, 0);
+        });
+    });
+}
+
 // Helper to safely setup the network
+const RAW_WEIGHTS_CACHE_MAX = 6;
 const WEIGHTS_CACHE_MAX = 4;
+const rawWeightsCache = new Map();
+const inflightRawWeights = new Map();
 const weightsByteCache = new Map();
 const activeRunnerByDevice = new WeakMap();
+const warmedDevices = new WeakSet();
 
-function disposeRunnerEntry(entry) {
+export async function warmupWebGpuRunners(device) {
+    if (!device || warmedDevices.has(device)) return;
+    warmedDevices.add(device);
+    try {
+        await fastV4Runner.warmupV4CorePipelines(device);
+    } catch (err) {
+        warmedDevices.delete(device);
+        console.debug('[WebGPU] Background pipeline warmup skipped:', err?.message || err);
+    }
+}
+
+function disposeRunnerEntry(entry, { keepSharedWorkspace = false } = {}) {
     if (!entry) return;
     try {
         if (typeof entry.execute?.dispose === 'function') {
-            entry.execute.dispose();
+            entry.execute.dispose({ keepSharedWorkspace });
         } else if (entry.ownedBuffers) {
             for (const buffer of entry.ownedBuffers) {
                 buffer.destroy();
@@ -219,29 +289,52 @@ function buildRunnerKey(kernelTier, runnerName, weightsPath, modelEntry) {
     ]);
 }
 
-async function fetchWeightsBytes(weightsPath, needsF16Cast, callbackUI) {
-    const weightsCacheKey = `${weightsPath}|${needsF16Cast ? 'f16' : 'raw'}`;
-    let weights = weightsByteCache.get(weightsCacheKey);
-    if (weights) {
-        weightsByteCache.delete(weightsCacheKey);
-        weightsByteCache.set(weightsCacheKey, weights);
-        return weights;
+function fetchRawWeightsBytes(weightsPath) {
+    const cached = rawWeightsCache.get(weightsPath);
+    if (cached) {
+        rawWeightsCache.delete(weightsPath);
+        rawWeightsCache.set(weightsPath, cached);
+        return Promise.resolve(cached);
     }
-    let weightsBuffer;
-    try {
-        const response = await fetch(weightsPath);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    const inflight = inflightRawWeights.get(weightsPath);
+    if (inflight) return inflight;
+    const p = (async () => {
+        let weightsBuffer;
+        try {
+            const response = await fetch(weightsPath);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            weightsBuffer = await response.arrayBuffer();
+        } catch (error) {
+            throw new Error(`Failed to load weights from '${weightsPath}': ${error.message}`);
         }
-        weightsBuffer = await response.arrayBuffer();
-    } catch (error) {
-        throw new Error(`Failed to load weights from '${weightsPath}': ${error.message}`);
+        const weights = new Uint8Array(weightsBuffer);
+        rawWeightsCache.set(weightsPath, weights);
+        while (rawWeightsCache.size > RAW_WEIGHTS_CACHE_MAX) {
+            const oldestKey = rawWeightsCache.keys().next().value;
+            rawWeightsCache.delete(oldestKey);
+        }
+        return weights;
+    })().finally(() => {
+        inflightRawWeights.delete(weightsPath);
+    });
+    inflightRawWeights.set(weightsPath, p);
+    return p;
+}
+
+function prepareWeightsBytes(rawWeights, weightsPath, needsF16Cast, callbackUI) {
+    if (!needsF16Cast) return rawWeights;
+    const cached = weightsByteCache.get(weightsPath);
+    if (cached) {
+        weightsByteCache.delete(weightsPath);
+        weightsByteCache.set(weightsPath, cached);
+        return cached;
     }
-    weights = new Uint8Array(weightsBuffer);
     // fp16 runner: if the file holds fp32 master weights, cast to fp16 now
     // (no-op when the file is already fp16). Native/f32/V4 runners handle F32 directly.
-    if (needsF16Cast) weights = castSafetensorsToF16(weights, callbackUI);
-    weightsByteCache.set(weightsCacheKey, weights);
+    const weights = castSafetensorsToF16(rawWeights, callbackUI);
+    weightsByteCache.set(weightsPath, weights);
     while (weightsByteCache.size > WEIGHTS_CACHE_MAX) {
         const oldestKey = weightsByteCache.keys().next().value;
         weightsByteCache.delete(oldestKey);
@@ -328,10 +421,16 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         return { ...cached, cacheHit: true };
     }
 
+    const nextIsFastV4 = Boolean(nativeReason && isFastV4RunnerName(runnerName));
+    callbackUI('Loading model runner...', 0.1);
+
     // Dispose previous model's GPU buffers before allocating the next model so peak GPU memory never doubles.
     if (cached) {
         activeRunnerByDevice.delete(device);
-        disposeRunnerEntry(cached);
+        disposeRunnerEntry(cached, { keepSharedWorkspace: nextIsFastV4 });
+    }
+    if (!nextIsFastV4) {
+        fastV4Runner.releaseV4Workspace(device);
     }
 
     logDeviceCapabilities(device, modelEntry);
@@ -339,7 +438,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     if (!nativeReason) {
         let nativeBuffers = [];
         try {
-            const weights = await fetchWeightsBytes(weightsPath, false, callbackUI);
+            const weights = await fetchRawWeightsBytes(weightsPath);
             const tracked = await runWithBufferTracking(
                 device,
                 () => setupNativeNet(device, weights, callbackUI, modelEntry)
@@ -367,7 +466,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         console.log(`[WebGPU-native] not used for ${modelEntry.modelName || modelEntry.webgpu_runner}: ${nativeReason}`);
     }
 
-    const loadRunner = findRunnerModule(runnerName);
+    const loadRunner = nextIsFastV4 ? async () => fastV4Runner : findRunnerModule(runnerName);
 
     if (!loadRunner) {
         const available = getAvailableRunners();
@@ -378,7 +477,10 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         );
     }
 
-    const runnerModule = await loadRunner();
+    const [runnerModule, rawWeights] = await Promise.all([
+        loadRunner(),
+        fetchRawWeightsBytes(weightsPath),
+    ]);
 
     // Validate the module has the expected export
     if (!runnerModule.setupNet && !runnerModule.default?.setupNet) {
@@ -396,7 +498,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     }
 
     const needsF16Cast = !useF32 && !supportsF32Fallback;
-    const weights = await fetchWeightsBytes(weightsPath, needsF16Cast, callbackUI);
+    const weights = prepareWeightsBytes(rawWeights, weightsPath, needsF16Cast, callbackUI);
 
     // Get setupNet function (handle both named and default exports)
     const setupNet = runnerModule.setupNet || runnerModule.default?.setupNet;
@@ -425,11 +527,14 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             execute,
             supportsGpuNativeIO,
             ownedBuffers: typeof execute.dispose === 'function' ? null : setupBuffers,
-            gpuBytes: sumBufferBytes(setupBuffers),
+            gpuBytes: typeof execute.gpuBytes === 'function' ? execute.gpuBytes() : sumBufferBytes(setupBuffers),
         };
         activeRunnerByDevice.set(device, entry);
         return { ...entry, cacheHit: false };
     } catch (error) {
+        if (nextIsFastV4) {
+            fastV4Runner.releaseV4Workspace(device);
+        }
         destroyBuffers(setupBuffers);
         throw new Error(
             `Failed to setup network for '${runnerName}': ${error.message}`
@@ -493,7 +598,6 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         oomScopeOpen = true; // ensure the scope is balanced even if the steps below throw
 
         // --- NETWORK SETUP (with warm runner & weights cache) ---
-        callbackUI('Loading model runner...', 0.1);
         const setupStart = performance.now();
         activeEntry = await setupNetwork(device, modelEntry, callbackUI);
         const Setup_t = ((performance.now() - setupStart) / 1000).toFixed(4);
@@ -551,8 +655,9 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         callbackUI('Input data prepared (full volume).', 0.4);
 
         // --- INFERENCE ---
-        const inferStart = performance.now();
         callbackUI('Running inference...', 0.5);
+        await yieldForPaint();
+        const inferStart = performance.now();
         const ioOpts = (useGpuNativeInput || useGpuNativeOutput)
             ? {
                 gpuNativeInput: useGpuNativeInput,
@@ -565,7 +670,13 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             ioOpts ? activeEntry.execute(inputData, ioOpts) : activeEntry.execute(inputData)
         );
         const inferenceResultArray = execTracked.result;
-        if (execTracked.buffers.length > 0) {
+        if (typeof activeEntry.execute.gpuBytes === 'function') {
+            activeEntry.gpuBytes = activeEntry.execute.gpuBytes();
+            const cachedEntry = activeRunnerByDevice.get(device);
+            if (cachedEntry && cachedEntry.runnerKey === activeEntry.runnerKey) {
+                cachedEntry.gpuBytes = activeEntry.gpuBytes;
+            }
+        } else if (execTracked.buffers.length > 0) {
             activeEntry.gpuBytes = (activeEntry.gpuBytes || 0) + sumBufferBytes(execTracked.buffers);
             if (activeEntry.ownedBuffers) {
                 activeEntry.ownedBuffers.push(...execTracked.buffers);
