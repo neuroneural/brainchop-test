@@ -264,6 +264,7 @@ export function convFirstSrc(d) {
  */
 export function convHiddenSrc(d) {
   const P = d.planes;
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
   const fold = d.norm === 'none';
   // weights: float index ((tap*CS) + ic)*CS + oc  ->  quad index
   //          (tap*CS + ic)*P + j,  j in [0,P)
@@ -273,12 +274,14 @@ export function convHiddenSrc(d) {
 ` + rep(P, (j) => `      a${j} += wf(w + ${j}) * v;\n`) + `    } }
 `;
   return preamble(d) + samplerDecl(P) + WFETCH +
+    (q8 ? `uniform highp sampler2D pQScale;\n` : '') +
     `uniform int uZ;\nuniform int uDil;\nuniform int uWQ0;\n` +
     (fold ? `uniform int uBiasQ;\n` + activationSrc(d.activation) + ACT4 : '') +
     outDecls(P, 'o') +
     `void main() {
   ivec3 p = ivec3(int(gl_FragCoord.x), int(gl_FragCoord.y), uZ);
-` + accDecls(P, 'a') + `  int tap = 0;
+` + (q8 ? rep(P, (i) => `  vec4 qs${i} = texelFetch(pQScale, ivec2(0, ${i}), 0);\n`) : '') +
+    accDecls(P, 'a') + `  int tap = 0;
   for (int dz = -1; dz <= 1; ++dz) {
   for (int dy = -1; dy <= 1; ++dy) {
   for (int dx = -1; dx <= 1; ++dx) {
@@ -286,7 +289,9 @@ export function convHiddenSrc(d) {
     float m = (all(greaterThanEqual(s, ivec3(0))) &&
                s.x < NX && s.y < NY && s.z < NZ) ? 1.0 : 0.0;
     ivec3 sc = clamp(s, ivec3(0), ivec3(NX - 1, NY - 1, NZ - 1));
-` + rep(P, (i) => `    vec4 q${i} = texelFetch(s${i}, sc, 0) * m;\n`) +
+` + rep(P, (i) => q8
+      ? `    vec4 q${i} = (texelFetch(s${i}, sc, 0) * 255.0 - 7.0) * qs${i} * m;\n`
+      : `    vec4 q${i} = texelFetch(s${i}, sc, 0) * m;\n`) +
     `    int b = uWQ0 + tap * CS * P;
 ` + rep(P, quad) + `    ++tap;
   }}}
@@ -323,6 +328,7 @@ export function convHiddenSrc(d) {
  */
 export function convHiddenVox2Src(d) {
   const P = d.planes;
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
   const fold = d.norm === 'none';
   const quad2 = (qi) => `  { for (int i = 0; i < 4; ++i) {
       float v = q${qi}[i];
@@ -332,13 +338,15 @@ export function convHiddenVox2Src(d) {
     `    } }
 `;
   return preamble(d) + samplerDecl(P) + WFETCH +
+    (q8 ? `uniform highp sampler2D pQScale;\n` : '') +
     `uniform int uZ;\nuniform int uDil;\nuniform int uWQ0;\n` +
     (fold ? `uniform int uBiasQ;\n` + activationSrc(d.activation) + ACT4 : '') +
     outDecls(P, 'o') + rep(P, (i) => `layout(location = ${P + i}) out vec4 n${i};\n`) +
     `void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y);
-` + accDecls(P, 'a') + accDecls(P, 'b') + `  int tap = 0;
+` + (q8 ? rep(P, (i) => `  vec4 qs${i} = texelFetch(pQScale, ivec2(0, ${i}), 0);\n`) : '') +
+    accDecls(P, 'a') + accDecls(P, 'b') + `  int tap = 0;
   for (int dz = -1; dz <= 1; ++dz) {
   for (int dy = -1; dy <= 1; ++dy) {
   for (int dx = -1; dx <= 1; ++dx) {
@@ -353,8 +361,12 @@ export function convHiddenVox2Src(d) {
     int cy = clamp(sy, 0, NY - 1);
     ivec3 ca = ivec3(cx, cy, clamp(za, 0, NZ - 1));
     ivec3 cb = ivec3(cx, cy, clamp(zb, 0, NZ - 1));
-` + rep(P, (i) => `    vec4 q${i} = texelFetch(s${i}, ca, 0) * ma;\n`) +
-    rep(P, (i) => `    vec4 r${i} = texelFetch(s${i}, cb, 0) * mb;\n`) +
+` + rep(P, (i) => q8
+      ? `    vec4 q${i} = (texelFetch(s${i}, ca, 0) * 255.0 - 7.0) * qs${i} * ma;\n`
+      : `    vec4 q${i} = texelFetch(s${i}, ca, 0) * ma;\n`) +
+    rep(P, (i) => q8
+      ? `    vec4 r${i} = (texelFetch(s${i}, cb, 0) * 255.0 - 7.0) * qs${i} * mb;\n`
+      : `    vec4 r${i} = texelFetch(s${i}, cb, 0) * mb;\n`) +
     `    int b = uWQ0 + tap * CS * P;
 ` + rep(P, quad2) + `    ++tap;
   }}}
@@ -391,37 +403,50 @@ export function convHiddenVox2Src(d) {
  * indexing an array of samplers by a runtime value. That is cheaper than P
  * separate programs.
  */
-export const momentsASrc = (d) => preamble(d) + `uniform highp sampler3D src;
+export const momentsASrc = (d) => {
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
+  return preamble(d) + `uniform highp sampler3D src;
 uniform int uRowBase;
 layout(location = 0) out vec4 oSum;
 layout(location = 1) out vec4 oSq;
-void main() {
+` + (q8 ? `layout(location = 2) out vec4 oMin;\nlayout(location = 3) out vec4 oMax;\n` : '') +
+`void main() {
   int x = int(gl_FragCoord.x);
   int y = int(gl_FragCoord.y) - uRowBase;
   vec4 s = vec4(0.0), q = vec4(0.0);
-  for (int z = 0; z < NZ; ++z) {
+` + (q8 ? `  vec4 mn = vec4(3.0e38), mx = vec4(-3.0e38);\n` : '') +
+`  for (int z = 0; z < NZ; ++z) {
     vec4 v = texelFetch(src, ivec3(x, y, z), 0);
     s += v;
     q += v * v;
-  }
+` + (q8 ? `    mn = min(mn, v); mx = max(mx, v);\n` : '') +
+`  }
   oSum = s; oSq = q;
-}
+` + (q8 ? `  oMin = mn; oMax = mx;\n` : '') + `}
 `;
+};
 
-export const momentsBSrc = (d) => preamble(d) + `uniform highp sampler2D pSum, pSq;
+export const momentsBSrc = (d) => {
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
+  return preamble(d) + `uniform highp sampler2D pSum, pSq` + (q8 ? `, pMin, pMax` : '') + `;
 layout(location = 0) out vec4 oSum;
 layout(location = 1) out vec4 oSq;
-void main() {
+` + (q8 ? `layout(location = 2) out vec4 oMin;\nlayout(location = 3) out vec4 oMax;\n` : '') +
+`void main() {
   int x = int(gl_FragCoord.x);
   int g = int(gl_FragCoord.y);
   vec4 s = vec4(0.0), q = vec4(0.0);
-  for (int y = 0; y < NY; ++y) {
+` + (q8 ? `  vec4 mn = vec4(3.0e38), mx = vec4(-3.0e38);\n` : '') +
+`  for (int y = 0; y < NY; ++y) {
     s += texelFetch(pSum, ivec2(x, g * NY + y), 0);
     q += texelFetch(pSq,  ivec2(x, g * NY + y), 0);
-  }
+` + (q8 ? `    mn = min(mn, texelFetch(pMin, ivec2(x, g * NY + y), 0));
+    mx = max(mx, texelFetch(pMax, ivec2(x, g * NY + y), 0));\n` : '') +
+`  }
   oSum = s; oSq = q;
-}
+` + (q8 ? `  oMin = mn; oMax = mx;\n` : '') + `}
 `;
+};
 
 /**
  * The variance is formed as E[x^2] - E[x]^2, the cancellation-prone way, which
@@ -444,23 +469,35 @@ void main() {
  * first; this second, and write it only if the first does not explain a
  * mismatch.
  */
-export const momentsFinishSrc = (d) => preamble(d) + `uniform highp sampler2D pSum, pSq;
-layout(location = 0) out vec4 oMean;
+export const momentsFinishSrc = (d) => {
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
+  return preamble(d) + `uniform highp sampler2D pSum, pSq` + (q8 ? `, pMin, pMax` : '') + `;\n` +
+    (q8 ? WFETCH + (d.affine ? `uniform int uAffQ;\nuniform int uBiasQ;\n` : '') + activationSrc(d.activation) + ACT4 : '') +
+`layout(location = 0) out vec4 oMean;
 layout(location = 1) out vec4 oInv;
-void main() {
+` + (q8 ? `layout(location = 2) out vec4 oQScale;\n` : '') +
+`void main() {
   int g = int(gl_FragCoord.y);
   vec4 s = vec4(0.0), q = vec4(0.0);
-  for (int x = 0; x < NX; ++x) {
+` + (q8 ? `  vec4 mn = vec4(3.0e38), mx = vec4(-3.0e38);\n` : '') +
+`  for (int x = 0; x < NX; ++x) {
     s += texelFetch(pSum, ivec2(x, g), 0);
     q += texelFetch(pSq,  ivec2(x, g), 0);
-  }
+` + (q8 ? `    mn = min(mn, texelFetch(pMin, ivec2(x, g), 0));
+    mx = max(mx, texelFetch(pMax, ivec2(x, g), 0));\n` : '') +
+`  }
   float n = float(NX) * float(NY) * float(NZ);
   vec4 mean = s / n;
   vec4 varr = max(q / n - mean * mean, vec4(0.0));
+  vec4 inv = inversesqrt(varr + EPS);
   oMean = mean;
-  oInv = inversesqrt(varr + EPS);
-}
+  oInv = inv;
+` + (q8 ? `  vec4 uLo = (mn - mean) * inv` + (d.affine ? ` * wf(uAffQ + g) + wf(uBiasQ + g)` : '') + `;
+  vec4 uHi = (mx - mean) * inv` + (d.affine ? ` * wf(uAffQ + g) + wf(uBiasQ + g)` : '') + `;
+  vec4 vmax = max(vec4(0.25), max(act4(uLo), act4(uHi)));
+  oQScale = max(vmax / 248.0, vec4(0.1705 / 7.0));\n` : '') + `}
 `;
+};
 
 // --- norm ------------------------------------------------------------------
 
@@ -481,17 +518,20 @@ void main() {
  */
 export function normSrc(d) {
   const P = d.planes;
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
   const group = (i) => `  vec4 v${i} = (texelFetch(s${i}, p, 0) - texelFetch(pMean, ivec2(0, ${i}), 0))
               * texelFetch(pInv, ivec2(0, ${i}), 0);
 ` + (d.affine ? `  v${i} = v${i} * wf(uAffQ + ${i}) + wf(uBiasQ + ${i});\n` : '');
   return preamble(d) + samplerDecl(P) +
-    `uniform highp sampler2D pMean, pInv;\n` + WFETCH +
+    `uniform highp sampler2D pMean, pInv` + (q8 ? `, pQScale` : '') + `;\n` + WFETCH +
     (d.affine ? `uniform int uAffQ;\nuniform int uBiasQ;\n` : '') +
     `uniform int uZ;\n` + activationSrc(d.activation) + ACT4 +
     outDecls(P, 'o') +
     `void main() {
   ivec3 p = ivec3(int(gl_FragCoord.x), int(gl_FragCoord.y), uZ);
-` + rep(P, group) + rep(P, (i) => `  o${i} = act4(v${i});\n`) + `}
+` + rep(P, group) + rep(P, (i) => q8
+      ? `  o${i} = clamp((act4(v${i}) / texelFetch(pQScale, ivec2(0, ${i}), 0) + 7.0) / 255.0, 0.0, 1.0);\n`
+      : `  o${i} = act4(v${i});\n`) + `}
 `;
 }
 
@@ -517,20 +557,25 @@ export function normSrc(d) {
  */
 export function classifySrc(d) {
   const P = d.planes;
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
   const pick = rep(P, (i) =>
     i === 0 ? `      float sv = c0[c];\n`
       : `      if (c >= ${i * 4}) sv = c${i}[c - ${i * 4}];\n`);
   return preamble(d) + samplerDecl(P) + WFETCH +
+    (q8 ? `uniform highp sampler2D pQScale;\n` : '') +
     `uniform int uWCls;\nuniform int uWBias;\nuniform int uHasBias;\n` +
     `out vec4 outColor;\n` +
     `void main() {
   int t = int(gl_FragCoord.y) * ${LAB_W} + int(gl_FragCoord.x);
-  vec4 lab = vec4(0.0);
+` + (q8 ? rep(P, (i) => `  vec4 qs${i} = texelFetch(pQScale, ivec2(0, ${i}), 0);\n`) : '') +
+    `  vec4 lab = vec4(0.0);
   for (int j = 0; j < 4; ++j) {
     int v = t * 4 + j;
     if (v >= NX * NY * NZ) break;
     ivec3 p = ivec3(v % NX, (v / NX) % NY, v / (NX * NY));
-` + rep(P, (i) => `    vec4 c${i} = texelFetch(s${i}, p, 0);\n`) +
+` + rep(P, (i) => q8
+      ? `    vec4 c${i} = (texelFetch(s${i}, p, 0) * 255.0 - 7.0) * qs${i};\n`
+      : `    vec4 c${i} = texelFetch(s${i}, p, 0);\n`) +
     `    float bestv = -3.0e38;
     int best = 0;
     for (int k = 0; k < NCLASS; ++k) {
@@ -556,6 +601,7 @@ export function classifySrc(d) {
 export function tissueProbabilitySrc(d) {
   if (d.nclass > 32) throw new Error('grouped tissue masks support at most 32 classes');
   const P = d.planes;
+  const q8 = !!(d.quantize8Bit && d.norm === 'gn');
   const pick = rep(P, (i) =>
     i === 0 ? `      float sv = c0[c];\n`
       : `      if (c >= ${i * 4}) sv = c${i}[c - ${i * 4}];\n`);
@@ -565,13 +611,17 @@ ${pick}        acc += sv * ws(uWCls + c * NCLASS + k);
       }
 `;
   return preamble(d) + samplerDecl(P) + WFETCH +
+    (q8 ? `uniform highp sampler2D pQScale;\n` : '') +
     `uniform int uWCls;\nuniform int uWBias;\nuniform int uHasBias;\n` +
     `uniform int uZ;\nuniform float uTemperature;\nuniform float uSupportTemperature;\n` +
     `uniform highp uint uGrayMask;\nuniform highp uint uWhiteMask;\nuniform highp uint uCsfMask;\n` +
     `out vec4 outColor;\n` +
     `void main() {
   ivec3 p = ivec3(int(gl_FragCoord.x), int(gl_FragCoord.y), uZ);
-` + rep(P, (i) => `  vec4 c${i} = texelFetch(s${i}, p, 0);\n`) +
+` + (q8 ? rep(P, (i) => `  vec4 qs${i} = texelFetch(pQScale, ivec2(0, ${i}), 0);\n`) : '') +
+    rep(P, (i) => q8
+      ? `  vec4 c${i} = (texelFetch(s${i}, p, 0) * 255.0 - 7.0) * qs${i};\n`
+      : `  vec4 c${i} = texelFetch(s${i}, p, 0);\n`) +
     `  float maximum = -3.0e38;
   for (int k = 0; k < NCLASS; ++k) {
 ${logit}    maximum = max(maximum, acc);

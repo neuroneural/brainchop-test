@@ -57,6 +57,7 @@ function toF16Bits(src) {
  * when it cannot, so the caller can log why it used the tinygrad runner.
  */
 export function nativeUnsupportedReason(device, modelEntry) {
+  if (modelEntry.quantize8Bit) return '8-bit quantized V4 runner requested';
   if (!device.features?.has('shader-f16')) return 'device lacks shader-f16';
   if (modelEntry.outputType === 'probability') return 'probability output (CAT-lite) is not ported yet';
   if (modelEntry.enableTTA) return 'test-time augmentation uses the tinygrad TTA runner';

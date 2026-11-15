@@ -8,13 +8,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "npx playwright test",
-    "pretest": "vite build",
-    "postinstall": "patch-package"
+    "pretest": "vite build"
   },
   "dependencies": {
-    "@niivue/niivue": "1.0.0-rc.13",
-    "@niivue/nv-ext-image-processing": "1.0.0-rc.13",
-    "@tensorflow/tfjs": "^4.20.0",
+    "@niivue/niivue": "1.0.0-rc.204",
+    "@niivue/nv-ext-image-processing": "1.0.0-rc.206",
     "gl-matrix": "^3.4.3"
   },
   "devDependencies": {
@@ -24,7 +22,6 @@
     "eslint": "^9.33.0",
     "eslint-plugin-vue": "^10.4.0",
     "globals": "^16.3.0",
-    "patch-package": "^8.0.1",
     "vite": "^7.0.5",
     "vite-plugin-compression": "^0.5.1"
   },

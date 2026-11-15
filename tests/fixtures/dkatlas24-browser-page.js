@@ -47,7 +47,7 @@ function profilePasses(device) {
 
 export async function benchmark({ model = 'both', variant = 'original', reverse = false, repeat = true } = {}) {
   const { input, length } = await prepareInput(variant);
-  const directories = { infant: 'model24chan104cls_infant_refit_synth', lesion: 'model24chan104cls_synth' };
+  const directories = { infant: 'model24chan104cls_v3_repbn', lesion: 'model24chan104cls_synth' };
   const models = model === 'both' ? Object.keys(directories) : [model];
   const comparisons = {};
   for (const name of models) {

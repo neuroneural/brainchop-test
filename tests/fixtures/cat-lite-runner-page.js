@@ -1,4 +1,4 @@
-import * as tf from '@tensorflow/tfjs';
+import { transposeVolume3D } from '../../tensor-utils.js';
 import runner from '../../webgpu_runners/model24chan18cls_gdice_prio_probability_runner.js';
 import { prepareInput, createDevice } from './cat-lite-browser-page.js';
 import { applyCatLitePartialVolume } from '../../cat-lite.js';
@@ -38,9 +38,7 @@ export async function benchmark({ variant = 'original', reverse = false, repeat 
         result.inferenceMs.push(performance.now() - inferenceStart);
         const volumes = [];
         for (const prior of priors) {
-          const native = tf.tidy(() => tf.tensor(prior, shape, 'float32').transpose());
-          volumes.push(await native.data());
-          native.dispose();
+          volumes.push(transposeVolume3D(prior, shape, [2, 1, 0]));
         }
         const cpuStart = performance.now();
         const { tissues, stats } = applyCatLitePartialVolume(volumes, intensity, shape, options);

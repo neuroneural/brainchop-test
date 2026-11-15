@@ -33,15 +33,15 @@ async function run(id) {
 const before = phantom();
 const b1 = count(before, 1), b5 = count(before, 5);
 console.log(`before      cerebral-WM(1)=${b1}  cerebellum-WM(5)=${b5}  (each includes a ${STRAY1}-voxel stray)`);
-for (const id of [3, 8, 21, 4]) {
+for (const id of [3, 38, 8, 21, 218, 4]) {
   const out = await run(id);
   const a1 = count(out, 1), a5 = count(out, 5);
   const ok = a1 === b1 - STRAY1 && a5 === b5 - STRAY5;
-  console.log(`id ${String(id).padStart(2)}  after cerebral-WM(1)=${a1}  cerebellum-WM(5)=${a5}   ${ok ? 'strays REMOVED (per-class largest kept)' : 'strays SURVIVED (no per-class filter)'}`);
+  console.log(`id ${String(id).padStart(3)}  after cerebral-WM(1)=${a1}  cerebellum-WM(5)=${a5}   ${ok ? 'strays REMOVED (per-class largest kept)' : 'strays SURVIVED (no per-class filter)'}`);
 }
 
 let fail = 0;
-for (const id of [3, 8, 21]) {
+for (const id of [3, 38, 8, 21, 218]) {
   const out = await run(id);
   if (count(out, 1) !== b1 - STRAY1 || count(out, 5) !== b5 - STRAY5) {
     console.error(`FAIL  model id ${id} is missing from the per-class branch in tensor-utils.js`);

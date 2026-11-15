@@ -23,10 +23,12 @@
 // weights, same output pipeline, so any label difference is the kernels.
 // ---------------------------------------------------------------------------
 
-import * as tf from '@tensorflow/tfjs';
 import {
   minMaxNormalizeVolumeData,
   quantileNormalizeVolumeData,
+  transposeVolume3D,
+  transposeVolume3DToU8,
+  countUniqueLabelsU8,
   processSegmentationVolume,
 } from './tensor-utils.js';
 import {
@@ -44,15 +46,20 @@ function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData
   self.postMessage({ cmd: 'ui', message, progressFrac, modalMessage, statData: statStr });
 }
 
-// Transfer, not clone: three 256^3 tissue maps are ~200 MB and main.js
-// terminates this worker right after 'img'. Every array here owns a distinct buffer.
+// Transfer, not clone: three 256^3 tissue maps are ~200 MB and the host
+// terminates this worker once display & completion settle.
 function callbackImg(img, opts, modelEntry, brainMask) {
   const arrays = Array.isArray(img) ? img : [img];
   if (brainMask) arrays.push(brainMask);
-  self.postMessage({ cmd: 'img', img, opts, modelEntry, brainMask }, arrays.map((a) => a.buffer));
+  const transferables = Array.from(new Set(arrays.map((a) => a.buffer)));
+  self.postMessage({ cmd: 'img', img, opts, modelEntry, brainMask }, transferables);
 }
 
-/** A refusal, not a crash: main.js reads this and starts the tfjs worker. */
+function callbackComplete(message, statData, timings) {
+  self.postMessage({ cmd: 'complete', message, statData: { ...statData }, timings });
+}
+
+/** A refusal, not a crash: main.js reads this and surfaces failure if no backend succeeded. */
 function refuse(reason) {
   self.postMessage({ cmd: 'unsupported', reason });
 }
@@ -65,10 +72,6 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
     return;
   }
   if (!entry.fullVolume) {
-    // The 24- and 32-channel models want 1.6-2.1 GiB of activations at 256^3 and
-    // today's tfjs path crops them. Cropping here means a crop/restore pass this
-    // worker does not have, so they stay on the tfjs channel-list path until it
-    // is written -- deliberately, so the first cut has no half-tested path.
     refuse(`${entry.name} needs cropping on this path, which is not implemented yet`);
     return;
   }
@@ -80,7 +83,8 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   const dim = 256;                      // main.js conforms before dispatching
   const dims = [dim, dim, dim];
 
-  // ---- weights ----------------------------------------------------------
+  // ---- weights & GL setup ----------------------------------------------
+  const setupStart = performance.now();
   callbackUI('Loading weights...', 0.05);
   const stUrl = `${opts.rootURL}${modelEntry.webgpu_safetensor.replace(/^\.\//, '/')}`;
   const stRes = await fetch(stUrl);
@@ -92,6 +96,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
     nx: dim, ny: dim, nz: dim,
     activation: entry.activation,
     dilations: entry.dilations,
+    quantize8Bit: !!modelEntry.quantize8Bit,
   });
 
   // ---- probe before doing any real work --------------------------------
@@ -102,39 +107,27 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   if (!probe.supported) { refuse(probe.reasons.join('; ')); return; }
 
   const packed = packWeights(desc, d);
+  const Setup_t = ((performance.now() - setupStart) / 1000).toFixed(4);
 
   // ---- preprocessing, identical to inference-webgpu.js ------------------
+  const prepStart = performance.now();
   callbackUI('Preparing input data...', 0.1);
-  await tf.setBackend('webgl');
-  // Let tfjs hand textures back promptly: the runner is about to ask for ~1 GiB
-  // and tfjs's default is to retain a texture pool for speed. brainchop-test's
-  // tfjs worker deliberately sets this to -1 for that reason; here the opposite
-  // is what we want, because tfjs is only doing pre/post work.
-  tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
-
-  let input, finalShape, catLiteIntensityData = null;
-  {
-    let t = tf.tensor(niftiImage, dims, 'float32');
-    const normed = modelEntry.enableQuantileNorm
-      ? await quantileNormalizeVolumeData(t)
-      : await minMaxNormalizeVolumeData(t);
-    t.dispose();
-    t = normed;
-    if (catLite) catLiteIntensityData = await t.data();
-    if (modelEntry.inputPermutation) {
-      const p = t.transpose(modelEntry.inputPermutation); t.dispose(); t = p;
-    } else if (modelEntry.enableTranspose) {
-      const p = t.transpose(); t.dispose(); t = p;
-    }
-    finalShape = t.shape;
-    input = await t.data();
-    t.dispose();
+  const normed = modelEntry.enableQuantileNorm
+    ? quantileNormalizeVolumeData(niftiImage)
+    : minMaxNormalizeVolumeData(niftiImage);
+  const catLiteIntensityData = catLite ? normed : null;
+  let input;
+  let finalShape = dims;
+  if (modelEntry.inputPermutation) {
+    const p = modelEntry.inputPermutation;
+    finalShape = [dims[p[0]], dims[p[1]], dims[p[2]]];
+    input = transposeVolume3D(normed, dims, p);
+  } else if (modelEntry.enableTranspose) {
+    input = transposeVolume3D(normed, dims, [2, 1, 0]);
+  } else {
+    input = normed;
   }
-  // Release tfjs's GPU allocations before the runner allocates its own. Without
-  // this the two pools compete and the probe's "allocates" answer stops meaning
-  // anything.
-  tf.engine().disposeVariables();
-  tf.engine().reset();
+  const Preprocess_t = ((performance.now() - prepStart) / 1000).toFixed(4);
 
   // ---- inference -------------------------------------------------------
   callbackUI('Running inference...', 0.2);
@@ -154,61 +147,60 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   input = null;
 
   // ---- postprocessing, identical to inference-webgpu.js ----------------
-  await tf.setBackend('webgl');
-  const toNativeTensor = (data, dtype) => tf.tidy(() => {
-    let v = tf.tensor(data, finalShape, dtype);
-    if (modelEntry.outputPermutation) v = v.transpose(modelEntry.outputPermutation);
-    else if (modelEntry.enableTranspose) v = v.transpose();
-    return v;
-  });
+  const outPerm = modelEntry.outputPermutation || (modelEntry.enableTranspose ? [2, 1, 0] : null);
   if (catLite) {
     const p0 = performance.now();
     callbackUI('CAT-lite: smoothing priors and fitting partial-volume classes...', 0.92);
     smoothAndGateTissuePriors(out.tissues, out.support, dims, modelEntry);
     out.support = null;
-    const tissues = await runCatLite(out.tissues, catLiteIntensityData, modelEntry, statData, async (prior) => {
-      const volume = toNativeTensor(prior, 'float32');
-      const data = await volume.data();
-      volume.dispose();
-      return data;
-    });
+    const toNative = (prior) => (outPerm
+      ? transposeVolume3D(prior, finalShape, outPerm)
+      : (prior instanceof Float32Array ? prior : Float32Array.from(prior)));
+    const tissues = await runCatLite(out.tissues, catLiteIntensityData, modelEntry, statData, toNative);
     const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
-    markSuccess(statData, Inference_t, Postprocess_t);
-    callbackUI(modelEntry.modelName + '<br>CAT-lite probability map finished', 0);
-    callbackUI('', -1, '', statData);
+    markSuccess(statData, Inference_t, Postprocess_t, { Preprocess_t, Setup_t });
     callbackImg(tissues, opts, modelEntry);
-    tf.engine().disposeVariables();
-    return;
-  }
-
-  // Int32Array, NOT Array.from: Array.from on 16.7M entries builds a boxed JS
-  // array of ~130 MB and takes seconds, which would land inside the number
-  // this path exists to improve.
-  let outLabelVolume = toNativeTensor(new Int32Array(out.labels), 'int32');
-
-  // An all-zero volume is a failure, never a result. Per the standing rule that
-  // a silent wrong answer is the cardinal sin, this must not reach the viewer as
-  // a successful empty segmentation.
-  const sum = tf.tidy(() => tf.sum(outLabelVolume).dataSync()[0]);
-  if (sum === 0) {
-    outLabelVolume.dispose();
-    refuse('native WebGL2 produced an all-zero volume');
+    callbackComplete(modelEntry.modelName + '<br>CAT-lite probability map finished', statData, {
+      Setup_t,
+      Preprocess_t,
+      Inference_t,
+      Postprocess_t,
+    });
     return;
   }
 
   const p0 = performance.now();
-  const maskResult = {};
-  const outimg = await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts, maskResult);
-  const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
-  outLabelVolume.dispose();
-  tf.engine().disposeVariables();
+  const nativeLabels = outPerm
+    ? transposeVolume3DToU8(out.labels, finalShape, outPerm)
+    : (out.labels instanceof Uint8Array ? out.labels : new Uint8Array(out.labels));
 
-  const uniq = new Set(outimg);
-  addLabelStats(statData, modelEntry.numClasses || uniq.size, uniq.size);
-  markSuccess(statData, Inference_t, Postprocess_t);
-  callbackUI(modelEntry.modelName + '<br>Segmentation finished', 0);
-  callbackUI('', -1, '', statData);
+  // An all-zero volume is a failure, never a result.
+  let hasNonZero = false;
+  for (let i = 0; i < nativeLabels.length; i++) {
+    if (nativeLabels[i] !== 0) {
+      hasNonZero = true;
+      break;
+    }
+  }
+  if (!hasNonZero) {
+    refuse('native WebGL2 produced an all-zero volume');
+    return;
+  }
+
+  const maskResult = {};
+  const outimg = await processSegmentationVolume(nativeLabels, niftiImage, modelEntry, opts, maskResult, dims);
+  const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
+
+  const actualLabels = countUniqueLabelsU8(outimg);
+  addLabelStats(statData, modelEntry.numClasses || actualLabels, actualLabels);
+  markSuccess(statData, Inference_t, Postprocess_t, { Preprocess_t, Setup_t });
   callbackImg(outimg, opts, modelEntry, maskResult.mask);
+  callbackComplete(modelEntry.modelName + '<br>Segmentation finished', statData, {
+    Setup_t,
+    Preprocess_t,
+    Inference_t,
+    Postprocess_t,
+  });
 }
 
 self.addEventListener('message', async (e) => {

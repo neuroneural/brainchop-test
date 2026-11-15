@@ -2,11 +2,10 @@ import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut }
 import { conform } from "@niivue/nv-ext-image-processing";
 import { mat4 } from "gl-matrix";
 import { shiny } from "@niivue/niivue/assets/matcaps";
-import { runInference as runInferenceTfjsMain } from "./brainchop-mainthread.js";
 import { runInferenceWebGpu } from "./inference-webgpu.js";
-import { inferenceModelsList, brainChopOpts } from "./brainchop-parameters.js";
+import { inferenceModelsList, brainChopOpts, resolveModelEntry } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
-import MyWorker from "./brainchop-webworker.js?worker";
+import { getLabelHistogramU8 } from "./tensor-utils.js";
 import { installResponsiveLayout } from "./responsive-layout.js";
 import { installTouchViewControls } from "./touch-view.js";
 
@@ -17,6 +16,105 @@ function cloneVolume(src, img = src.img.slice(), name = src.name) {
   const vol = nii2volume(hdr, img, name);
   vol.id = crypto.randomUUID();  // nii2volume defaults id to name; overlays must stay distinct
   return vol;
+}
+
+const cloneArr = (v) => (v && typeof v.slice === "function" ? v.slice() : v);
+
+// Fast conformed overlay clone: reuses src (volumes[0]) geometry/RAS fields without running
+// nii2volume's two 16.77M-voxel min/max and quantile scans.
+function cloneOverlayVolume(src, img, name = src.name, hdrOverrides = {}, volOverrides = {}) {
+  const hdr = Object.assign(Object.create(Object.getPrototypeOf(src.hdr)), src.hdr, {
+    dims: [...src.hdr.dims],
+    pixDims: [...src.hdr.pixDims],
+    affine: src.hdr.affine.map((row) => [...row]),
+    ...hdrOverrides,
+  });
+  const dims = src.dims ? src.dims.slice(0, 4) : hdr.dims.slice(0, 4);
+  const nVox3D = src.nVox3D ?? dims[1] * dims[2] * dims[3];
+  return {
+    img,
+    hdr,
+    originalAffine: hdr.affine.map((row) => [...row]),
+    dims,
+    nVox3D,
+    extentsMin: cloneArr(src.extentsMin),
+    extentsMax: cloneArr(src.extentsMax),
+    mm000: cloneArr(src.mm000),
+    mm100: cloneArr(src.mm100),
+    mm010: cloneArr(src.mm010),
+    mm001: cloneArr(src.mm001),
+    dimsRAS: src.dimsRAS ? [...src.dimsRAS] : undefined,
+    pixDimsRAS: src.pixDimsRAS ? [...src.pixDimsRAS] : undefined,
+    permRAS: src.permRAS ? [...src.permRAS] : undefined,
+    toRAS: cloneArr(src.toRAS),
+    toRASvox: cloneArr(src.toRASvox),
+    matRAS: cloneArr(src.matRAS),
+    obliqueRAS: cloneArr(src.obliqueRAS),
+    oblique_angle: src.oblique_angle,
+    frac2mm: cloneArr(src.frac2mm),
+    frac2mmOrtho: cloneArr(src.frac2mmOrtho),
+    img2RASstep: src.img2RASstep ? [...src.img2RASstep] : undefined,
+    img2RASstart: src.img2RASstart ? [...src.img2RASstart] : undefined,
+    volScale: src.volScale ? [...src.volScale] : undefined,
+    name,
+    id: crypto.randomUUID(),
+    calMin: 0,
+    calMax: 255,
+    robustMin: 0,
+    robustMax: 255,
+    globalMin: 0,
+    globalMax: 255,
+    frame4D: 0,
+    nFrame4D: 1,
+    nTotalFrame4D: 1,
+    isLegendVisible: false,
+    ...volOverrides,
+  };
+}
+
+function computeIntensityWindowFromHistU8(hist) {
+  let mn = 256;
+  let mx = -1;
+  let nonZeroTotal = 0;
+  for (let v = 0; v < 256; v++) {
+    const c = hist[v];
+    if (c > 0) {
+      if (v < mn) mn = v;
+      mx = v;
+      if (v !== 0) nonZeroTotal += c;
+    }
+  }
+  if (mn > mx) return { calMin: 0, calMax: 255, robustMin: 0, robustMax: 255, globalMin: 0, globalMax: 255 };
+  if (mn === mx) return { calMin: mn, calMax: mx, robustMin: mn, robustMax: mx, globalMin: mn, globalMax: mx };
+  const targetLo = Math.round(nonZeroTotal * 0.02);
+  const targetHi = Math.round(nonZeroTotal * 0.02);
+  let acc = 0;
+  let qLo = mn;
+  for (let v = mn; v <= mx; v++) {
+    if (v === 0 && hist[0] > targetLo) {
+      qLo = 0;
+      break;
+    }
+    acc += hist[v];
+    if (acc >= targetLo) {
+      qLo = v;
+      break;
+    }
+  }
+  acc = 0;
+  let qHi = mx;
+  for (let v = mx; v >= mn; v--) {
+    acc += hist[v];
+    if (acc >= targetHi) {
+      qHi = Math.min(mx, v + 1);
+      break;
+    }
+  }
+  if (qLo >= qHi) {
+    qLo = mn;
+    qHi = mx;
+  }
+  return { calMin: qLo, calMax: qHi, robustMin: qLo, robustMax: qHi, globalMin: mn, globalMax: mx };
 }
 
 // Niivue addresses voxels in RAS order (locationChange.vox, the drawing
@@ -67,35 +165,11 @@ let backendAttemptMessages = [];
 // Keep Safari on the tested WebGL2 fallback until its WebGPU outputs are sound.
 // ?inference=webgpu is an explicit test override for checking future WebKit builds.
 const IS_SAFARI = /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|FxiOS|Edg|Android/.test(navigator.userAgent);
-const FORCE_WEBGL2_TESTING = IS_SAFARI && new URLSearchParams(window.location.search).get('inference') !== 'webgpu';
+const SAFARI_LEGACY_WEBGPU_GATE = IS_SAFARI && new URLSearchParams(window.location.search).get('inference') !== 'webgpu';
+const FORCE_WEBGL2_TESTING = false;
 
-// Set true to skip the NATIVE WebGL2 runner (webgl2_runners/) and force the old
-// tfjs WebWorker path. This is the A/B control for the native runner: with
-// FORCE_WEBGL2_TESTING=true, flipping this false/true switches between the two
-// WebGL2 implementations on the same machine and the same model, which is the
-// only comparison that settles whether the port is worth it.
-const FORCE_TFJS_WEBGL_TESTING = false;
-
-// The NATIVE WebGL2 runner (webgl2_runners/) is LIVE. It is the whole point of
-// that code: when WebGPU is missing -- Firefox, older Safari, most Linux browsers,
-// many phones -- this is what makes brainchop fast instead of a several-minute
-// crawl. 8.03 s for model16chan18cls at full 256^3 on an M1, roughly brainchopC
-// parity, against a tfjs path that on Firefox cannot even reach its dense path for
-// any GroupNorm model (see TASK_webgl2_native_runner.md section 2b).
-//
-// Shipping it is safe because it DECLINES rather than breaks: runInferenceWebGl2
-// rejects on an unsupported device, a missing descriptor or safetensors, a GL
-// error, a lost context, non-finite layer-1 activations, or an all-zero volume --
-// and every rejection falls through to the tfjs worker below, which can still run
-// every model. So the worst case is exactly the old behaviour plus a console line.
-//
-// The import stays DYNAMIC on purpose, and not to hide the feature: the WebGPU
-// block above returns on success, so a WebGPU user never fetches this chunk or the
-// second tfjs copy its worker pulls in. Same reasoning as brainchopC probing
-// before it fetches its WebGL2 module.
-//
-// Outstanding: label parity against the WebGPU runner has not been diffed
-// systematically. Set FORCE_WEBGL2_TESTING below to compare the two on one volume.
+// The NATIVE WebGL2 runner (webgl2_runners/) handles WebGL2 fallback without tfjs.
+// The import stays DYNAMIC so WebGPU users never fetch the WebGL2 worker chunk.
 const ENABLE_NATIVE_WEBGL2 = true;
 // --------------------------------------------------------------------------
 
@@ -113,13 +187,9 @@ async function initializeBackend() {
     error: null
   };
 
-  if (FORCE_WEBGL2_TESTING) {
-    diagnostics.error = 'Safari WebGPU inference returned invalid labels; using WebGL2';
-    console.info(diagnostics.error);
-    updateBackendStatusUI(false, diagnostics);
-    window.webgpuDiagnostics = diagnostics;
-    return diagnostics;
-  }
+  // Note: When FORCE_WEBGL2_TESTING is true on Safari, we still initialize
+  // WebGPU so V4 8-bit models (quantize8Bit: true) can run on WebGPU, while
+  // legacy non-V4 models remain gated to WebGL2 in runInferenceChain().
 
   // Check secure context first
   if (!window.isSecureContext) {
@@ -156,6 +226,8 @@ async function initializeBackend() {
         const requiredLimits = {
           maxBufferSize: adapter.limits.maxBufferSize,
           maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+          maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
+          maxUniformBufferBindingSize: adapter.limits.maxUniformBufferBindingSize,
           maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
           maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
           maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
@@ -164,15 +236,20 @@ async function initializeBackend() {
           maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
         };
         const hasF16 = adapter.features.has("shader-f16");
+        const hasSubgroups = adapter.features.has("subgroups");
         diagnostics.f16Support = hasF16;
-        const requiredFeatures = hasF16 ? ["shader-f16"] : [];
+        diagnostics.subgroupsSupport = hasSubgroups;
+        const requiredFeatures = [];
+        if (hasF16) requiredFeatures.push("shader-f16");
+        if (hasSubgroups) requiredFeatures.push("subgroups");
 
         gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+        gpuDevice.__adapterInfo = adapter.info || null;
         diagnostics.deviceObtained = true;
 
         isWebGpuAvailable = true;
         const f16Status = hasF16 ? "enabled" : "not available";
-        console.log(`✓ WebGPU initialized successfully. F16: ${f16Status}`);
+        console.log(`✓ WebGPU initialized successfully. F16: ${f16Status}, Subgroups: ${hasSubgroups ? "enabled" : "not available"}`);
       } else {
         console.warn('WebGPU adapter request returned null.');
         console.warn('This typically means:');
@@ -209,9 +286,7 @@ async function initializeBackend() {
   }
 
   // Update UI with backend status
-  // While FORCE_WEBGL2_TESTING is on, report WebGL even if WebGPU initialized,
-  // so the indicator matches the path actually used.
-  updateBackendStatusUI(isWebGpuAvailable && !FORCE_WEBGL2_TESTING, diagnostics);
+  updateBackendStatusUI(isWebGpuAvailable, diagnostics);
 
   if (!isWebGpuAvailable) {
     console.log('Falling back to WebGL backend.');
@@ -262,12 +337,38 @@ function updateBackendStatusUI(webgpuAvailable, diagnostics) {
 async function main() {
   let diagnosticsString = "";
   let missingLabelStatus = "";
-  let chopWorker;
   // Raw label names / colors for the current segmentation (index -> value), used by "Save Stats".
   let lastSegLabelNames = null;
   let lastSegColors = null; // { R:[], G:[], B:[] }
   let lastModelEntry = null;
   let lastBrainMask = null; // Mindgrab's postprocessed labels, before masking image intensities
+
+  const turboToggleEl = document.getElementById("turboToggle");
+  const initialTurboParam = new URLSearchParams(window.location.search).get("turbo");
+  let isTurboEnabled = !["0", "false", "off"].includes(String(initialTurboParam || "").toLowerCase());
+
+  function getSelectedBaseModel() {
+    const idx = modelSelect.value;
+    if (idx === "-1" || modelSelect.selectedIndex < 0) return null;
+    return inferenceModelsList[idx] || null;
+  }
+
+  function syncTurboToggleUI() {
+    if (!turboToggleEl) return;
+    const baseEntry = getSelectedBaseModel();
+    const turboUnavailable = Boolean(baseEntry && baseEntry.type !== "Divider" && !baseEntry.turbo);
+    turboToggleEl.classList.toggle("active", isTurboEnabled);
+    turboToggleEl.classList.toggle("turbo-na", turboUnavailable);
+    turboToggleEl.setAttribute("aria-checked", isTurboEnabled ? "true" : "false");
+    if (turboUnavailable) {
+      turboToggleEl.title = `${baseEntry.modelName} has no 8-bit Turbo variant; it runs in standard mode while keeping your global Turbo (${isTurboEnabled ? "ON" : "OFF"}) setting.`;
+    } else if (isTurboEnabled) {
+      turboToggleEl.title = "Turbo ON: 8-bit V4 WebGPU / RGBA8 WebGL2 acceleration (~3x faster, mobile and cross-browser friendly). Click to run FP16 reference mode.";
+    } else {
+      turboToggleEl.title = "Turbo OFF: FP16 reference WebGPU / WebGL2 mode (requires large WebGPU buffers on desktop). Click to turn Turbo ON.";
+    }
+    modelSelect.title = baseEntry?.description || "Choose a segmentation model to run";
+  }
 
   // --- Single-label isolation --------------------------------------------
   // Alt/Option-click a region in a 2D panel to show ONLY that label across
@@ -423,9 +524,11 @@ async function main() {
         • <strong>Option/Alt-click</strong> a segmentation label or CAT-lite tissue to show it alone in all panels + 3D. Click it again, click the background, or press Esc to restore all overlays.</p>
 
         <p><strong>🧠 AI Models</strong><br>
-        <strong>⚡ Flash Filet:</strong> Small, lightning fast, resource-friendly. Best for HCP-like structural MRIs ("Tissue GWM (light)").<br>
-        <strong>🔪 Thin Slice:</strong> High quality but potentially fragile. Best for standard healthy adult data.<br>
-        <strong>🪓 Rough Chop:</strong> New & robust! Works on a wide variety of data qualities (clinical, infant). May be less refined than "Thin slice" on perfect data but tougher on real-world data.</p>
+        <strong>⚡ (toolbar switch, default ON):</strong> Global 8-bit V4 WebGPU &amp; RGBA8 WebGL2 acceleration (~3× faster, fits mobile/phone WebGPU limits, cross-browser across Chrome, Firefox &amp; Safari). Turn OFF for FP16 reference mode.<br>
+        <strong>🪓🌐 Omnimodal / Clinical:</strong> <em>omnimodal Skull Stripping</em> (MindGrab) and <em>Aparc+Aseg 104 (Omnimodal / Clinical)</em> (MindSnap v3-Omnimodal) for T2w, FLAIR, DWI, CT, thick clinical slices (2–5 mm), noise/bias, and skull-stripped scans.<br>
+        <strong>🪓🔪 / 🔪 Cortical + Subcortical Parcellation:</strong> <em>Aparc+Aseg 104</em> (MindSnap v3-RepBN) for standard T1-like MRIs; <em>Aparc+Aseg 104 (lesion scans)</em> after the divider for focal lesions; <em>Aparc+Aseg 50</em> for merged cortical homologues.<br>
+        <strong>⅔🧠 Tissue Fractions:</strong> <em>Tissue fraction maps (GM/WM/CSF)</em> for CAT-inspired continuous partial-volume estimation (Turbo-accelerated when ⚡ is ON).<br>
+        <strong>🪓 Subcortical &amp; Tissue:</strong> <em>Subcortical + GWM</em> and <em>Subcortical + GWM (fast)</em> for robust subcortical/tissue segmentation.</p>
         
         <p><em>Note: Models may run slower on limited devices to ensure memory safety.</em></p>
       </div>
@@ -487,7 +590,7 @@ async function main() {
   // updateGLVolume already coalesces: one call in flight, newest pending value
   // re-runs on completion. A drag never queues a backlog of stale redraws.
   opacitySlider0.oninput = () => {
-    nv1.volumes[0].opacity = Number(opacitySlider0.value);
+    if (nv1.volumes[0]) nv1.volumes[0].opacity = Number(opacitySlider0.value);
     nv1.updateGLVolume();
   };
   function applyOverlayOpacity() {
@@ -500,19 +603,24 @@ async function main() {
   }
   opacitySlider1.oninput = applyOverlayOpacity;
 
-  function applyModelUnderlayOpacity(modelEntry = null) {
+  function syncModelUnderlayOpacityNoRender(modelEntry = null) {
     const underlayOpacity = modelEntry?.probabilityUnderlayOpacity;
     if (underlayOpacity !== undefined) {
       if (probabilityUnderlayRestoreValue === null) {
         probabilityUnderlayRestoreValue = opacitySlider0.value;
       }
       opacitySlider0.value = underlayOpacity;
-      opacitySlider0.oninput();
+      if (nv1.volumes[0]) nv1.volumes[0].opacity = Number(underlayOpacity);
     } else if (probabilityUnderlayRestoreValue !== null) {
       opacitySlider0.value = probabilityUnderlayRestoreValue;
       probabilityUnderlayRestoreValue = null;
-      opacitySlider0.oninput();
+      if (nv1.volumes[0]) nv1.volumes[0].opacity = Number(opacitySlider0.value);
     }
+  }
+
+  function applyModelUnderlayOpacity(modelEntry = null) {
+    syncModelUnderlayOpacityNoRender(modelEntry);
+    nv1.updateGLVolume();
   }
 
   async function ensureConformed() {
@@ -528,20 +636,29 @@ async function main() {
       isConformed = false;
     }
     if (isConformed) return;
+    await closeAllOverlays();
     const nii2 = await nv1.volumeTransform.conform(nii, { toRAS: false });
     const [nativeNV, nativeName] = [nativeInputNV, nativeInputName];
+    const prevModelVal = modelSelect.value;
     await nv1.removeVolume(0);
     await nv1.addVolume(nii2);
-    // addVolume re-ran doLoadImage with the conformed copy; keep the native grid for export.
+    // addVolume re-ran doLoadImage with the conformed copy; keep the native grid and selected model.
     [nativeInputNV, nativeInputName] = [nativeNV, nativeName];
+    modelSelect.value = prevModelVal;
+    syncTurboToggleUI();
+  }
+
+  function removeOverlaysNoRender() {
+    isolatedProbabilityIndex = null;
+    probabilityOverlays = null;
+    while (nv1.model.volumes.length > 1) {
+      nv1.model.removeVolume(nv1.model.volumes.length - 1);
+    }
   }
 
   async function closeAllOverlays() {
-    isolatedProbabilityIndex = null;
-    probabilityOverlays = null;
-    while (nv1.volumes.length > 1) {
-      await nv1.removeVolume(nv1.volumes.length - 1);
-    }
+    removeOverlaysNoRender();
+    await nv1.updateGLVolume();
   }
 
   // The segmentation overlay, only if it carries a discrete label LUT.
@@ -710,6 +827,8 @@ async function main() {
       await runInferenceChain();
     } finally {
       suppressBackendModals = false;
+      modelSelect.value = "-1";
+      syncTurboToggleUI();
     }
   }
 
@@ -718,11 +837,11 @@ async function main() {
     if (selectedModelIndex === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
 
-    await closeAllOverlays();
-    resetLabelIsolation(); // drop any active single-label view + its HUD
+    resetLabelIsolation(); // drop any active single-label state + HUD; callbackImg swaps overlays in one pass
     await ensureConformed();
 
-    const modelEntry = inferenceModelsList[selectedModelIndex];
+    const baseModelEntry = inferenceModelsList[selectedModelIndex];
+    const modelEntry = resolveModelEntry(baseModelEntry, isTurboEnabled);
 
     const opts = { ...brainChopOpts };
     // Fix URL construction to handle './' base correctly and allow subfolders
@@ -731,27 +850,30 @@ async function main() {
     opts.rootURL = rootUrl.endsWith('/') ? rootUrl.slice(0, -1) : rootUrl;
 
     const niftiImage = nv1.volumes[0].img;
+    let lastError = null;
 
-    // 1. Try WebGPU  (skipped while FORCE_WEBGL2_TESTING is true)
-    if (isWebGpuAvailable && !FORCE_WEBGL2_TESTING && modelEntry.webgpu_safetensor) {
+    // 1. Try WebGPU (legacy non-V4 runners stay gated on Safari unless ?inference=webgpu)
+    const skipSafariLegacyWebGpu = SAFARI_LEGACY_WEBGPU_GATE && !modelEntry.quantize8Bit;
+    const skipWebGpu = FORCE_WEBGL2_TESTING || skipSafariLegacyWebGpu;
+    if (skipSafariLegacyWebGpu && isWebGpuAvailable && modelEntry.webgpu_safetensor) {
+      console.info('Safari WebGPU legacy gate active for non-V4 model; routing to native WebGL2.');
+    }
+    if (isWebGpuAvailable && !skipWebGpu && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
 
-      // Get UI state for TTA
       const currentModelEntry = { ...modelEntry, enableTTA: false };
 
       try {
         await runInferenceWebGpu(gpuDevice, opts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
         return; // Success
       } catch (e) {
-        console.error("WebGPU inference failed, falling back to WebWorker.", e);
+        lastError = e;
+        console.error("WebGPU inference failed, falling back to native WebGL2.", e);
       }
     }
 
-    // 1b. Try the NATIVE WebGL2 runner (webgl2_runners/): raw GLSL, 3D textures
-    // and MRT, bypassing tfjs entirely. Any refusal -- unsupported device, no
-    // descriptor, no safetensors, a GL error, an all-zero volume -- rejects and
-    // falls through to the tfjs worker below, which can still run every model.
-    if (ENABLE_NATIVE_WEBGL2 && !FORCE_TFJS_WEBGL_TESTING && modelEntry.webgpu_safetensor) {
+    // 2. Native WebGL2 worker runner (webgl2_runners/)
+    if (ENABLE_NATIVE_WEBGL2 && modelEntry.webgpu_safetensor) {
       try {
         // Dynamic so WebGPU users never fetch this chunk (see ENABLE_NATIVE_WEBGL2).
         const { runInferenceWebGl2, nativeWebgl2Available } = await import("./inference-webgl2.js");
@@ -760,155 +882,33 @@ async function main() {
           await runInferenceWebGl2(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
           return; // Success
         }
-        console.log("Native WebGL2 unavailable here (no OffscreenCanvas/webgl2); using the tfjs worker.");
+        lastError = new Error("Native WebGL2 unavailable (no OffscreenCanvas WebGL2 context).");
+        console.warn(lastError.message);
       } catch (e) {
-        console.warn("Native WebGL2 declined or failed, falling back to the tfjs worker.", e.message);
+        lastError = e;
+        console.error("Native WebGL2 failed.", e);
       }
     }
 
-    // The legacy tfjs paths return categorical argmax labels, never probabilities.
-    if (modelEntry.outputType === 'probability') {
-      showBackendFailure(new Error(
-        `${modelEntry.modelName} requires WebGPU or the native WebGL2 runner.`
-      ));
-      return;
-    }
-
-    // 2. Try WebWorker (WebGL)
-    console.log("Attempting WebWorker backend...");
-    if (typeof chopWorker !== "undefined") {
-      console.log("Worker is busy. Please wait.");
-      return;
-    }
-
-    const plainNiftiHeader = {
-      dims: nv1.volumes[0].hdr.dims,
-      datatypeCode: nv1.volumes[0].hdr.datatypeCode,
-    };
-
-    const runWorker = (useSeqConv) => {
-      return new Promise((resolve, reject) => {
-        const currentOpts = { ...opts, enableSeqConv: useSeqConv };
-        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv, enableTTA: false };
-
-        chopWorker = new MyWorker({ type: "module" });
-        chopWorker.postMessage({ opts: currentOpts, modelEntry: currentModelEntry, niftiHeader: plainNiftiHeader, niftiImage });
-
-        chopWorker.onmessage = function (event) {
-          const { cmd, message, progressFrac, modalMessage, statData, img, opts, modelEntry, brainMask } = event.data;
-          if (cmd === "ui") {
-            if (modalMessage) {
-              chopWorker.terminate();
-              chopWorker = undefined;
-              // Check for failure status or error message
-              if (statData && statData.Status === 'Fail') {
-                reject(new Error(statData.Error_Type || modalMessage));
-                return;
-              }
-              // Some errors might be passed as modalMessage without statData
-              if (typeof modalMessage === 'string' && (modalMessage.toLowerCase().includes('fail') || modalMessage.toLowerCase().includes('error') || modalMessage.toLowerCase().includes('compatible') || modalMessage.toLowerCase().includes('texture') || modalMessage.toLowerCase().includes('maximum'))) {
-                reject(new Error(modalMessage));
-                return;
-              }
-            }
-            callbackUI(message, progressFrac, modalMessage, statData);
-          }
-          if (cmd === "img") {
-            chopWorker.terminate();
-            chopWorker = undefined;
-            callbackImg(img, opts, modelEntry, brainMask);
-            resolve();
-          }
-        };
-        chopWorker.onerror = function (e) {
-          console.error("WebWorker failed", e);
-          chopWorker.terminate();
-          chopWorker = undefined;
-          reject(e);
-        };
-      });
-    };
-
-    try {
-      console.log("Attempting WebWorker with enableSeqConv: false");
-      await runWorker(false);
-      return;
-    } catch (e) {
-      console.warn("WebWorker (fast) failed, retrying with enableSeqConv: true", e);
-
-      // Explicitly terminate worker if it's still around
-      if (typeof chopWorker !== "undefined") {
-        chopWorker.terminate();
-        chopWorker = undefined;
-      }
-
-      // Delay to allow WebGL context cleanup
-      console.log("Waiting 1000ms for WebGL context cleanup...");
-      await new Promise(r => setTimeout(r, 1000));
-
-      try {
-        console.log("Attempting WebWorker with enableSeqConv: true");
-        await runWorker(true); // Retry with seqConv
-        return;
-      } catch (e2) {
-        console.error("WebWorker (slow) failed, falling back to Main Thread.", e2);
-      }
-    }
-
-    // 3. Fallback to Main Thread
-    console.log("Attempting Main Thread backend...");
-
-    const runMainThread = (useSeqConv) => {
-      return new Promise((resolve, reject) => {
-        const currentOpts = { ...opts, enableSeqConv: useSeqConv };
-        const currentModelEntry = { ...modelEntry, enableSeqConv: useSeqConv };
-
-        // Proxy callbackUI to intercept errors
-        const proxyCallbackUI = (message, progressFrac, modalMessage, statData) => {
-          if (statData && statData.Status === 'Fail') {
-            reject(new Error(statData.Error_Type || modalMessage || "Inference Failed"));
-            // We still call original callback to show error to user? 
-            // Actually if we are falling back, we might NOT want to show the error yet?
-            // But the existing code shows it. Let's let it show for now, or maybe suppress if we are going to retry.
-            // For now, let's just reject.
-          } else if (modalMessage && typeof modalMessage === 'string' && (modalMessage.toLowerCase().includes('fail') || modalMessage.toLowerCase().includes('error') || modalMessage.toLowerCase().includes('compatible') || modalMessage.toLowerCase().includes('texture') || modalMessage.toLowerCase().includes('maximum'))) {
-            reject(new Error(modalMessage));
-          }
-
-          // If we are rejecting, we might want to prevent the UI from showing the error if we are going to retry.
-          // But modifying callbackUI logic deeply is risky. 
-          // Let's just pass it through. The user might see "Error" then "Retrying..."
-          callbackUI(message, progressFrac, modalMessage, statData);
-        };
-
-        // Proxy callbackImg to resolve
-        const proxyCallbackImg = (img, opts, modelEntry, brainMask) => {
-          callbackImg(img, opts, modelEntry, brainMask);
-          resolve();
-        };
-
-        runInferenceTfjsMain(currentOpts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, proxyCallbackImg, proxyCallbackUI)
-          .catch(e => reject(e));
-      });
-    };
-
-    try {
-      console.log("Attempting Main Thread with enableSeqConv: false");
-      await runMainThread(false);
-    } catch (e) {
-      console.warn("Main Thread (fast) failed, retrying with enableSeqConv: true", e);
-      await new Promise(r => setTimeout(r, 100)); // Small delay
-      try {
-        console.log("Attempting Main Thread with enableSeqConv: true");
-        await runMainThread(true);
-      } catch (e2) {
-        console.error("Main Thread (slow) failed.", e2);
-        showBackendFailure(e2);
-      }
-    }
+    showBackendFailure(lastError || new Error(`No available backend could run ${modelEntry.modelName}.`));
   }
 
-  modelSelect.onchange = runSelectedInference;
+  modelSelect.onchange = () => {
+    syncTurboToggleUI();
+    return runSelectedInference();
+  };
+  if (turboToggleEl) {
+    turboToggleEl.onclick = async () => {
+      if (suppressBackendModals) return;
+      isTurboEnabled = !isTurboEnabled;
+      syncTurboToggleUI();
+      const baseEntry = getSelectedBaseModel();
+      if (baseEntry && baseEntry.turbo) {
+        await runSelectedInference();
+      }
+    };
+  }
+  syncTurboToggleUI();
   // backendSelect.onchange = runSelectedInference; // Removed
 
   // --- Save actions -------------------------------------------------------
@@ -1427,70 +1427,45 @@ async function main() {
     // Retain the volume as loaded (native grid) before ensureConformed() may
     // replace volumes[0] with the 256³ conformed copy — needed to reslice the
     // segmentation back to native space on export.
-    // addVolume() also notifies Niivue's image-loaded hook. Only treat a
-    // single-volume scene as a newly loaded underlay: an inference overlay must
-    // not replace the native volume or restore the opacity set for CAT-lite.
     if (nv1.volumes.length <= 1) {
       nativeInputNV = nv1.volumes[0] || null;
       nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
       lastModelEntry = null;
       lastBrainMask = null;
-      applyModelUnderlayOpacity();
+      syncModelUnderlayOpacityNoRender();
+      modelSelect.value = "-1";
+      syncTurboToggleUI();
+      if (nv1.volumes[0]) opacitySlider0.oninput();
     }
-    opacitySlider0.oninput();
-    modelSelect.value = "-1";
   }
 
+  const colormapJsonCache = new Map();
   async function fetchJSON(fnm) {
+    if (colormapJsonCache.has(fnm)) return colormapJsonCache.get(fnm);
     const response = await fetch(fnm);
-    return await response.json();
+    const json = await response.json();
+    colormapJsonCache.set(fnm, json);
+    return json;
   }
 
-  async function getUniqueValuesAndCounts(uint8Array) {
-    const countsMap = new Map();
-    for (const value of uint8Array) {
-      countsMap.set(value, (countsMap.get(value) || 0) + 1);
+  function createLabeledCountsFromHist(hist, labelStrings, voxelVolMm3 = 1) {
+    let presentCount = 0;
+    for (let k = 0; k < 256; k++) {
+      if (hist[k] > 0) presentCount++;
     }
-    return Array.from(countsMap, ([value, count]) => ({ value, count }));
-  }
-
-  async function createLabeledCounts(uniqueValuesAndCounts, labelStrings, voxelVolMm3 = 1) {
-    if (!labelStrings || uniqueValuesAndCounts.length !== labelStrings.length) {
+    if (!labelStrings || presentCount !== labelStrings.length) {
       missingLabelStatus = "Failed to Predict Some Labels - ";
     }
     return labelStrings.map((label, index) => {
-      const entry = uniqueValuesAndCounts.find(item => item.value === index);
-      const countText = entry ? `${fmtCm3(entry.count * voxelVolMm3)} cm3` : "Missing";
+      const count = index < 256 ? hist[index] : 0;
+      const countText = count > 0 ? `${fmtCm3(count * voxelVolMm3)} cm3` : "Missing";
       if (countText === "Missing") missingLabelStatus += `${label}, `;
       return `${label}   ${countText}`;
     });
   }
 
   async function addProbabilityOverlay(img, modelEntry, tissue) {
-    const overlayVolume = cloneVolume(
-      nv1.volumes[0],
-      img instanceof Float32Array ? img : Float32Array.from(img),
-      tissue?.name ?? nv1.volumes[0].name);
-    Object.assign(overlayVolume.hdr, {
-      scl_inter: 0,
-      scl_slope: 1,
-      datatypeCode: 16,       // DT_FLOAT32: preserve partial-volume probabilities
-      numBitsPerVoxel: 32,
-      cal_min: 0,
-      cal_max: 1,
-      intent_code: 1001,      // NIFTI_INTENT_ESTIMATE, not a categorical LABEL
-    });
     const probabilityDisplayMin = modelEntry.probabilityDisplayMin ?? 0.005;
-    Object.assign(overlayVolume, {
-      calMin: probabilityDisplayMin,
-      calMax: 1,
-      robustMin: probabilityDisplayMin,
-      robustMax: 1,
-      // ZERO_TO_MAX_TRANSPARENT_BELOW_MIN. This is essential for 3D: the
-      // overlay shader otherwise rounds every tiny positive alpha to opaque.
-      colormapType: 1,
-    });
-
     // A light tinted ramp (floor..tint) avoids the dark false edge a black-based
     // colormap draws over bright T1 white matter.
     const { probabilityOverlayAlpha: alpha = 96, probabilityOverlayFloor: floor = 192 } = modelEntry;
@@ -1503,23 +1478,43 @@ async function main() {
         A: [0, alpha], I: [0, 255],
       });
     }
-    overlayVolume.colormap = colormap;
-    overlayVolume.opacity = Number(opacitySlider1.value);
-    // Niivue rounds any nonzero overlay alpha up to opaque. Modulating the
-    // overlay by itself makes zero genuinely transparent and lets intermediate
-    // probabilities reveal the T1 underneath. Set this before addVolume so
-    // NiiVue includes modulation in its first upload rather than rebuilding
-    // the volume a second time. Ids survive overlays being removed in any order.
+    const overlayVolume = cloneOverlayVolume(
+      nv1.volumes[0],
+      img instanceof Float32Array ? img : Float32Array.from(img),
+      tissue?.name ?? nv1.volumes[0].name,
+      {
+        scl_inter: 0,
+        scl_slope: 1,
+        datatypeCode: 16,       // DT_FLOAT32: preserve partial-volume probabilities
+        numBitsPerVoxel: 32,
+        cal_min: 0,
+        cal_max: 1,
+        intent_code: 1001,      // NIFTI_INTENT_ESTIMATE, not a categorical LABEL
+      },
+      {
+        calMin: probabilityDisplayMin,
+        calMax: 1,
+        robustMin: probabilityDisplayMin,
+        robustMax: 1,
+        globalMin: 0,
+        globalMax: 1,
+        // ZERO_TO_MAX_TRANSPARENT_BELOW_MIN. Essential for 3D: the overlay shader
+        // otherwise rounds every tiny positive alpha to opaque.
+        colormapType: 1,
+        colormap,
+        opacity: Number(opacitySlider1.value),
+        modulateAlpha: 1,
+      }
+    );
+    // Modulating the overlay by itself makes zero genuinely transparent and lets
+    // intermediate probabilities reveal the T1 underneath.
     overlayVolume.modulationImage = overlayVolume.id;
-    overlayVolume.modulateAlpha = 1;
-    await nv1.addVolume(overlayVolume);
-    // NiiVue's addVolume prepares a shallow copy; retain the displayed object
-    // so isolation can match it against nv1.volumes after it is added.
+    await nv1.model.addVolume(overlayVolume);
     return nv1.volumes.at(-1);
   }
 
   async function callbackImg(img, opts, modelEntry, brainMask) {
-    await closeAllOverlays();
+    removeOverlaysNoRender();
     resetLabelIsolation();
     lastSegLabelNames = null;
     lastSegColors = null;
@@ -1532,15 +1527,22 @@ async function main() {
       for (let i = 0; i < maps.length; i++) {
         overlays.push(await addProbabilityOverlay(maps[i], modelEntry, modelEntry.probabilityTissues?.[i]));
       }
-      if (modelEntry.probabilityPostprocess === 'cat-lite' && overlays.length === 3)
+      if (modelEntry.probabilityPostprocess === 'cat-lite' && overlays.length === 3) {
         probabilityOverlays = overlays;
-      applyModelUnderlayOpacity(modelEntry);
+      }
+      syncModelUnderlayOpacityNoRender(modelEntry);
+      await nv1.updateGLVolume();
       return;
     }
-    let labelColormap = null;
-    const overlayVolume = cloneVolume(
-      nv1.volumes[0], img instanceof Uint8Array ? img : new Uint8Array(img.buffer));
-    Object.assign(overlayVolume.hdr, { scl_inter: 0, scl_slope: 1 });
+
+    const u8Img = img instanceof Uint8Array
+      ? img
+      : new Uint8Array(img.buffer, img.byteOffset || 0, img.byteLength);
+    let colormap;
+    let colormapLabel = null;
+    let intentCode = 0;
+    let volBounds = { calMin: 0, calMax: 255, robustMin: 0, robustMax: 255, globalMin: 0, globalMax: 255 };
+
     if (modelEntry.type === 'Brain_Masking') {
       const newLabels = ["Background", "Brain Mask"];
       lastSegLabelNames = newLabels.slice();
@@ -1548,38 +1550,73 @@ async function main() {
       const newG = [0, 119];
       const newB = [0, 33];
       lastSegColors = { R: newR, G: newG, B: newB };
-      labelColormap = { R: newR, G: newG, B: newB, labels: newLabels };
-      overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
+      const labelColormap = { R: newR, G: newG, B: newB, labels: newLabels };
+      const cmapName = 'brainchop-label-mask';
+      nv1.addColormap(cmapName, labelColormap);
+      colormap = cmapName;
+      colormapLabel = makeLabelLut(labelColormap);
+      intentCode = 1002; // NIFTI_INTENT_LABEL
+      volBounds = { calMin: 0, calMax: 1, robustMin: 0, robustMax: 1, globalMin: 0, globalMax: 1 };
     } else if (modelEntry.colormapPath) {
-      const roiVolumes = await getUniqueValuesAndCounts(overlayVolume.img);
+      const hist = getLabelHistogramU8(u8Img);
       const cmap = await fetchJSON(modelEntry.colormapPath);
       lastSegLabelNames = cmap["labels"] ? cmap["labels"].slice() : null;
       lastSegColors = { R: cmap["R"], G: cmap["G"], B: cmap["B"] };
       const pd = nv1.volumes[0].hdr.pixDims || [];
       const voxelVolMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
-      const newLabels = await createLabeledCounts(roiVolumes, cmap["labels"], voxelVolMm3);
-      labelColormap = { R: cmap["R"], G: cmap["G"], B: cmap["B"], labels: newLabels };
-      overlayVolume.hdr.intent_code = 1002; // NIFTI_INTENT_LABEL
+      const newLabels = cmap["labels"] ? createLabeledCountsFromHist(hist, cmap["labels"], voxelVolMm3) : [];
+      const labelColormap = {
+        R: cmap["R"],
+        G: cmap["G"],
+        B: cmap["B"],
+        ...(cmap["I"] ? { I: cmap["I"] } : {}),
+        ...(cmap["A"] ? { A: cmap["A"] } : {}),
+        labels: newLabels,
+      };
+      const cmapName = `brainchop-label-${modelEntry.id}`;
+      nv1.addColormap(cmapName, labelColormap);
+      colormap = cmapName;
+      colormapLabel = makeLabelLut(labelColormap);
+      const maxIdx = Math.max(1, (cmap["R"]?.length ?? 256) - 1);
+      intentCode = 1002; // NIFTI_INTENT_LABEL
+      volBounds = { calMin: 0, calMax: maxIdx, robustMin: 0, robustMax: maxIdx, globalMin: 0, globalMax: maxIdx };
     } else {
-      let colormap = opts.atlasSelectedColorTable.toLowerCase();
-
-      // Custom: Use copper2 for Brain Extraction models
+      const hist = getLabelHistogramU8(u8Img);
+      volBounds = computeIntensityWindowFromHistU8(hist);
+      colormap = opts.atlasSelectedColorTable.toLowerCase();
       if (modelEntry.type === 'Brain_Extraction') {
         colormap = 'copper2';
       }
-
       if (!nv1.hasColormap(colormap)) colormap = "actc";
-      overlayVolume.colormap = colormap;
     }
-    overlayVolume.opacity = Number(opacitySlider1.value);
-    // Build the LUT before adding. nv1.setColormapLabel() would also scan all
-    // 16.7M voxels for label centroids (only the legend reads them, and it is
-    // off) and run a second updateGLVolume over the freshly uploaded volume.
-    if (labelColormap) overlayVolume.colormapLabel = makeLabelLut(labelColormap);
-    await nv1.addVolume(overlayVolume);
-    // Apply after addVolume: Niivue may fire its image-loaded callback while an
-    // overlay is added, and that callback handles real underlay replacements.
-    applyModelUnderlayOpacity(modelEntry);
+
+    const overlayVolume = cloneOverlayVolume(
+      nv1.volumes[0],
+      u8Img,
+      nv1.volumes[0].name,
+      {
+        datatypeCode: 2,
+        numBitsPerVoxel: 8,
+        scl_inter: 0,
+        scl_slope: 1,
+        cal_min: volBounds.calMin,
+        cal_max: volBounds.calMax,
+        intent_code: intentCode,
+      },
+      {
+        ...volBounds,
+        colormap,
+        ...(colormapLabel ? { colormapLabel } : {}),
+        opacity: Number(opacitySlider1.value),
+      }
+    );
+    await nv1.model.addVolume(overlayVolume);
+    const addedSeg = nv1.volumes.at(-1);
+    if (colormapLabel && addedSeg && !addedSeg.colormapLabel) {
+      addedSeg.colormapLabel = colormapLabel;
+    }
+    syncModelUnderlayOpacityNoRender(modelEntry);
+    await nv1.updateGLVolume();
 
     // One-line discoverability hint (only for multi-label overlays where
     // isolation applies). It sits in the location bar until the next mouse move.
@@ -1645,13 +1682,17 @@ async function main() {
       .join('<span class="loc-sep">&middot;</span>');
   }
 
-  // WebGL2 is pinned: the raw-GLSL webgl2_runners path and the diagnostics
-  // both expect a GL context, and niivue 1.0 would otherwise pick WebGPU.
+  // Keep WebGL2 as the proven default while comparing NiiVue's WebGPU renderer.
+  // Both renderers carry the BG-opacity patch; ?viewer=webgpu opts in locally.
+  // The segmentation inference backend is selected separately.
   // matcaps must be supplied by name: loadMatcap() looks the name up here and,
   // on a miss, treats the name itself as a URL -- a silent 404 that leaves the
   // built-in default matcap in place rather than throwing.
-  const nv1 = new NiiVue({ backend: "webgl2", matcaps: { Shiny: shiny } });
+  const viewerBackend = new URLSearchParams(window.location.search).get("viewer") === "webgpu"
+    ? "webgpu" : "webgl2";
+  const nv1 = new NiiVue({ backend: viewerBackend, matcaps: { Shiny: shiny } });
   await nv1.attachTo("gl1");
+  console.info("NiiVue viewer backend:", nv1.backend);
 
   // Match the 2D panes (whose surround is the image's black background) so the
   // 3D render tile no longer reads as a lighter gray box.
@@ -1762,6 +1803,7 @@ async function main() {
   // Actually, we set selected=true on placeholder, so browser should pick it up.
   // But let's be explicit.
   modelSelect.value = "-1";
+  syncTurboToggleUI();
   setPen(-1);
 
   await initializeBackend();
@@ -1770,8 +1812,9 @@ async function main() {
   // Use URLSearchParams to correctly parse the query string.
   const urlParams = new URLSearchParams(window.location.search);
   const modelParam = urlParams.get("model");
-  if (modelParam && modelParam < inferenceModelsList.length) {
-    modelSelect.value = modelParam;
+  if (modelParam !== null && modelParam !== "" && Number(modelParam) >= 0 && Number(modelParam) < inferenceModelsList.length) {
+    modelSelect.value = String(Number(modelParam));
+    syncTurboToggleUI();
     runSelectedInference();
   }
 }

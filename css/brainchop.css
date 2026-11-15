@@ -317,6 +317,90 @@ header {
   color: #e6e8ea;
 }
 
+/* Global Turbo (8-bit WebGPU / RGBA8 WebGL2) tumbler beside model selector */
+.turbo-tumbler {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #353b45;
+  color: #b4bbc4;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+}
+
+.turbo-tumbler:hover {
+  border-color: rgba(255, 255, 255, 0.32);
+  color: #e6e8ea;
+}
+
+.turbo-tumbler:focus-visible {
+  outline: none;
+  border-color: #60a5fa;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.28);
+}
+
+.turbo-tumbler.active {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(251, 191, 36, 0.58);
+  color: #fde68a;
+}
+
+.turbo-tumbler.active:hover {
+  background: rgba(245, 158, 11, 0.24);
+  border-color: rgba(251, 191, 36, 0.8);
+}
+
+.turbo-tumbler.turbo-na {
+  opacity: 0.62;
+}
+
+.turbo-glyph {
+  display: inline-block;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.turbo-track {
+  position: relative;
+  display: inline-block;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.22);
+  transition: background-color 0.15s ease;
+}
+
+.turbo-tumbler.active .turbo-track {
+  background: #f59e0b;
+}
+
+.turbo-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #f8fafc;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 0.15s ease;
+}
+
+.turbo-tumbler.active .turbo-thumb {
+  transform: translateX(12px);
+}
+
 /* Main Canvas Area */
 main#canvas-container {
   flex-grow: 1;
@@ -550,7 +634,14 @@ progress::-moz-progress-bar {
   }
 
   .model-select {
-    max-width: 220px;
+    max-width: 200px;
+  }
+
+  .turbo-tumbler {
+    height: 32px;
+    padding: 0 8px 0 7px;
+    gap: 5px;
+    font-size: 12px;
   }
 
   .tb-btn span,
@@ -834,10 +925,31 @@ body.nv-narrow .tb-divider {
 
 body.nv-narrow .model-select {
   height: 30px;
-  max-width: 180px;
+  max-width: 168px;
   padding: 0 28px 0 10px;
   font-size: 12px;
   background-position: right 9px center;
+}
+
+body.nv-narrow .turbo-tumbler {
+  height: 30px;
+  padding: 0 7px;
+  gap: 5px;
+  font-size: 12px;
+}
+
+body.nv-narrow .turbo-track {
+  width: 24px;
+  height: 14px;
+}
+
+body.nv-narrow .turbo-thumb {
+  width: 10px;
+  height: 10px;
+}
+
+body.nv-narrow .turbo-tumbler.active .turbo-thumb {
+  transform: translateX(10px);
 }
 
 body.nv-narrow .opacity-stack {

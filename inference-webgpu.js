@@ -1,7 +1,11 @@
-import * as tf from '@tensorflow/tfjs';
 import {
-    quantileNormalizeVolumeData,
-    minMaxNormalizeVolumeData,
+    computeQuantiles,
+    computeMinMax,
+    linearScaleVolume,
+    transposeVolume3D,
+    transposeVolume3DToU8,
+    countUniqueLabelsU8,
+    validateVolumeStats,
     processSegmentationVolume
 } from './tensor-utils.js';
 import {
@@ -15,9 +19,9 @@ import { isCatLite, runCatLite } from './cat-lite.js';
 import { setupNet as setupNativeNet, nativeUnsupportedReason } from './webgpu_native/meshnet_gpu.js';
 
 // Hand-written WGSL kernels (webgpu_native/, ported from brainchopC) run first
-// when the model has a webgl2_runners/descriptors.js entry; the tinygrad runner
-// in webgpu_runners/ is the fallback. ?webgpuKernels=tinygrad forces the
-// tinygrad runner, for side-by-side comparison.
+// for FP16 label models that have a webgl2_runners/descriptors.js entry (when
+// 8-bit Turbo is OFF); V4 (quantize8Bit) uses meshnet_fast_v4_runner.js, and
+// ?webgpuKernels=tinygrad forces the tinygrad FP16 runner for A/B comparison.
 const ENABLE_NATIVE_WEBGPU = true;
 
 function nativeWebGpuDisabledReason() {
@@ -30,8 +34,9 @@ function nativeWebGpuDisabledReason() {
     return null;
 }
 
-// Use relative paths and eager loading for better error detection
-const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js', { eager: true });
+// Keep the runner catalog for capability checks, but import only the selected
+// model. The generated runners are large and the five-channel demo needs one.
+const runnerModules = import.meta.glob('./webgpu_runners/*_runner.js');
 
 // Helper to get available runners for debugging
 function getAvailableRunners() {
@@ -169,24 +174,112 @@ function logDeviceCapabilities(device, modelEntry) {
 }
 
 // Helper to safely setup the network
-async function setupNetwork(device, modelEntry, callbackUI) {
-    logDeviceCapabilities(device, modelEntry);
+const WEIGHTS_CACHE_MAX = 4;
+const weightsByteCache = new Map();
+const activeRunnerByDevice = new WeakMap();
 
-    const nativeReason = nativeWebGpuDisabledReason() ?? nativeUnsupportedReason(device, modelEntry);
-    if (!nativeReason) {
-        try {
-            const response = await fetch(modelEntry.webgpu_safetensor);
-            if (!response.ok) throw new Error(`HTTP ${response.status} for ${modelEntry.webgpu_safetensor}`);
-            const execute = await setupNativeNet(device, new Uint8Array(await response.arrayBuffer()), callbackUI, modelEntry);
-            execute.kernels = 'hand-written';
-            callbackUI('Using hand-written WebGPU kernels.', 0.45);
-            return execute;
-        } catch (error) {
-            console.warn('[WebGPU-native] falling back to the tinygrad runner:', error?.message || error);
+function disposeRunnerEntry(entry) {
+    if (!entry) return;
+    try {
+        if (typeof entry.execute?.dispose === 'function') {
+            entry.execute.dispose();
+        } else if (entry.ownedBuffers) {
+            for (const buffer of entry.ownedBuffers) {
+                buffer.destroy();
+            }
         }
-    } else {
-        console.log(`[WebGPU-native] not used for ${modelEntry.modelName || modelEntry.webgpu_runner}: ${nativeReason}`);
+    } catch (err) {
+        console.warn('[WebGPU] Failed to dispose cached runner buffers:', err);
     }
+}
+
+function buildRunnerKey(kernelTier, runnerName, weightsPath, modelEntry) {
+    return JSON.stringify([
+        kernelTier,
+        runnerName,
+        weightsPath,
+        modelEntry.id ?? null,
+        modelEntry.numClasses ?? null,
+        modelEntry.outputType ?? null,
+        modelEntry.dilations ?? null,
+        modelEntry.activation ?? null,
+        modelEntry.quantize8Bit ?? null,
+        modelEntry.forceFP32 ?? null,
+        modelEntry.disableF16 ?? null,
+        modelEntry.disableSubgroups ?? null,
+        modelEntry.disableConeSkip ?? null,
+        modelEntry.forceLowMem128 ?? null,
+        modelEntry.softmaxTemperature ?? null,
+        modelEntry.brainSupportTemperature ?? null,
+        modelEntry.brainSupportPower ?? null,
+        modelEntry.partialVolumeSigma ?? null,
+        modelEntry.probabilityGroups ?? null,
+        modelEntry.probabilityDisplay ?? null,
+        modelEntry.classifierBias ?? null
+    ]);
+}
+
+async function fetchWeightsBytes(weightsPath, needsF16Cast, callbackUI) {
+    const weightsCacheKey = `${weightsPath}|${needsF16Cast ? 'f16' : 'raw'}`;
+    let weights = weightsByteCache.get(weightsCacheKey);
+    if (weights) {
+        weightsByteCache.delete(weightsCacheKey);
+        weightsByteCache.set(weightsCacheKey, weights);
+        return weights;
+    }
+    let weightsBuffer;
+    try {
+        const response = await fetch(weightsPath);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        weightsBuffer = await response.arrayBuffer();
+    } catch (error) {
+        throw new Error(`Failed to load weights from '${weightsPath}': ${error.message}`);
+    }
+    weights = new Uint8Array(weightsBuffer);
+    // fp16 runner: if the file holds fp32 master weights, cast to fp16 now
+    // (no-op when the file is already fp16). Native/f32/V4 runners handle F32 directly.
+    if (needsF16Cast) weights = castSafetensorsToF16(weights, callbackUI);
+    weightsByteCache.set(weightsCacheKey, weights);
+    while (weightsByteCache.size > WEIGHTS_CACHE_MAX) {
+        const oldestKey = weightsByteCache.keys().next().value;
+        weightsByteCache.delete(oldestKey);
+    }
+    return weights;
+}
+
+async function runWithBufferTracking(device, fn) {
+    const buffers = [];
+    const origCreateBuffer = device.createBuffer.bind(device);
+    device.createBuffer = (descriptor) => {
+        const buffer = origCreateBuffer(descriptor);
+        buffers.push(buffer);
+        return buffer;
+    };
+    try {
+        return { result: await fn(), buffers };
+    } finally {
+        device.createBuffer = origCreateBuffer;
+    }
+}
+
+function sumBufferBytes(buffers) {
+    let total = 0;
+    for (const buf of buffers) {
+        total += Number(buf?.size) || 0;
+    }
+    return total;
+}
+
+function destroyBuffers(buffers) {
+    for (const buf of buffers) {
+        try { buf.destroy(); } catch (_) {}
+    }
+}
+
+async function setupNetwork(device, modelEntry, callbackUI) {
+    const nativeReason = nativeWebGpuDisabledReason() ?? nativeUnsupportedReason(device, modelEntry);
 
     let runnerName = modelEntry.webgpu_runner;
     let weightsPath = modelEntry.webgpu_safetensor;
@@ -196,45 +289,87 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     // The fp32 runner + weights are exported alongside as `<name>_f32`. We use fp32
     // when EITHER:
     //   1. the model entry forces it (forceFP32: true), an explicit manual override; OR
-    //   2. the device does not support the `shader-f16` feature. The fp16 runner's
-    //      WGSL declares `enable f16;` and uses array<f16>, so without that feature its
-    //      compute pipelines fail to create. In that case we auto-switch to fp32 --
-    //      but only if an fp32 runner actually exists. If no fp32 variant is available
-    //      we leave the default runner in place; it will fail and main.js falls back
-    //      to the WebGL2 worker.
+    //   2. the device does not support the `shader-f16` feature.
     const f16Supported = !!(device.features && device.features.has && device.features.has('shader-f16'));
     let useF32 = false;
 
-    if (modelEntry.forceFP32) {
-        useF32 = true;
-        console.log('[WebGPU] forceFP32: using fp32 runner and weights.');
-    } else if (!f16Supported) {
-        if (runnerExists(`${runnerName}_f32`)) {
+    if (nativeReason) {
+        if (modelEntry.forceFP32) {
+            useF32 = true;
+            console.log('[WebGPU] forceFP32: using fp32 runner and weights.');
+        } else if (!f16Supported && runnerExists(`${runnerName}_f32`)) {
             useF32 = true;
             console.log('[WebGPU] shader-f16 not supported on this device -> auto-selecting fp32 runner and weights.');
             callbackUI('fp16 not supported - using fp32 WebGPU runner.', 0.05);
-        } else {
-            console.warn(`[WebGPU] shader-f16 not supported and no fp32 runner ('${runnerName}_f32') available; ` +
-                `the fp16 runner will likely fail and fall back to WebGL2.`);
+        }
+
+        if (useF32) {
+            runnerName = `${runnerName}_f32`;
+            weightsPath = weightsPath.replace('.safetensors', '_f32.safetensors');
+        }
+
+        // --- TTA SUPPORT LOGIC ---
+        if (modelEntry.enableTTA && modelEntry.webgpuTTArunner) {
+            console.log(`[WebGPU] TTA Enabled: Switching to TTA runner and weights.`);
+            runnerName = `${runnerName}_tta`;
+            weightsPath = weightsPath.replace('.safetensors', '_tta.safetensors');
         }
     }
 
-    if (useF32) {
-        runnerName = `${runnerName}_f32`;
-        weightsPath = weightsPath.replace('.safetensors', '_f32.safetensors');
+    const kernelTier = nativeReason ? 'runner' : 'native';
+    const runnerKey = buildRunnerKey(
+        kernelTier,
+        nativeReason ? runnerName : 'webgpu_native',
+        weightsPath,
+        modelEntry
+    );
+    const cached = activeRunnerByDevice.get(device);
+    if (cached && cached.runnerKey === runnerKey) {
+        return { ...cached, cacheHit: true };
     }
 
-    // --- TTA SUPPORT LOGIC ---
-    if (modelEntry.enableTTA && modelEntry.webgpuTTArunner) {
-        console.log(`[WebGPU] TTA Enabled: Switching to TTA runner and weights.`);
-        runnerName = `${runnerName}_tta`;
-        // Assumption: TTA weights are in the same folder with '_tta' suffix before .safetensors
-        weightsPath = weightsPath.replace('.safetensors', '_tta.safetensors');
+    // Dispose previous model's GPU buffers before allocating the next model so peak GPU memory never doubles.
+    if (cached) {
+        activeRunnerByDevice.delete(device);
+        disposeRunnerEntry(cached);
     }
 
-    const runnerModule = findRunnerModule(runnerName);
+    logDeviceCapabilities(device, modelEntry);
 
-    if (!runnerModule) {
+    if (!nativeReason) {
+        let nativeBuffers = [];
+        try {
+            const weights = await fetchWeightsBytes(weightsPath, false, callbackUI);
+            const tracked = await runWithBufferTracking(
+                device,
+                () => setupNativeNet(device, weights, callbackUI, modelEntry)
+            );
+            nativeBuffers = tracked.buffers;
+            const execute = tracked.result;
+            execute.kernels = 'hand-written';
+            const entry = {
+                runnerKey,
+                runnerName: 'webgpu_native',
+                weightsPath,
+                execute,
+                supportsGpuNativeIO: false,
+                ownedBuffers: nativeBuffers,
+                gpuBytes: sumBufferBytes(nativeBuffers),
+            };
+            activeRunnerByDevice.set(device, entry);
+            callbackUI('Using hand-written WebGPU kernels.', 0.2);
+            return { ...entry, cacheHit: false };
+        } catch (error) {
+            destroyBuffers(nativeBuffers);
+            console.warn('[WebGPU-native] falling back to the tinygrad runner:', error?.message || error);
+        }
+    } else {
+        console.log(`[WebGPU-native] not used for ${modelEntry.modelName || modelEntry.webgpu_runner}: ${nativeReason}`);
+    }
+
+    const loadRunner = findRunnerModule(runnerName);
+
+    if (!loadRunner) {
         const available = getAvailableRunners();
         throw new Error(
             `Runner '${runnerName}' not found. ` +
@@ -242,6 +377,8 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             `Looking in: ./webgpu_runners/`
         );
     }
+
+    const runnerModule = await loadRunner();
 
     // Validate the module has the expected export
     if (!runnerModule.setupNet && !runnerModule.default?.setupNet) {
@@ -251,33 +388,49 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         );
     }
 
-    // Try to fetch the weights file with error handling
-    let weightsBuffer;
-    try {
-        const response = await fetch(weightsPath);
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        weightsBuffer = await response.arrayBuffer();
-    } catch (error) {
-        throw new Error(
-            `Failed to load weights from '${weightsPath}': ${error.message}`
-        );
+    const supportsF32Fallback = !!(runnerModule.supportsF32Fallback ?? runnerModule.default?.supportsF32Fallback);
+    const supportsGpuNativeIO = !!(runnerModule.supportsGpuNativeIO ?? runnerModule.default?.supportsGpuNativeIO);
+    if (!useF32 && !f16Supported && !supportsF32Fallback) {
+        console.warn(`[WebGPU] shader-f16 not supported and no fp32 runner ('${runnerName}_f32') available; ` +
+            `the fp16 runner will likely fail and fall back to WebGL2.`);
     }
+
+    const needsF16Cast = !useF32 && !supportsF32Fallback;
+    const weights = await fetchWeightsBytes(weightsPath, needsF16Cast, callbackUI);
 
     // Get setupNet function (handle both named and default exports)
     const setupNet = runnerModule.setupNet || runnerModule.default?.setupNet;
 
-    // Setup the network with proper error context
+    let setupBuffers = [];
     try {
-        let weights = new Uint8Array(weightsBuffer);
-        // fp16 runner: if the file holds fp32 master weights, cast to fp16 now
-        // (no-op when the file is already fp16). The fp32 runner keeps fp32 as-is.
-        if (!useF32) weights = castSafetensorsToF16(weights, callbackUI);
         // Generated runners ignore the fourth argument. Probability-map runners
         // use it for softmax temperature, tissue grouping, and display choice.
-        return await setupNet(device, weights, callbackUI, modelEntry);
+        const tracked = await runWithBufferTracking(
+            device,
+            () => setupNet(device, weights, callbackUI, modelEntry)
+        );
+        setupBuffers = tracked.buffers;
+        const execute = tracked.result;
+        if (typeof execute !== 'function') {
+            destroyBuffers(setupBuffers);
+            throw new Error(
+                `setupNet for '${runnerName}' didn't return a function. ` +
+                `Returned type: ${typeof execute}`
+            );
+        }
+        const entry = {
+            runnerKey,
+            runnerName,
+            weightsPath,
+            execute,
+            supportsGpuNativeIO,
+            ownedBuffers: typeof execute.dispose === 'function' ? null : setupBuffers,
+            gpuBytes: sumBufferBytes(setupBuffers),
+        };
+        activeRunnerByDevice.set(device, entry);
+        return { ...entry, cacheHit: false };
     } catch (error) {
+        destroyBuffers(setupBuffers);
         throw new Error(
             `Failed to setup network for '${runnerName}': ${error.message}`
         );
@@ -286,14 +439,11 @@ async function setupNetwork(device, modelEntry, callbackUI) {
 
 export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
     callbackUI('Starting WebGPU inference...', 0);
-    const inferenceStartTime = performance.now();
     const statData = createStatData(modelEntry, ExecutionModes.WEBGPU);
     statData.isModelFullVol = true;
 
-    let outLabelVolume; // To hold the tensor for final disposal
-    let collectedBuffers = []; // Track WebGPU buffers for cleanup
-    let originalCreateBuffer = null; // To restore the original method
     let oomScopeOpen = false; // True while an 'out-of-memory' error scope is pushed
+    let activeEntry = null;
     const catLite = isCatLite(modelEntry);
 
     try {
@@ -333,76 +483,98 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             }
         }
 
-        // --- PRE-PROCESSING: FULL VOLUME ---
-        callbackUI('Preparing input data...', 0.1);
-
-        let tensor = tf.tensor(niftiImage, [256, 256, 256], 'float32');
-        const normalized_tensor = modelEntry.enableQuantileNorm
-            ? await quantileNormalizeVolumeData(tensor)
-            : await minMaxNormalizeVolumeData(tensor);
-        tensor.dispose();
-        tensor = normalized_tensor;
-
-        // CAT-lite combines three model tissue priors with the subject's T1.
-        // Capture this before the model-specific transpose; the three outputs
-        // are transposed back to this native order below.
-        const catLiteIntensityData = catLite ? await tensor.data() : null;
-
-        if (modelEntry.inputPermutation) {
-            console.log(`[WebGPU] Permuting Input: ${modelEntry.inputPermutation}`);
-            const permuted_tensor = tensor.transpose(modelEntry.inputPermutation);
-            tensor.dispose();
-            tensor = permuted_tensor;
-        } else if (modelEntry.enableTranspose) {
-            const transposed_tensor = tensor.transpose();
-            tensor.dispose();
-            tensor = transposed_tensor;
-        }
-
-        const inputData = await tensor.data();
-        const finalShape = tensor.shape;
-        tensor.dispose();
-        callbackUI('Input data prepared (full volume).', 0.3);
-
-        // --- DYNAMIC RUNNER & INFERENCE ---
-        callbackUI('Loading model runner...', 0.4);
-
-        // Track resources for cleanup using a temporary shim
-        // We shim createBuffer to track resources without using a Proxy (which caused issues on Windows)
-        if (device) {
-            originalCreateBuffer = device.createBuffer.bind(device);
-            device.createBuffer = (descriptor) => {
-                const buffer = originalCreateBuffer(descriptor);
-                collectedBuffers.push(buffer);
-                return buffer;
-            };
-        }
-
         // --- OUT-OF-MEMORY ERROR SCOPE ---
         // Buffer allocation (in setupNetwork) and the compute passes (in execute)
         // are where a GPU OOM actually happens. Some backends (notably Firefox's
         // experimental WebGPU on macOS) report a generous maxBufferSize/
         // maxStorageBufferBindingSize yet still fail to allocate this model's
-        // large full-volume activation buffers at runtime. Without a scope the
-        // failure surfaces only as "Uncaptured WebGPU error: Out of memory" spam
-        // and an all-zeros result. Capturing it here lets us throw deterministically
-        // so main.js falls back to the WebGL2 worker cleanly. The popErrorScope
-        // call also awaits queue completion, so by the time it resolves the
-        // inference has actually run on the GPU.
+        // large full-volume activation buffers at runtime.
         device.pushErrorScope('out-of-memory');
         oomScopeOpen = true; // ensure the scope is balanced even if the steps below throw
 
-        const execute = await setupNetwork(device, modelEntry, callbackUI);
+        // --- NETWORK SETUP (with warm runner & weights cache) ---
+        callbackUI('Loading model runner...', 0.1);
+        const setupStart = performance.now();
+        activeEntry = await setupNetwork(device, modelEntry, callbackUI);
+        const Setup_t = ((performance.now() - setupStart) / 1000).toFixed(4);
 
-        if (typeof execute !== 'function') {
-            throw new Error(
-                `setupNet for '${modelEntry.webgpu_runner}' didn't return a function. ` +
-                `Returned type: ${typeof execute}`
-            );
+        // --- PRE-PROCESSING: FULL VOLUME ---
+        const prepStart = performance.now();
+        callbackUI('Preparing input data...', 0.25);
+
+        const CONFORMED_SHAPE = [256, 256, 256];
+        const useGpuNativeInput =
+            activeEntry.supportsGpuNativeIO && !!modelEntry.enableTranspose && !modelEntry.inputPermutation;
+        const useGpuNativeOutput =
+            activeEntry.supportsGpuNativeIO && !!modelEntry.enableTranspose && !modelEntry.outputPermutation;
+
+        let normOffset;
+        let normRange;
+        if (modelEntry.enableQuantileNorm) {
+            const { qmin, qmax } = computeQuantiles(niftiImage);
+            normOffset = qmin;
+            normRange = qmax - qmin;
+        } else {
+            const { min, max } = computeMinMax(niftiImage);
+            normOffset = min;
+            normRange = max - min;
         }
+        const safeRange = normRange === 0 ? 1 : normRange;
 
+        let catLiteIntensityData = null;
+        let inputData;
+        let finalShape = CONFORMED_SHAPE;
+        if (useGpuNativeInput) {
+            // Pass raw native volume straight to V4 GPU prep shader (skipping 64 MiB normalized + transposed CPU buffers).
+            if (catLite) {
+                catLiteIntensityData = linearScaleVolume(niftiImage, normOffset, safeRange);
+            }
+            inputData = niftiImage;
+        } else {
+            const normed = linearScaleVolume(niftiImage, normOffset, safeRange);
+            if (catLite) {
+                // CAT-lite combines three model tissue priors with the subject's T1 in native order.
+                catLiteIntensityData = normed;
+            }
+            if (modelEntry.inputPermutation) {
+                console.log(`[WebGPU] Permuting Input: ${modelEntry.inputPermutation}`);
+                const p = modelEntry.inputPermutation;
+                finalShape = [CONFORMED_SHAPE[p[0]], CONFORMED_SHAPE[p[1]], CONFORMED_SHAPE[p[2]]];
+                inputData = transposeVolume3D(normed, CONFORMED_SHAPE, p);
+            } else if (modelEntry.enableTranspose) {
+                inputData = transposeVolume3D(normed, CONFORMED_SHAPE, [2, 1, 0]);
+            } else {
+                inputData = normed;
+            }
+        }
+        const Preprocess_t = ((performance.now() - prepStart) / 1000).toFixed(4);
+        callbackUI('Input data prepared (full volume).', 0.4);
+
+        // --- INFERENCE ---
+        const inferStart = performance.now();
         callbackUI('Running inference...', 0.5);
-        const inferenceResultArray = await execute(inputData);
+        const ioOpts = (useGpuNativeInput || useGpuNativeOutput)
+            ? {
+                gpuNativeInput: useGpuNativeInput,
+                gpuNativeOutput: useGpuNativeOutput,
+                normOffset,
+                normRange: safeRange,
+            }
+            : undefined;
+        const execTracked = await runWithBufferTracking(device, () =>
+            ioOpts ? activeEntry.execute(inputData, ioOpts) : activeEntry.execute(inputData)
+        );
+        const inferenceResultArray = execTracked.result;
+        if (execTracked.buffers.length > 0) {
+            activeEntry.gpuBytes = (activeEntry.gpuBytes || 0) + sumBufferBytes(execTracked.buffers);
+            if (activeEntry.ownedBuffers) {
+                activeEntry.ownedBuffers.push(...execTracked.buffers);
+            }
+            const cachedEntry = activeRunnerByDevice.get(device);
+            if (cachedEntry && cachedEntry.runnerKey === activeEntry.runnerKey) {
+                cachedEntry.gpuBytes = activeEntry.gpuBytes;
+            }
+        }
 
         // Pop the scope once we've finished issuing GPU work. popErrorScope resolves
         // after the queued allocations/passes complete, so a non-null result means a
@@ -410,7 +582,6 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         oomScopeOpen = false;
         const oomError = await device.popErrorScope();
         if (oomError) {
-            // Firefox: large model exceeds what this backend can allocate.
             throw new Error(
                 `WebGPU out of memory (${oomError.message || 'allocation failed'}) ` +
                 `- falling back to WebGL2.`
@@ -424,90 +595,88 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             );
         }
 
-        const Inference_t = ((performance.now() - inferenceStartTime) / 1000).toFixed(4);
-        // Every buffer this run created is in collectedBuffers and none is freed
-        // before the cleanup below, so their sum is the model's peak GPU memory.
-        const gpuMiB = collectedBuffers.reduce((sum, b) => sum + (Number(b?.size) || 0), 0) / 1048576;
+        const Inference_t = ((performance.now() - inferStart) / 1000).toFixed(4);
+        const gpuMiB = (activeEntry.gpuBytes || 0) / 1048576;
         statData.GPU_Memory_MiB = Math.round(gpuMiB);
-        statData.WebGPU_Kernels = execute.kernels || 'tinygrad';
+        statData.WebGPU_Kernels = activeEntry.execute.kernels || 'tinygrad';
         const gpuMemory = gpuMiB >= 1024 ? `${(gpuMiB / 1024).toFixed(2)} GiB` : `${Math.round(gpuMiB)} MiB`;
-        callbackUI(`WebGPU inference (${statData.WebGPU_Kernels} kernels) took ${Inference_t}s, ` +
-            `${gpuMemory} GPU memory.`, 0.9);
+        callbackUI(
+            `WebGPU inference took ${Inference_t}s (${statData.WebGPU_Kernels} kernels, ${gpuMemory} GPU memory).`,
+            0.9
+        );
 
         // --- POST-PROCESSING ---
         console.log('Inference result shapes:', inferenceResultArray.map((result) => result?.length));
 
         const isProbabilityOutput = modelEntry.outputType === 'probability';
-        const toNativeTensor = (result, dtype) => tf.tidy(() => {
-            const volume = tf.tensor(result, finalShape, dtype);
-            if (modelEntry.outputPermutation) return volume.transpose(modelEntry.outputPermutation);
-            return modelEntry.enableTranspose ? volume.transpose() : volume;
-        });
-        const makeNativeVolume = (result, probability, description) => tf.tidy(() => {
-            const volume = toNativeTensor(result, probability ? 'float32' : 'int32');
-            const sum = tf.sum(volume).dataSync()[0];
-            console.log(`${description} sum:`, sum);
-            if (!Number.isFinite(sum) || sum === 0) {
-                throw new Error(`${description} is empty or non-finite.`);
-            }
-            if (probability) {
-                const min = tf.min(volume).dataSync()[0];
-                const max = tf.max(volume).dataSync()[0];
-                console.log(`${description} range: ${min} .. ${max}`);
-                if (!Number.isFinite(min) || !Number.isFinite(max) || min < -1e-6 || max > 1 + 1e-6) {
-                    throw new Error(`${description} is outside [0,1]: ${min} .. ${max}`);
-                }
-            }
-            return volume;
-        });
+        const outPerm = modelEntry.outputPermutation || (modelEntry.enableTranspose ? [2, 1, 0] : null);
 
-        const postProcessStartTime = performance.now();
+        const postStart = performance.now();
         let finalImage;
         const maskResult = {};
         if (catLite) {
-            // The runner is chosen by name, so a mismatched model entry can return the wrong map count.
             if (inferenceResultArray.length !== 3) {
                 throw new Error(`CAT-lite expected three tissue maps; received ${inferenceResultArray.length}.`);
             }
             callbackUI('CAT-lite: fitting GM/WM/CSF and partial-volume classes...', 0.92);
-            finalImage = await runCatLite(inferenceResultArray, catLiteIntensityData, modelEntry, statData,
-                async (prior) => {
-                    // Softmax priors: skip makeNativeVolume's three blocking readbacks per map.
-                    const volume = toNativeTensor(prior, 'float32');
-                    const data = await volume.data();
-                    volume.dispose();
-                    return data;
-                });
+            const toNative = useGpuNativeOutput
+                ? (prior) => prior
+                : (prior) => (outPerm
+                    ? transposeVolume3D(prior, finalShape, outPerm)
+                    : (prior instanceof Float32Array ? prior : Float32Array.from(prior)));
+            finalImage = await runCatLite(inferenceResultArray, catLiteIntensityData, modelEntry, statData, toNative);
+        } else if (isProbabilityOutput) {
+            const rawProb = inferenceResultArray[0];
+            finalImage = useGpuNativeOutput
+                ? rawProb
+                : (outPerm
+                    ? transposeVolume3D(rawProb, finalShape, outPerm)
+                    : (rawProb instanceof Float32Array ? rawProb : Float32Array.from(rawProb)));
+            validateVolumeStats(finalImage, true, 'probability');
         } else {
-            outLabelVolume = makeNativeVolume(
-                inferenceResultArray[0],
-                isProbabilityOutput,
-                isProbabilityOutput ? 'Probability volume' : 'Segmentation volume'
+            const rawLabels = inferenceResultArray[0];
+            let nativeLabels;
+            if (useGpuNativeOutput) {
+                nativeLabels = rawLabels instanceof Uint8Array ? rawLabels : new Uint8Array(rawLabels);
+            } else if (outPerm) {
+                nativeLabels = transposeVolume3DToU8(rawLabels, finalShape, outPerm);
+            } else {
+                nativeLabels = rawLabels instanceof Uint8Array ? rawLabels : new Uint8Array(rawLabels);
+            }
+            validateVolumeStats(nativeLabels, false, 'segmentation');
+            finalImage = await processSegmentationVolume(
+                nativeLabels,
+                niftiImage,
+                modelEntry,
+                opts,
+                maskResult,
+                CONFORMED_SHAPE
             );
-            finalImage = isProbabilityOutput
-                ? await outLabelVolume.data()
-                : await processSegmentationVolume(outLabelVolume, niftiImage, modelEntry, opts, maskResult);
         }
-        const Postprocess_t = ((performance.now() - postProcessStartTime) / 1000).toFixed(4);
+        const Postprocess_t = ((performance.now() - postStart) / 1000).toFixed(4);
 
+        const displayStart = performance.now();
         await callbackImg(finalImage, opts, modelEntry, maskResult.mask);
+        const Display_t = ((performance.now() - displayStart) / 1000).toFixed(4);
 
         if (!isProbabilityOutput) {
-            // Add label statistics from categorical output.
-            const uniqueLabels = new Set(finalImage);
-            const actualLabels = uniqueLabels.size;
+            const actualLabels = countUniqueLabelsU8(finalImage);
             const expectedLabels = modelEntry.numClasses || actualLabels;
             addLabelStats(statData, expectedLabels, actualLabels);
-        } else if (!catLite) { // runCatLite fills its own statData
+        } else if (!catLite) {
             statData.Output_Type = 'Continuous tissue probability';
             statData.Tissue = modelEntry.probabilityDisplay || 'grayMatter';
             statData.Softmax_Temperature = modelEntry.softmaxTemperature ?? 1;
         }
 
-        markSuccess(statData, Inference_t, Postprocess_t);
+        markSuccess(statData, Inference_t, Postprocess_t, { Preprocess_t, Setup_t, Display_t });
+        console.log(
+            `[Timing] WebGPU | ${modelEntry.modelName} | setup=${(Number(Setup_t) * 1000).toFixed(1)}ms ` +
+            `prep=${(Number(Preprocess_t) * 1000).toFixed(1)}ms infer=${(Number(Inference_t) * 1000).toFixed(1)}ms ` +
+            `post=${(Number(Postprocess_t) * 1000).toFixed(1)}ms disp=${(Number(Display_t) * 1000).toFixed(1)}ms ` +
+            `cache=${activeEntry.cacheHit ? 'hit' : 'miss'}`
+        );
 
-        // The timing/memory line above is replaced within a second, so repeat it
-        // here; this message stays until the next click moves the crosshair.
         callbackUI(
             modelEntry.modelName + (isProbabilityOutput
                 ? '<br>Probability map finished.'
@@ -521,6 +690,15 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
     } catch (error) {
         console.error("WebGPU Inference Error:", error);
+
+        // Evict and release GPU resources for a failed/OOM run so stale buffers never persist.
+        if (activeEntry) {
+            if (activeRunnerByDevice.get(device) === activeEntry) {
+                activeRunnerByDevice.delete(device);
+            }
+            disposeRunnerEntry(activeEntry);
+            activeEntry = null;
+        }
 
         // If we threw while an OOM error scope was still open (e.g. setupNetwork or
         // execute failed before we popped it), pop it now so the scope stays balanced
@@ -544,27 +722,5 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         callbackUI('', -1, `WebGPU Error: ${errorMessage}`, statData);
         throw error; // Re-throw to trigger fallback in main.js
-    } finally {
-        // Clean up input tensor (it was disposed earlier but let's be safe if logic changes)
-        // Clean up output tensor
-        if (outLabelVolume) {
-            outLabelVolume.dispose();
-        }
-
-        // Clean up WebGPU resources
-        // Clean up WebGPU resources
-        // Restore original createBuffer immediately
-        if (originalCreateBuffer && device) {
-            device.createBuffer = originalCreateBuffer;
-        }
-
-        // Clean up WebGPU resources
-        if (collectedBuffers && collectedBuffers.length > 0) {
-            // console.log(`Cleaning up ${collectedBuffers.length} WebGPU buffers...`);
-            for (const buffer of collectedBuffers) {
-                buffer.destroy();
-            }
-            collectedBuffers = [];
-        }
     }
 }

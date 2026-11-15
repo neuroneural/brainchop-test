@@ -78,6 +78,7 @@ export function probeWebgl2(d, dims, existingGl = null) {
     // 32 need 2.0 GiB. Guessing from one plane would refuse those on principle or
     // admit them on hope. So allocate all 2*planes and free them.
     let allocates = false;
+    const q8 = !!(d.quantize8Bit && d.norm === 'gn');
     const probeTex = [];
     if (!reasons.length) {
       while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
@@ -86,18 +87,18 @@ export function probeWebgl2(d, dims, existingGl = null) {
         const t = gl.createTexture();
         probeTex.push(t);
         gl.bindTexture(gl.TEXTURE_3D, t);
-        gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGBA16F, nx, ny, nz);
+        const fmt = (q8 && i < d.planes) ? gl.RGBA8 : gl.RGBA16F;
+        gl.texStorage3D(gl.TEXTURE_3D, 1, fmt, nx, ny, nz);
         if (gl.getError() !== gl.NO_ERROR || gl.isContextLost()) allocates = false;
       }
       for (const t of probeTex) gl.deleteTexture(t);
       if (!allocates) {
-        const mb = Math.round((2 * d.planes * nx * ny * nz * 8) / 1048576);
-        reasons.push(`could not allocate this model's ${mb} MB activation working set ` +
-          `(${2 * d.planes} x RGBA16F ${nx}x${ny}x${nz} 3D textures)`);
+        const mb = Math.round((d.planes * nx * ny * nz * (q8 ? 12 : 16)) / 1048576);
+        reasons.push(`could not allocate this model's ${mb} MB activation working set`);
       }
     }
 
-    const bytes = 2 * d.planes * nx * ny * nz * 8;
+    const bytes = d.planes * nx * ny * nz * (q8 ? 12 : 16);
     return {
       supported: reasons.length === 0,
       reasons,
@@ -115,6 +116,9 @@ export function probeWebgl2(d, dims, existingGl = null) {
 }
 
 function describeRenderer(gl) {
+  if (typeof navigator !== 'undefined' && /Firefox/.test(navigator.userAgent)) {
+    return gl.getParameter(gl.RENDERER);
+  }
   const dbg = gl.getExtension('WEBGL_debug_renderer_info');
   return dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
 }
@@ -253,10 +257,10 @@ function hardSync(gl, fbo) {
  * implementation-defined, so a failure here returns null and never breaks a run
  * that is otherwise fine.
  */
-function sampleActivation(gl, fbo, w, h) {
+function sampleActivation(gl, fbo, w, h, isRgba8 = false) {
   try {
     const n = Math.min(8, w, h);
-    const buf = new Float32Array(n * n * 4);
+    const buf = isRgba8 ? new Uint8Array(n * n * 4) : new Float32Array(n * n * 4);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fbo);
     gl.readBuffer(gl.COLOR_ATTACHMENT0);
     while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
@@ -264,11 +268,11 @@ function sampleActivation(gl, fbo, w, h) {
     // zeros and would make an all-zero patch look like a failure.
     const x0 = Math.max(0, Math.floor(w / 2) - n);
     const y0 = Math.max(0, Math.floor(h / 2) - n);
-    gl.readPixels(x0, y0, n, n, gl.RGBA, gl.FLOAT, buf);
+    gl.readPixels(x0, y0, n, n, gl.RGBA, isRgba8 ? gl.UNSIGNED_BYTE : gl.FLOAT, buf);
     if (gl.getError() !== gl.NO_ERROR) return null;
     let nan = 0, inf = 0, nz = 0, min = Infinity, max = -Infinity;
     for (let i = 0; i < buf.length; i++) {
-      const v = buf[i];
+      const v = isRgba8 ? (buf[i] - 7) : buf[i];
       if (Number.isNaN(v)) { nan++; continue; }
       if (!Number.isFinite(v)) { inf++; continue; }
       if (v !== 0) nz++;
@@ -379,8 +383,12 @@ export function runMeshNetGL(o) {
     // Two activation sets, ping-ponged. Written as setP / setQ because the
     // schedule below keeps P as "the current activation" throughout, which is
     // the whole invariant: conv P->Q, moments read Q, norm Q->P.
+    // When quantize8Bit is enabled on a GroupNorm model, setP uses normalized
+    // 8-bit RGBA8 (384 MiB for 24ch vs 768 MiB RGBA16F), cutting activation
+    // read bandwidth during 3x3x3 convolutions in half!
+    const q8 = !!(d.quantize8Bit && d.norm === 'gn');
     const setP = [], setQ = [];
-    for (let i = 0; i < P; i++) setP.push(T(tex3d(gl, nx, ny, nz, gl.RGBA16F)));
+    for (let i = 0; i < P; i++) setP.push(T(tex3d(gl, nx, ny, nz, q8 ? gl.RGBA8 : gl.RGBA16F)));
     for (let i = 0; i < P; i++) setQ.push(T(tex3d(gl, nx, ny, nz, gl.RGBA16F)));
     checkGl(gl, 'activation allocation');
 
@@ -396,7 +404,9 @@ export function runMeshNetGL(o) {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WTEX_W, wRows, gl.RGBA, gl.FLOAT, wPad);
     checkGl(gl, 'weight upload');
 
-    let momSum = null, momSq = null, redSum = null, redSq = null, mean = null, inv = null;
+    let momSum = null, momSq = null, momMin = null, momMax = null;
+    let redSum = null, redSq = null, redMin = null, redMax = null;
+    let mean = null, inv = null, qScale = null;
     let fboMomA = null, fboMomB = null, fboMomF = null;
     if (d.norm === 'gn') {
       momSum = T(tex2d(gl, nx, ny * P, gl.RGBA32F));
@@ -405,9 +415,20 @@ export function runMeshNetGL(o) {
       redSq = T(tex2d(gl, nx, P, gl.RGBA32F));
       mean = T(tex2d(gl, 1, P, gl.RGBA32F));
       inv = T(tex2d(gl, 1, P, gl.RGBA32F));
-      fboMomA = F(make2dFbo(gl, [momSum, momSq]));
-      fboMomB = F(make2dFbo(gl, [redSum, redSq]));
-      fboMomF = F(make2dFbo(gl, [mean, inv]));
+      if (q8) {
+        momMin = T(tex2d(gl, nx, ny * P, gl.RGBA32F));
+        momMax = T(tex2d(gl, nx, ny * P, gl.RGBA32F));
+        redMin = T(tex2d(gl, nx, P, gl.RGBA32F));
+        redMax = T(tex2d(gl, nx, P, gl.RGBA32F));
+        qScale = T(tex2d(gl, 1, P, gl.RGBA32F));
+        fboMomA = F(make2dFbo(gl, [momSum, momSq, momMin, momMax]));
+        fboMomB = F(make2dFbo(gl, [redSum, redSq, redMin, redMax]));
+        fboMomF = F(make2dFbo(gl, [mean, inv, qScale]));
+      } else {
+        fboMomA = F(make2dFbo(gl, [momSum, momSq]));
+        fboMomB = F(make2dFbo(gl, [redSum, redSq]));
+        fboMomF = F(make2dFbo(gl, [mean, inv]));
+      }
     }
 
     const labTexels = Math.ceil(nvox / 4);
@@ -468,6 +489,7 @@ export function runMeshNetGL(o) {
       gl.useProgram(p);
       planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
       gl.uniform1i(U(p, 'wts'), P);
+      if (q8) gl.uniform1i(U(p, 'pQScale'), P + 1);
     }
     if (progs.norm) {
       gl.useProgram(progs.norm);
@@ -475,28 +497,40 @@ export function runMeshNetGL(o) {
       gl.uniform1i(U(progs.norm, 'pMean'), P);
       gl.uniform1i(U(progs.norm, 'pInv'), P + 1);
       gl.uniform1i(U(progs.norm, 'wts'), P + 2);
+      if (q8) gl.uniform1i(U(progs.norm, 'pQScale'), P + 3);
     }
     if (progs.momentsA) { gl.useProgram(progs.momentsA); gl.uniform1i(U(progs.momentsA, 'src'), 0); }
     if (progs.momentsB) {
       gl.useProgram(progs.momentsB);
       gl.uniform1i(U(progs.momentsB, 'pSum'), 0);
       gl.uniform1i(U(progs.momentsB, 'pSq'), 1);
+      if (q8) {
+        gl.uniform1i(U(progs.momentsB, 'pMin'), 2);
+        gl.uniform1i(U(progs.momentsB, 'pMax'), 3);
+      }
     }
     if (progs.momentsF) {
       gl.useProgram(progs.momentsF);
       gl.uniform1i(U(progs.momentsF, 'pSum'), 0);
       gl.uniform1i(U(progs.momentsF, 'pSq'), 1);
+      if (q8) {
+        gl.uniform1i(U(progs.momentsF, 'pMin'), 2);
+        gl.uniform1i(U(progs.momentsF, 'pMax'), 3);
+        gl.uniform1i(U(progs.momentsF, 'wts'), 4);
+      }
     }
     if (progs.classify) {
       gl.useProgram(progs.classify);
       planeNames.forEach((n, i) => gl.uniform1i(U(progs.classify, n), i));
       gl.uniform1i(U(progs.classify, 'wts'), P);
+      if (q8) gl.uniform1i(U(progs.classify, 'pQScale'), P + 1);
     }
     if (progs.tissueProbability) {
       const p = progs.tissueProbability;
       gl.useProgram(p);
       planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
       gl.uniform1i(U(p, 'wts'), P);
+      if (q8) gl.uniform1i(U(p, 'pQScale'), P + 1);
       gl.uniform1f(U(p, 'uTemperature'), o.probability.temperature);
       gl.uniform1f(U(p, 'uSupportTemperature'), o.probability.supportTemperature);
       gl.uniform1ui(U(p, 'uGrayMask'), o.probability.grayMask >>> 0);
@@ -550,12 +584,20 @@ export function runMeshNetGL(o) {
       gl.useProgram(progs.momentsB);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboMomB);
       bind2d(0, momSum); bind2d(1, momSq);
+      if (q8) { bind2d(2, momMin); bind2d(3, momMax); }
       gl.viewport(0, 0, nx, P);
       draw();
 
       gl.useProgram(progs.momentsF);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboMomF);
       bind2d(0, redSum); bind2d(1, redSq);
+      if (q8) {
+        bind2d(2, redMin); bind2d(3, redMax); bind2d(4, wts);
+        if (d.affine) {
+          gl.uniform1i(U(progs.momentsF, 'uAffQ'), L[li].affQ);
+          gl.uniform1i(U(progs.momentsF, 'uBiasQ'), L[li].affBiasQ);
+        }
+      }
       gl.viewport(0, 0, 1, P);
       draw();
 
@@ -566,6 +608,7 @@ export function runMeshNetGL(o) {
       gl.useProgram(p);
       for (let g = 0; g < P; g++) bind3d(g, fromList[g]);
       bind2d(P, mean); bind2d(P + 1, inv); bind2d(P + 2, wts);
+      if (q8) bind2d(P + 3, qScale);
       if (d.affine) {
         gl.uniform1i(U(p, 'uAffQ'), L[li].affQ);
         gl.uniform1i(U(p, 'uBiasQ'), L[li].affBiasQ);
@@ -593,7 +636,7 @@ export function runMeshNetGL(o) {
     // A NaN here reaches the classifier as `acc > bestv` false for every class,
     // which silently leaves label 0 at every voxel -- indistinguishable from a
     // successful run until the very end.
-    const stats0 = sampleActivation(gl, curFbo[nz >> 1], nx, ny);
+    const stats0 = sampleActivation(gl, curFbo[nz >> 1], nx, ny, q8);
     if (stats0) {
       const s = `min=${stats0.min.toPrecision(4)} max=${stats0.max.toPrecision(4)} ` +
         `nonzero=${stats0.nonZero}/${stats0.total} nan=${stats0.nan} inf=${stats0.inf}`;
@@ -620,6 +663,7 @@ export function runMeshNetGL(o) {
       gl.viewport(0, 0, nx, ny);
       for (let g = 0; g < P; g++) bind3d(g, cur[g]);
       bind2d(P, wts);
+      if (q8) bind2d(P + 1, qScale);
       gl.uniform1i(U(p, 'uDil'), d.dilations[li]);
       gl.uniform1i(U(p, 'uWQ0'), L[li].wq);
       if (L[li].biasQ !== undefined) gl.uniform1i(U(p, 'uBiasQ'), L[li].biasQ);
@@ -663,6 +707,7 @@ export function runMeshNetGL(o) {
       gl.useProgram(p);
       for (let g = 0; g < P; g++) bind3d(g, cur[g]);
       bind2d(P, wts);
+      if (q8) bind2d(P + 1, qScale);
       gl.uniform1i(U(p, 'uWCls'), o.offsets.clsFloat);
       gl.uniform1i(U(p, 'uWBias'), Math.max(o.offsets.clsBiasFloat, 0));
       gl.uniform1i(U(p, 'uHasBias'), o.offsets.clsBiasFloat >= 0 ? 1 : 0);
@@ -692,6 +737,7 @@ export function runMeshNetGL(o) {
       gl.useProgram(p);
       for (let g = 0; g < P; g++) bind3d(g, cur[g]);
       bind2d(P, wts);
+      if (q8) bind2d(P + 1, qScale);
       gl.uniform1i(U(p, 'uWCls'), o.offsets.clsFloat);
       gl.uniform1i(U(p, 'uWBias'), Math.max(o.offsets.clsBiasFloat, 0));
       gl.uniform1i(U(p, 'uHasBias'), o.offsets.clsBiasFloat >= 0 ? 1 : 0);

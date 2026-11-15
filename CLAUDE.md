@@ -1,23 +1,23 @@
 # CLAUDE.md
 
-Guidance for AI sessions working on this repo: browser MRI segmentation app (Vite, NiiVue 1.0.0-rc.13, tfjs, plus raw-GLSL/WebGPU runners).
+Guidance for AI sessions working on this repo: browser MRI segmentation app (Vite, NiiVue 1.0.0-rc.204, zero `@tensorflow/tfjs`, plus WebGPU V4 INT8 / native WebGPU WGSL & raw-GLSL WebGL2 runners).
 
 ## Layout
 
-- `main.js` — app shell: UI wiring, `runInferenceChain` backend dispatch, save/export, overlay rendering (`callbackImg`, `addProbabilityOverlay`), native-space reslice (`resliceLabelsToNative`), local `cloneVolume`/`downloadVolume` (module scope, replacing NVImage methods 1.0 dropped).
+- `main.js` — app shell: UI wiring, `#turboToggle` (`⚡` 8-bit Turbo ON/OFF) & `#modelSelect` auto-reset, `runInferenceChain` backend dispatch (`WebGPU -> native WebGL2 worker`), save/export, batched overlay rendering (`callbackImg`, `addProbabilityOverlay`, `removeOverlaysNoRender`, `cloneOverlayVolume`, `nv1.addColormap` + `makeLabelLut`), native-space reslice (`resliceLabelsToNative`), local `cloneVolume`/`downloadVolume` (module scope).
 - `responsive-layout.js` — `nv-narrow` body class on phone-like viewports (CSS slims the toolbar) plus the single-plane pane switcher. 1.0 scores the multiplanar tiling itself and re-measures its canvas from a ResizeObserver, so the old layout-scoring override, draw hook and resize nudge are gone.
 - `touch-view.js` — blocks document pinch-zoom, then implements canvas pinch zoom. 1.0 drives everything from pointer events and has no gesture concept, so two-finger pointer events are stopped in the capture phase before niivue reads them as a second drag; zoom is anchored on the crosshair by mirroring the unexported `zoomPan2DAbout`.
-- `brainchop-parameters.js` — `inferenceModelsList`: one entry per model, drives dispatch/postprocess/UI (see below).
-- `inference-webgpu.js` — WebGPU runner, main thread. `setupNetwork()` tries the hand-written kernels (`webgpu_native/`) first, then loads the tinygrad runner `webgpu_runners/<name>`; both run `model.safetensors` and share pre/postprocessing.
-- `webgpu_native/` — hand-written WGSL MeshNet ported from brainchopC (`src/webgpu_kernels.h`, `src/backend_webgpu.c`): `kernels.js` generates the WGSL for any channel count and all three families, `meshnet_gpu.js` is the host (same `setupNet` → `execute(input)` interface as the tinygrad runners; weights via `webgl2_runners/weights.js`, descriptors via `webgl2_runners/descriptors.js`), `presets.js` picks threads × voxels per vendor (AMD 256×1, else 64×2; `?wgPreset=128x2` overrides). Not yet: probability/CAT-lite output, TTA, fp32.
+- `brainchop-parameters.js` — `inferenceModelsList` + `resolveModelEntry(entry, turboEnabled)`: drives dispatch/postprocess/UI (`id: 5` MindSnap v3-RepBN, `id: 60` MindSnap v3-Omnimodal, `id: 21` & `id: 23` MindMap `sulci_v2_strict`, `id: 2` MindGrab, `id: 3` 16ch fast, `id: 4` 30ch 50cls, `id: 14` lesion scans).
+- `inference-webgpu.js` — WebGPU runner, main thread, with warm runner + weights cache, GPU-folded input/output when supported (`supportsGpuNativeIO`), and per-stage timings + GPU memory reporting (`GPU_Memory_MiB`, `WebGPU_Kernels`). When Turbo ON (`quantize8Bit`), runs `meshnet_fast_v4_runner.js` (`v4-int8`); when Turbo OFF on FP16 label models, tries hand-written WGSL (`webgpu_native/`) first, then tinygrad `webgpu_runners/<name>`.
+- `webgpu_native/` — hand-written WGSL MeshNet ported from brainchopC (`src/webgpu_kernels.h`, `src/backend_webgpu.c`): `kernels.js` generates the WGSL for any channel count and all three families, `meshnet_gpu.js` is the host (same `setupNet` → `execute(input)` interface as the tinygrad runners; weights via `webgl2_runners/weights.js`, descriptors via `webgl2_runners/descriptors.js`), `presets.js` picks threads × voxels per vendor (AMD 256×1, else 64×2; `?wgPreset=128x2` overrides). Not used for `quantize8Bit`, probability/CAT-lite output, TTA, or fp32.
 - `inference-webgl2.js` — thin wrapper that spawns `brainchop-webgl2-worker.js` and normalizes its result to resolve/reject.
-- `brainchop-webgl2-worker.js` — native WebGL2 path: raw GLSL via `webgl2_runners/` (descriptors, kernels, weights, MeshNet GL driver, probability postprocess), no tfjs inference (tfjs used only for pre/post tensor ops). Mirrors `inference-webgpu.js` pre/postprocessing exactly (load-bearing: same transpose convention as the safetensors export).
-- `brainchop-webworker.js` / `brainchop-mainthread.js` — legacy tfjs paths (`inference-logic.js`, `tensor-utils.js`), fallback when WebGPU and native WebGL2 both decline/fail.
-- `cat-lite.js` — CAT-lite partial-volume postprocess (`applyCatLitePartialVolume`, plus `isCatLite`/`runCatLite` shared by both backends), pure JS, used by both the WebGPU and native WebGL2 paths.
-- `webgpu_runners/`, `webgl2_runners/` — per-model GPU kernels/descriptors for the two fast paths.
+- `brainchop-webgl2-worker.js` — native WebGL2 path: raw GLSL via `webgl2_runners/` (descriptors, kernels, weights, MeshNet GL driver with RGBA8 quantized & RGBA16F paths, probability postprocess), pure typed-array `tensor-utils.js` (no `@tensorflow/tfjs`). Mirrors `inference-webgpu.js` pre/postprocessing exactly (load-bearing: same transpose convention as the safetensors export).
+- `tensor-utils.js` / `bwlabels.js` — pure typed-array normalization, 3D transpose, `Uint32Array(256)` single-pass histograms (`countUniqueLabelsU8`), `Uint8Array`-native `BWLabeler` (`filter18ClassFromLabels`, linear component selection & neighbor voting).
+- `cat-lite.js` — CAT-lite partial-volume postprocess (`applyCatLitePartialVolume`, plus `isCatLite`/`runCatLite` shared by both backends), pure JS, used by both the WebGPU and native WebGL2 paths. WebGPU V4 computes CAT-lite separable 3D Gaussian prior smoothing on GPU before readback.
+- `webgpu_runners/`, `webgl2_runners/` — per-model GPU kernels (`meshnet_fast_v4_runner.js` V4 8-bit `dp4a` engine with 3-tier `Subgroups f16 -> Shared-mem f16 -> f32` + `LowMem128` `<= 8` storage bindings) & WebGL2 descriptors.
 - `public/models/` — model weights (`model.json`/`.safetensors`, colormaps). CAT-lite uses `model24chan18cls_gdice_prio`.
-- `tests/` — `*.mjs` node scripts (pure node except `webgl2_gate.mjs`, which drives a real browser) plus `*.spec.cjs` playwright specs.
-- `audit_response.md` — responses to the last external review (`audit_temp.md` is consumed and deleted).
+- `tests/` — `*.mjs` node scripts (`cat-lite.mjs`, `cortical_relabel.mjs`, `perclass_largest_wm.mjs`, `webgl2-probability.mjs`, `mindgrab-bias.mjs`, `component-selection.mjs`, `model5-app-smoke.mjs`, `meshnet-v4-benchmark.mjs`, `*-int8-browser.mjs`, `webgl2_gate.mjs`, `webgpu_runner_bench.mjs`) plus `*.spec.cjs` playwright specs.
+- `docs/model5_demo_speed_investigation.md` — non-inference bottleneck breakdown and before/after timings.
 
 ## Build / run / test
 
@@ -37,11 +37,8 @@ node tests/webgpu_runner_bench.mjs --model mindmap --native   # hand-written vs 
 
 Order, each stage falling through on failure/refusal (never surfaced individually to the user):
 
-1. **WebGPU** — if `isWebGpuAvailable && modelEntry.webgpu_safetensor` (skippable via `FORCE_WEBGL2_TESTING`). Hand-written kernels when the model has a descriptor and the device has `shader-f16`, else the tinygrad runner; `?webgpuKernels=tinygrad` forces the latter for A/B checks. Per-layer submissions keep each GPU job under the driver watchdog (amdgpu reset a slow single-submission runner during testing).
-2. **Native WebGL2** (`ENABLE_NATIVE_WEBGL2`, skippable via `FORCE_TFJS_WEBGL_TESTING`) — dynamic import of `inference-webgl2.js`; also needs `modelEntry.webgpu_safetensor`, plus `nativeWebgl2Available()` (OffscreenCanvas + webgl2) and a `webgl2_runners/descriptors.js` entry for the model.
-3. `outputType: 'probability'` models stop here with an error: the legacy tfjs paths only return argmax labels.
-4. **tfjs WebWorker** (`brainchop-webworker.js`) — tried fast, then retried with `enableSeqConv: true` on failure.
-5. **tfjs main thread** (`brainchop-mainthread.js`) — last resort.
+1. **WebGPU** — if `isWebGpuAvailable && modelEntry.webgpu_safetensor` (skippable via `FORCE_WEBGL2_TESTING`). With `#turboToggle` ON (default), runs the V4 8-bit runner (`meshnet_fast_v4_runner.js`, `120–240 MiB` max storage buffer). With Turbo OFF on FP16 label models, runs hand-written kernels (`webgpu_native/`) when eligible and the device has `shader-f16`, else the tinygrad runner; `?webgpuKernels=tinygrad` forces the latter for A/B checks.
+2. **Native WebGL2** (`ENABLE_NATIVE_WEBGL2`) — dynamic import of `inference-webgl2.js`; also needs `modelEntry.webgpu_safetensor`, plus `nativeWebgl2Available()` (OffscreenCanvas + webgl2) and a `webgl2_runners/descriptors.js` entry for the model (uses RGBA8 quantized textures when `quantize8Bit: true`, else RGBA16F). If WebGL2 refuses or fails, the chain surfaces the error directly (legacy `@tensorflow/tfjs` fallbacks have been removed).
 
 ## Model entries (`brainchop-parameters.js`)
 
@@ -69,15 +66,15 @@ Each entry in `inferenceModelsList` is a plain object read by `runInferenceChain
 - No `eslint.config.js` exists despite ESLint 9 + `eslint-plugin-vue`/`globals` in devDependencies; `npx eslint .` fails outright.
 - `npm test` currently fails at browser launch: @playwright/test 1.57.0 wants `chromium_headless_shell-1200`, and only 1194/1228 are in `~/Library/Caches/ms-playwright`. Run `npx playwright install chromium` to fix.
 - Even once installed, the bundled browsers do not expose WebGPU here; a test that needs it would have to use system Chrome (`channel: 'chrome'`, `--enable-unsafe-webgpu`). Nothing in `tests/` does — `webgl2_gate.mjs` drives bundled chromium/firefox for WebGL2 only.
-- CAT-lite needs WebGPU or native WebGL2 and ~1.5 GiB of GPU memory.
+- CAT-lite needs WebGPU or native WebGL2 (`120–240 MiB` max storage buffer in Turbo mode; `~1.5 GiB` in FP16 mode).
 
 ## NiiVue 1.0 migration notes
 
-Upgraded 0.62.0 → 1.0.0-rc.13. Why: 0.62's orient pass forced the opacity uniform to 1.0 whenever `modulateAlpha` was set, so the overlay slider could not affect a self-modulated overlay at all. 1.0 applies modulation and opacity independently.
+Upgraded 0.62.0 → 1.0.0-rc.13 → 1.0.0-rc.204 (`@next`, with `@niivue/nv-ext-image-processing` `1.0.0-rc.206`, zero local `patch-package` patches). Why: 0.62's orient pass forced the opacity uniform to 1.0 whenever `modulateAlpha` was set, and `1.0.0-rc.204` upstreamed our wheel-pan, render-gain, background-opacity fade, and 3D filtering fixes natively.
 
-- Backend is pinned: `new NiiVue({ backend: "webgl2" })`. 1.0 defaults to WebGPU; WebGL2 keeps the viewer aligned with the raw-GLSL runners and `localSystemDetails(nv1.view?.gl)`. Switching to WebGPU is a one-line change; it is the faster backend for the CAT-lite overlay slider (see Deferred).
-- `NVImage` is plain data in 1.0 — no `clone`/`zeroImage`/`calMinMax`/`getValue`/`mm2vox`/`saveToDisk`/`setColormapLabel`. `cloneVolume` and `downloadVolume` (main.js, module scope) replace the ones we used; `resliceLabelsToNative` now inverts the overlay's own affine with `gl-matrix` instead of `mm2vox`/`toRASvox`.
-- Label colormaps: assign `vol.colormapLabel = makeLabelLut(cmap)` **before** `addVolume`. 1.0's replacement `nv1.setColormapLabel(idx, cmap)` builds the same LUT but also scans all 16.7M voxels for label centroids (only the legend reads them, and it is off) and runs a second `updateGLVolume` over the volume just uploaded — ~0.8 s per displayed segmentation.
+- Backend is pinned: `new NiiVue({ backend: "webgl2" })`. 1.0 defaults to WebGPU; WebGL2 keeps the viewer aligned with the raw-GLSL runners and `localSystemDetails(nv1.view?.gl)`. `?viewer=webgpu` opts into WebGPU for local comparison.
+- `NVImage` is plain data in 1.0 — no `clone`/`zeroImage`/`calMinMax`/`getValue`/`mm2vox`/`saveToDisk`/`setColormapLabel`. `cloneVolume`, `cloneOverlayVolume` (skipping redundant 16.77M-voxel min/max & quantile scans for discrete label / `[0,1]` probability overlays), and `downloadVolume` (`main.js`, module scope) replace them; `resliceLabelsToNative` inverts the overlay's own affine with `gl-matrix` instead of `mm2vox`/`toRASvox`.
+- Label colormaps & 3D rendering: always register `nv1.addColormap(...)` AND assign `vol.colormapLabel = makeLabelLut(cmap)` **before** adding the volume, and batch overlay replacement/addition via `removeOverlaysNoRender` + `nv1.model.addVolume` + a single `nv1.updateGLVolume()` so 1–3 overlays upload/rebuild GL 3D textures only once. Avoid `nv1.setColormapLabel(idx, cmap)`, which scans all 16.7M voxels for label centroids and triggers a second `updateGLVolume`.
 - `loadMatcap(name)` looks `name` up in `opts.matcaps` and, on a miss, treats the name itself as a URL; the failed fetch is swallowed, so the built-in default matcap silently stays in place. Pass the map to the constructor (`matcaps: { Shiny: shiny }` from `@niivue/niivue/assets/matcaps`). Bit us twice. The shading toolbar button toggles `volumeIllumination` 0 <-> 0.5 and loads the matcap on first enable.
 - `cal_min`/`cal_max`/`robust_min`/`robust_max` → `calMin`/`calMax`/`robustMin`/`robustMax`. The NVImage type has an index signature, so the old snake_case names assign silently and do nothing.
 - `conform()` left core: `@niivue/nv-ext-image-processing`, registered via `registerVolumeTransform(conform)` and called as `nv1.volumeTransform.conform(vol, { toRAS: false })`. Easy to miss — `ensureConformed` short-circuits on the already-conformed default image, so a missing registration only fails on a real input.
