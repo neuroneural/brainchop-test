@@ -2,7 +2,7 @@ import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut }
 import { conform } from "@niivue/nv-ext-image-processing";
 import { mat4 } from "gl-matrix";
 import { shiny } from "@niivue/niivue/assets/matcaps";
-import { runInferenceWebGpu } from "./inference-webgpu.js";
+import { runInferenceWebGpu, warmupWebGpuRunners, yieldForPaint } from "./inference-webgpu.js";
 import { inferenceModelsList, brainChopOpts, resolveModelEntry } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import { getLabelHistogramU8 } from "./tensor-utils.js";
@@ -636,6 +636,8 @@ async function main() {
       isConformed = false;
     }
     if (isConformed) return;
+    callbackUI("Conforming input volume to 256\u00b3...", 0.05);
+    await yieldForPaint();
     await closeAllOverlays();
     const nii2 = await nv1.volumeTransform.conform(nii, { toRAS: false });
     const [nativeNV, nativeName] = [nativeInputNV, nativeInputName];
@@ -1816,6 +1818,11 @@ async function main() {
     modelSelect.value = String(Number(modelParam));
     syncTurboToggleUI();
     runSelectedInference();
+  } else if (isWebGpuAvailable && !FORCE_WEBGL2_TESTING && gpuDevice) {
+    const scheduleWarmup = window.requestIdleCallback
+      ? (fn) => window.requestIdleCallback(fn, { timeout: 600 })
+      : (fn) => setTimeout(fn, 200);
+    scheduleWarmup(() => warmupWebGpuRunners(gpuDevice));
   }
 }
 

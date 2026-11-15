@@ -74,6 +74,41 @@ function workingSetBytes(d, momLX) {
   return 2 * nvox * d.cs * 2 + nvox * 2 + 2 * nvox * 4 + (groups + 1) * d.cs * 2 * 4;
 }
 
+const nativePipeCache = new WeakMap();
+
+async function getNativePipes(device, d, preset) {
+  let cache = nativePipeCache.get(device);
+  if (!cache) {
+    cache = new Map();
+    nativePipeCache.set(device, cache);
+  }
+  const key = `${d.chan}|${d.cs}|${d.nclass}|${d.norm}|${d.affine}|${d.convBias}|${d.clsBias}|${d.activation}|${d.eps}|${preset.localX}x${preset.vox}x${preset.momLX}`;
+  let pending = cache.get(key);
+  if (!pending) {
+    pending = (async () => {
+      const module = device.createShaderModule({ code: buildWgsl(d, preset) });
+
+      // One explicit layout for all five entry points; an inferred layout only
+      // carries the bindings its own entry point uses.
+      const kinds = ['read-only-storage', 'storage', 'read-only-storage', 'uniform',
+        'storage', 'storage', 'read-only-storage', 'read-only-storage'];
+      const bgl = device.createBindGroupLayout({
+        entries: kinds.map((type, binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type } })),
+      });
+      const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+      const entryPoints = ['conv', 'classify', ...(d.norm === 'gn' ? ['moments', 'moments_finish', 'norm'] : [])];
+      const pipelines = Object.fromEntries(await Promise.all(entryPoints.map(async (e) =>
+        [e, await device.createComputePipelineAsync({ layout, compute: { module, entryPoint: e } })])));
+      return { bgl, pipelines };
+    })().catch((err) => {
+      cache.delete(key);
+      throw err;
+    });
+    cache.set(key, pending);
+  }
+  return pending;
+}
+
 export async function setupNet(device, safetensorBytes, callbackUI, modelEntry) {
   const entry = descriptorFor(modelEntry);
   if (!entry) throw new Error(`webgpu-native: no descriptor for ${modelEntry.path}`);
@@ -105,19 +140,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry) 
   device.pushErrorScope('out-of-memory');
   let scopes = 2;
   try {
-    const module = device.createShaderModule({ code: buildWgsl(d, preset) });
-
-    // One explicit layout for all five entry points; an inferred layout only
-    // carries the bindings its own entry point uses.
-    const kinds = ['read-only-storage', 'storage', 'read-only-storage', 'uniform',
-      'storage', 'storage', 'read-only-storage', 'read-only-storage'];
-    const bgl = device.createBindGroupLayout({
-      entries: kinds.map((type, binding) => ({ binding, visibility: GPUShaderStage.COMPUTE, buffer: { type } })),
-    });
-    const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
-    const entryPoints = ['conv', 'classify', ...(d.norm === 'gn' ? ['moments', 'moments_finish', 'norm'] : [])];
-    const pipelines = Object.fromEntries(await Promise.all(entryPoints.map(async (e) =>
-      [e, await device.createComputePipelineAsync({ layout, compute: { module, entryPoint: e } })])));
+    const { bgl, pipelines } = await getNativePipes(device, d, preset);
 
     const buf = (size, usage) => device.createBuffer({ size, usage });
     const S = GPUBufferUsage.STORAGE;

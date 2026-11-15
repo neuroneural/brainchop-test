@@ -127,6 +127,66 @@ function getDeviceMap(wm, device) {
   return m;
 }
 
+function getCachedKernelGroup(cache, key, factoryFn) {
+  let p = cache.get(key);
+  if (!p) {
+    p = factoryFn().catch((err) => {
+      cache.delete(key);
+      throw err;
+    });
+    cache.set(key, p);
+  }
+  return p;
+}
+
+function createBufAllocator(device, list) {
+  let bytes = 0;
+  const alloc = (size, usage) => {
+    const alignedSize = Math.max(16, Math.ceil(size / 16) * 16);
+    const buf = device.createBuffer({ size: alignedSize, usage });
+    list.push(buf);
+    bytes += alignedSize;
+    return buf;
+  };
+  return { alloc, getBytes: () => bytes, resetBytes: () => { bytes = 0; } };
+}
+
+const v4WorkspacePool = new WeakMap();
+
+export function releaseV4Workspace(device) {
+  const ws = device ? v4WorkspacePool.get(device) : null;
+  if (!ws) return;
+  v4WorkspacePool.delete(device);
+  ws.inUse = false;
+  for (const b of ws.buffers) b.destroy();
+  ws.buffers.length = 0;
+}
+
+function acquireV4Workspace(device, key, allocFn) {
+  const existing = v4WorkspacePool.get(device);
+  if (existing) {
+    if (existing.key === key && !existing.inUse) {
+      existing.inUse = true;
+      return existing;
+    }
+    if (existing.inUse) {
+      const fresh = allocFn();
+      return { key, ...fresh, inUse: true, pooled: false };
+    }
+    v4WorkspacePool.delete(device);
+    for (const b of existing.buffers) b.destroy();
+    existing.buffers.length = 0;
+  }
+  const fresh = allocFn();
+  const entry = { key, ...fresh, inUse: true, pooled: true };
+  v4WorkspacePool.set(device, entry);
+  return entry;
+}
+
+function createShaderModuleFast(device, label, code) {
+  return device.createShaderModule({ label, code });
+}
+
 async function createLayoutAndPipe(device, label, module, entryPoint, entriesSpec) {
   const bgl = device.createBindGroupLayout({
     entries: entriesSpec.map((spec, binding) => (
@@ -135,12 +195,26 @@ async function createLayoutAndPipe(device, label, module, entryPoint, entriesSpe
         : { binding, visibility: GPUShaderStage.COMPUTE, buffer: spec }
     )),
   });
-  const pipe = await device.createComputePipelineAsync({
-    label,
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
-    compute: { module, entryPoint },
-  });
-  return { bgl, pipe };
+  try {
+    const pipe = await device.createComputePipelineAsync({
+      label,
+      layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+      compute: { module, entryPoint },
+    });
+    return { bgl, pipe };
+  } catch (err) {
+    if (module?.getCompilationInfo) {
+      const info = await module.getCompilationInfo().catch(() => null);
+      const errs = info ? info.messages.filter((m) => m.type === 'error') : [];
+      if (errs.length) {
+        throw new Error(
+          `meshnet_fast_v4 [${label}] WGSL error: ` +
+            errs.map((e) => `L${e.lineNum}:${e.linePos} ${e.message}`).join(' | ')
+        );
+      }
+    }
+    throw err;
+  }
 }
 
 function buildPrepInWgsl(isU8, hasF16) {
@@ -391,7 +465,7 @@ async function getIoPipe(device, key, wgslFn, entryPoint, entriesSpec) {
   let p = cache.get(key);
   if (!p) {
     p = (async () => {
-      const mod = await compileModule(device, key, wgslFn());
+      const mod = createShaderModuleFast(device, key, wgslFn());
       return createLayoutAndPipe(device, key, mod, entryPoint, entriesSpec);
     })().catch((err) => {
       cache.delete(key);
@@ -447,195 +521,248 @@ function prepareHeadMaskFromNativeInput(raw, headRow, yzActive, normOffset, dete
   return { hasBgSkip: true };
 }
 
-function getNetPipeKey(mode, d, packed, hasF16, hasSubgroups32, splitHalves, probCfg) {
-  const probKey = probCfg
+function getProbCacheKey(probCfg) {
+  return probCfg
     ? `${probCfg.grayMask}_${probCfg.whiteMask}_${probCfg.csfMask}_${probCfg.temperature}_${probCfg.supportTemperature}`
     : 'seg';
-  return `${mode}|${d.cs}|${d.chan}|${d.nclass}|${packed.clsK4}|${d.dilations.join(',')}|${d.activation}|${d.norm}|${hasF16 ? 1 : 0}|${hasSubgroups32 ? 1 : 0}|${splitHalves ? 1 : 0}|${probKey}`;
 }
 
-async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg, shaders, dilKeys) {
+async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg, shaders, dilKeys, { includeCls = true } = {}) {
   const cache = getDeviceMap(netPipeCache, device);
-  const key = getNetPipeKey('128', d, packed, hasF16, hasSubgroups32, true, probCfg);
-  let p = cache.get(key);
-  if (!p) {
-    p = (async () => {
-      const [mInit, mConv0, mPrep, mFlush, mNorm, mCls, ...mConvs] = await Promise.all([
-        compileModule(device, 'init_act8_128', shaders.initActWgsl),
-        compileModule(device, 'conv0_128', shaders.conv0Wgsl),
-        compileModule(device, 'prep_128', shaders.prepWgsl),
-        compileModule(device, 'flush_128', shaders.flushWgsl),
-        compileModule(device, 'norm_128', shaders.normWgsl),
-        compileModule(device, 'cls_128', shaders.clsWgsl),
-        ...dilKeys.map((dil) => compileModule(device, `conv_128_d${dil}`, shaders.convWgsls[dil])),
-      ]);
-      const mk = (label, mod, ep, spec) => createLayoutAndPipe(device, label, mod, ep, spec);
-      const initTypes = ['storage', 'storage', 'storage', 'storage'];
-      const conv0Types = ['read-only-storage', 'storage', 'storage', 'storage', 'storage', 'storage', 'read-only-storage', 'storage', 'uniform', 'uniform', 'uniform'];
-      const prepTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
-      const flushTypes = ['storage', 'storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', { type: 'uniform', hasDynamicOffset: true, minBindingSize: 32 }];
-      const normTypes = ['storage', 'storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'uniform'];
-      const convTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage', shaders.useUniformWeff ? 'uniform' : 'read-only-storage', 'read-only-storage', { type: 'uniform', hasDynamicOffset: true, minBindingSize: 32 }];
-      const clsTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'uniform', 'uniform', 'uniform'];
+  const f16Tag = hasF16 ? 1 : 0;
+  const sgTag = hasSubgroups32 ? 1 : 0;
+  const uWeffTag = shaders.useUniformWeff ? 1 : 0;
+  const mk = (label, mod, ep, spec) => createLayoutAndPipe(device, label, mod, ep, spec);
 
-      const [pInit, pMomFin, pPrepW, pFlush, pNorm, pNormHalo, pCls, pConv0List, pConvList] = await Promise.all([
-        mk('init_act8_128', mInit, 'main', initTypes),
-        mk('moments_finish_128', mPrep, 'moments_finish', prepTypes),
-        mk('prep_weff_128', mPrep, 'prep_weff', prepTypes),
-        mk('flush_stage_128', mFlush, 'main', flushTypes),
-        mk('norm_quant8_128', mNorm, 'main', normTypes),
-        mk('norm_halo_fill_128', mNorm, 'norm_halo_fill', normTypes),
-        mk('classify_v4_128', mCls, 'main', clsTypes),
-        Promise.all(
-          shaders.halfPass0
-            ? [
-                mk('conv0_128_lo', mConv0, 'main_lo', conv0Types),
-                mk('conv0_128_hi', mConv0, 'main_hi', conv0Types),
-                mk('conv0_128_bg_lo', mConv0, 'main_bg_lo', conv0Types),
-                mk('conv0_128_bg_hi', mConv0, 'main_bg_hi', conv0Types),
-              ]
-            : [
-                mk('conv0_128', mConv0, 'main', conv0Types),
-                mk('conv0_128_bg', mConv0, 'main_bg', conv0Types),
-              ]
-        ),
-        Promise.all(
-          mConvs.flatMap((mod, idx) => {
-            const dil = dilKeys[idx];
-            if (shaders.halfPassConv) {
-              return [
-                mk(`conv_128_d${dil}_lo`, mod, 'main_lo', convTypes),
-                mk(`conv_128_d${dil}_hi`, mod, 'main_hi', convTypes),
-                mk(`conv_128_d${dil}_ext_lo`, mod, 'main_ext_lo', convTypes),
-                mk(`conv_128_d${dil}_ext_hi`, mod, 'main_ext_hi', convTypes),
-                mk(`conv_128_d${dil}_bg_lo`, mod, 'main_bg_lo', convTypes),
-                mk(`conv_128_d${dil}_bg_hi`, mod, 'main_bg_hi', convTypes),
-              ];
-            }
-            return [
-              mk(`conv_128_d${dil}`, mod, 'main', convTypes),
-              mk(`conv_128_d${dil}_ext`, mod, 'main_ext', convTypes),
-              mk(`conv_128_d${dil}_bg`, mod, 'main_bg', convTypes),
-            ];
-          })
-        ),
-      ]);
-      const pConv0 = shaders.halfPass0
-        ? { lo: pConv0List[0], hi: pConv0List[1], bgLo: pConv0List[2], bgHi: pConv0List[3] }
-        : { main: pConv0List[0], bg: pConv0List[1] };
-      const convPipes = {};
-      if (shaders.halfPassConv) {
-        dilKeys.forEach((dil, i) => {
-          convPipes[dil] = {
-            lo: pConvList[i * 6],
-            hi: pConvList[i * 6 + 1],
-            extLo: pConvList[i * 6 + 2],
-            extHi: pConvList[i * 6 + 3],
-            bgLo: pConvList[i * 6 + 4],
-            bgHi: pConvList[i * 6 + 5],
-          };
-        });
-      } else {
-        dilKeys.forEach((dil, i) => {
-          convPipes[dil] = { main: pConvList[i * 3], ext: pConvList[i * 3 + 1], bg: pConvList[i * 3 + 2] };
-        });
+  const initTypes = ['storage', 'storage', 'storage', 'storage'];
+  const conv0Types = ['read-only-storage', 'storage', 'storage', 'storage', 'storage', 'storage', 'read-only-storage', 'storage', 'uniform', 'uniform', 'uniform'];
+  const prepTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
+  const flushTypes = ['storage', 'storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', { type: 'uniform', hasDynamicOffset: true, minBindingSize: 32 }];
+  const normTypes = ['storage', 'storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'uniform'];
+  const convTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage', shaders.useUniformWeff ? 'uniform' : 'read-only-storage', 'read-only-storage', { type: 'uniform', hasDynamicOffset: true, minBindingSize: 32 }];
+  const clsTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'uniform', 'uniform', 'uniform'];
+
+  const initKey = `128|init|${d.cs}|${d.activation}|${f16Tag}`;
+  const conv0Key = `128|conv0|${d.cs}|${d.dilations[0]}|${d.norm}|${f16Tag}|${sgTag}`;
+  const prepKey = `128|prep|${d.chan}|${d.cs}|${d.activation}|${d.norm}|${f16Tag}`;
+  const flushKey = `128|flush|${d.cs}|${f16Tag}`;
+  const normKey = `128|norm|${d.cs}|${d.activation}|${d.norm}|${f16Tag}`;
+  const clsKey = `128|cls|${d.chan}|${d.cs}|${d.nclass}|${packed?.clsK4 ?? 0}|${shaders.numConvs}|${d.activation}|${d.norm}|${f16Tag}|${getProbCacheKey(probCfg)}`;
+
+  const pInitP = getCachedKernelGroup(cache, initKey, () => {
+    const mInit = createShaderModuleFast(device, 'init_act8_128', shaders.initActWgsl());
+    return mk('init_act8_128', mInit, 'main', initTypes);
+  });
+  const pConv0P = getCachedKernelGroup(cache, conv0Key, async () => {
+    const mConv0 = createShaderModuleFast(device, 'conv0_128', shaders.conv0Wgsl());
+    const list = await Promise.all(
+      shaders.halfPass0
+        ? [
+            mk('conv0_128_lo', mConv0, 'main_lo', conv0Types),
+            mk('conv0_128_hi', mConv0, 'main_hi', conv0Types),
+            mk('conv0_128_bg_lo', mConv0, 'main_bg_lo', conv0Types),
+            mk('conv0_128_bg_hi', mConv0, 'main_bg_hi', conv0Types),
+          ]
+        : [
+            mk('conv0_128', mConv0, 'main', conv0Types),
+            mk('conv0_128_bg', mConv0, 'main_bg', conv0Types),
+          ]
+    );
+    return shaders.halfPass0
+      ? { lo: list[0], hi: list[1], bgLo: list[2], bgHi: list[3] }
+      : { main: list[0], bg: list[1] };
+  });
+  const pPrepP = getCachedKernelGroup(cache, prepKey, async () => {
+    const mPrep = createShaderModuleFast(device, 'prep_128', shaders.prepWgsl());
+    const [pMomFin, pPrepW] = await Promise.all([
+      mk('moments_finish_128', mPrep, 'moments_finish', prepTypes),
+      mk('prep_weff_128', mPrep, 'prep_weff', prepTypes),
+    ]);
+    return { pMomFin, pPrepW };
+  });
+  const pFlushP = getCachedKernelGroup(cache, flushKey, () => {
+    const mFlush = createShaderModuleFast(device, 'flush_128', shaders.flushWgsl());
+    return mk('flush_stage_128', mFlush, 'main', flushTypes);
+  });
+  const pNormP = getCachedKernelGroup(cache, normKey, async () => {
+    const mNorm = createShaderModuleFast(device, 'norm_128', shaders.normWgsl());
+    const [pNorm, pNormHalo] = await Promise.all([
+      mk('norm_quant8_128', mNorm, 'main', normTypes),
+      mk('norm_halo_fill_128', mNorm, 'norm_halo_fill', normTypes),
+    ]);
+    return { pNorm, pNormHalo };
+  });
+  const pClsP = includeCls
+    ? getCachedKernelGroup(cache, clsKey, () => {
+        const mCls = createShaderModuleFast(device, 'cls_128', shaders.clsWgsl());
+        return mk('classify_v4_128', mCls, 'main', clsTypes);
+      })
+    : Promise.resolve(null);
+  const pConvPs = dilKeys.map((dil) =>
+    getCachedKernelGroup(
+      cache,
+      `128|conv|${d.chan}|${d.cs}|${dil}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}`,
+      async () => {
+        const mod = createShaderModuleFast(device, `conv_128_d${dil}`, shaders.getConvWgsl(dil));
+        if (shaders.halfPassConv) {
+          const [lo, hi, extLo, extHi, bgLo, bgHi] = await Promise.all([
+            mk(`conv_128_d${dil}_lo`, mod, 'main_lo', convTypes),
+            mk(`conv_128_d${dil}_hi`, mod, 'main_hi', convTypes),
+            mk(`conv_128_d${dil}_ext_lo`, mod, 'main_ext_lo', convTypes),
+            mk(`conv_128_d${dil}_ext_hi`, mod, 'main_ext_hi', convTypes),
+            mk(`conv_128_d${dil}_bg_lo`, mod, 'main_bg_lo', convTypes),
+            mk(`conv_128_d${dil}_bg_hi`, mod, 'main_bg_hi', convTypes),
+          ]);
+          return { lo, hi, extLo, extHi, bgLo, bgHi };
+        }
+        const [main, ext, bg] = await Promise.all([
+          mk(`conv_128_d${dil}`, mod, 'main', convTypes),
+          mk(`conv_128_d${dil}_ext`, mod, 'main_ext', convTypes),
+          mk(`conv_128_d${dil}_bg`, mod, 'main_bg', convTypes),
+        ]);
+        return { main, ext, bg };
       }
-      return { pInit, pMomFin, pPrepW, pFlush, pNorm, pNormHalo, pCls, pConv0, convPipes };
-    })().catch((err) => {
-      cache.delete(key);
-      throw err;
-    });
-    cache.set(key, p);
-  }
-  return p;
+    )
+  );
+
+  const [pInit, pConv0, prepPair, pFlush, normPair, pCls, ...convList] = await Promise.all([
+    pInitP,
+    pConv0P,
+    pPrepP,
+    pFlushP,
+    pNormP,
+    pClsP,
+    ...pConvPs,
+  ]);
+  const convPipes = {};
+  dilKeys.forEach((dil, i) => {
+    convPipes[dil] = convList[i];
+  });
+  return {
+    pInit,
+    pMomFin: prepPair.pMomFin,
+    pPrepW: prepPair.pPrepW,
+    pFlush,
+    pNorm: normPair.pNorm,
+    pNormHalo: normPair.pNormHalo,
+    pCls,
+    pConv0,
+    convPipes,
+  };
 }
 
-async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHalves, probCfg, shaders, dilKeys) {
+async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHalves, probCfg, shaders, dilKeys, { includeCls = true } = {}) {
   const cache = getDeviceMap(netPipeCache, device);
-  const key = getNetPipeKey('std', d, packed, hasF16, hasSubgroups32, splitHalves, probCfg);
-  let p = cache.get(key);
-  if (!p) {
-    p = (async () => {
-      const [mInit, mConv0, mPrep, mNorm, mCls, ...mConvs] = await Promise.all([
-        compileModule(device, 'init_act8', shaders.initActWgsl),
-        compileModule(device, 'conv0', shaders.conv0Wgsl),
-        compileModule(device, 'prep', shaders.prepWgsl),
-        compileModule(device, 'norm', shaders.normWgsl),
-        compileModule(device, 'cls', shaders.clsWgsl),
-        ...dilKeys.map((dil) => compileModule(device, `conv_d${dil}`, shaders.convWgsls[dil])),
-      ]);
-      const mk = (label, mod, ep, types) => createLayoutAndPipe(device, label, mod, ep, types);
-      const initTypes = ['storage', 'storage'];
-      const conv0Types = ['read-only-storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
-      const prepTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
-      const normTypes = ['storage', 'storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'uniform'];
-      const convTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'storage', 'storage', shaders.useUniformWeff ? 'uniform' : 'read-only-storage', 'read-only-storage', 'uniform'];
-      const clsTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'read-only-storage', 'uniform'];
+  const f16Tag = hasF16 ? 1 : 0;
+  const sgTag = hasSubgroups32 ? 1 : 0;
+  const splitTag = splitHalves ? 1 : 0;
+  const uWeffTag = shaders.useUniformWeff ? 1 : 0;
+  const mk = (label, mod, ep, types) => createLayoutAndPipe(device, label, mod, ep, types);
 
-      const [pInit, pMomFin, pPrepW, pNorm, pNormHalo, pCls, pConv0List, pConvList] = await Promise.all([
-        mk('init_act8', mInit, 'main', initTypes),
-        mk('moments_finish', mPrep, 'moments_finish', prepTypes),
-        mk('prep_weff', mPrep, 'prep_weff', prepTypes),
-        mk('norm_quant8', mNorm, 'main', normTypes),
-        mk('norm_halo_fill', mNorm, 'norm_halo_fill', normTypes),
-        mk('classify_v4', mCls, 'main', clsTypes),
-        Promise.all(
-          shaders.halfPass0
-            ? [
-                mk('conv0_lo', mConv0, 'main_lo', conv0Types),
-                mk('conv0_hi', mConv0, 'main_hi', conv0Types),
-                mk('conv0_bg_lo', mConv0, 'main_bg_lo', conv0Types),
-                mk('conv0_bg_hi', mConv0, 'main_bg_hi', conv0Types),
-              ]
-            : [
-                mk('conv0', mConv0, 'main', conv0Types),
-                mk('conv0_bg', mConv0, 'main_bg', conv0Types),
-              ]
-        ),
-        Promise.all(
-          mConvs.flatMap((mod, idx) => {
-            const dil = dilKeys[idx];
-            if (shaders.halfPassConv) {
-              return [
-                mk(`conv_d${dil}_lo`, mod, 'main_lo', convTypes),
-                mk(`conv_d${dil}_hi`, mod, 'main_hi', convTypes),
-                mk(`conv_d${dil}_ext_lo`, mod, 'main_ext_lo', convTypes),
-                mk(`conv_d${dil}_ext_hi`, mod, 'main_ext_hi', convTypes),
-              ];
-            }
-            return [
-              mk(`conv_d${dil}`, mod, 'main', convTypes),
-              mk(`conv_d${dil}_ext`, mod, 'main_ext', convTypes),
-            ];
-          })
-        ),
-      ]);
-      const pConv0 = shaders.halfPass0
-        ? { lo: pConv0List[0], hi: pConv0List[1], bgLo: pConv0List[2], bgHi: pConv0List[3] }
-        : { main: pConv0List[0], bg: pConv0List[1] };
-      const convPipes = {};
-      if (shaders.halfPassConv) {
-        dilKeys.forEach((dil, i) => {
-          convPipes[dil] = {
-            lo: pConvList[i * 4],
-            hi: pConvList[i * 4 + 1],
-            extLo: pConvList[i * 4 + 2],
-            extHi: pConvList[i * 4 + 3],
-          };
-        });
-      } else {
-        dilKeys.forEach((dil, i) => {
-          convPipes[dil] = { main: pConvList[i * 2], ext: pConvList[i * 2 + 1] };
-        });
+  const initTypes = ['storage', 'storage'];
+  const conv0Types = ['read-only-storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
+  const prepTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
+  const normTypes = ['storage', 'storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'uniform'];
+  const convTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'storage', 'storage', shaders.useUniformWeff ? 'uniform' : 'read-only-storage', 'read-only-storage', 'uniform'];
+  const clsTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'read-only-storage', 'uniform'];
+
+  const initKey = `std|init|${d.cs}|${d.activation}|${f16Tag}|${splitTag}`;
+  const conv0Key = `std|conv0|${d.cs}|${d.dilations[0]}|${d.norm}|${f16Tag}|${sgTag}|${splitTag}`;
+  const prepKey = `std|prep|${d.chan}|${d.cs}|${d.activation}|${d.norm}|${f16Tag}|${splitTag}`;
+  const normKey = `std|norm|${d.cs}|${d.activation}|${d.norm}|${f16Tag}|${splitTag}`;
+  const clsKey = `std|cls|${d.chan}|${d.cs}|${d.nclass}|${packed?.clsK4 ?? 0}|${d.activation}|${d.norm}|${f16Tag}|${splitTag}|${getProbCacheKey(probCfg)}`;
+
+  const pInitP = getCachedKernelGroup(cache, initKey, () => {
+    const mInit = createShaderModuleFast(device, 'init_act8', shaders.initActWgsl());
+    return mk('init_act8', mInit, 'main', initTypes);
+  });
+  const pConv0P = getCachedKernelGroup(cache, conv0Key, async () => {
+    const mConv0 = createShaderModuleFast(device, 'conv0', shaders.conv0Wgsl());
+    const list = await Promise.all(
+      shaders.halfPass0
+        ? [
+            mk('conv0_lo', mConv0, 'main_lo', conv0Types),
+            mk('conv0_hi', mConv0, 'main_hi', conv0Types),
+            mk('conv0_bg_lo', mConv0, 'main_bg_lo', conv0Types),
+            mk('conv0_bg_hi', mConv0, 'main_bg_hi', conv0Types),
+          ]
+        : [
+            mk('conv0', mConv0, 'main', conv0Types),
+            mk('conv0_bg', mConv0, 'main_bg', conv0Types),
+          ]
+    );
+    return shaders.halfPass0
+      ? { lo: list[0], hi: list[1], bgLo: list[2], bgHi: list[3] }
+      : { main: list[0], bg: list[1] };
+  });
+  const pPrepP = getCachedKernelGroup(cache, prepKey, async () => {
+    const mPrep = createShaderModuleFast(device, 'prep', shaders.prepWgsl());
+    const [pMomFin, pPrepW] = await Promise.all([
+      mk('moments_finish', mPrep, 'moments_finish', prepTypes),
+      mk('prep_weff', mPrep, 'prep_weff', prepTypes),
+    ]);
+    return { pMomFin, pPrepW };
+  });
+  const pNormP = getCachedKernelGroup(cache, normKey, async () => {
+    const mNorm = createShaderModuleFast(device, 'norm', shaders.normWgsl());
+    const [pNorm, pNormHalo] = await Promise.all([
+      mk('norm_quant8', mNorm, 'main', normTypes),
+      mk('norm_halo_fill', mNorm, 'norm_halo_fill', normTypes),
+    ]);
+    return { pNorm, pNormHalo };
+  });
+  const pClsP = includeCls
+    ? getCachedKernelGroup(cache, clsKey, () => {
+        const mCls = createShaderModuleFast(device, 'cls', shaders.clsWgsl());
+        return mk('classify_v4', mCls, 'main', clsTypes);
+      })
+    : Promise.resolve(null);
+  const pConvPs = dilKeys.map((dil) =>
+    getCachedKernelGroup(
+      cache,
+      `std|conv|${d.chan}|${d.cs}|${dil}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}|${splitTag}`,
+      async () => {
+        const mod = createShaderModuleFast(device, `conv_d${dil}`, shaders.getConvWgsl(dil));
+        if (shaders.halfPassConv) {
+          const [lo, hi, extLo, extHi] = await Promise.all([
+            mk(`conv_d${dil}_lo`, mod, 'main_lo', convTypes),
+            mk(`conv_d${dil}_hi`, mod, 'main_hi', convTypes),
+            mk(`conv_d${dil}_ext_lo`, mod, 'main_ext_lo', convTypes),
+            mk(`conv_d${dil}_ext_hi`, mod, 'main_ext_hi', convTypes),
+          ]);
+          return { lo, hi, extLo, extHi };
+        }
+        const [main, ext] = await Promise.all([
+          mk(`conv_d${dil}`, mod, 'main', convTypes),
+          mk(`conv_d${dil}_ext`, mod, 'main_ext', convTypes),
+        ]);
+        return { main, ext };
       }
-      return { pInit, pMomFin, pPrepW, pNorm, pNormHalo, pCls, pConv0, convPipes };
-    })().catch((err) => {
-      cache.delete(key);
-      throw err;
-    });
-    cache.set(key, p);
-  }
-  return p;
+    )
+  );
+
+  const [pInit, pConv0, prepPair, normPair, pCls, ...convList] = await Promise.all([
+    pInitP,
+    pConv0P,
+    pPrepP,
+    pNormP,
+    pClsP,
+    ...pConvPs,
+  ]);
+  const convPipes = {};
+  dilKeys.forEach((dil, i) => {
+    convPipes[dil] = convList[i];
+  });
+  return {
+    pInit,
+    pMomFin: prepPair.pMomFin,
+    pPrepW: prepPair.pPrepW,
+    pNorm: normPair.pNorm,
+    pNormHalo: normPair.pNormHalo,
+    pCls,
+    pConv0,
+    convPipes,
+  };
 }
 
 /**
@@ -1356,12 +1483,13 @@ function createGpuIoController({
   let actDirty = false;
   let inpHalosInitialized = false;
   let inpHalosDirty = false;
+  let disposed = false;
   const yzActive = new Uint8Array(DIM * DIM);
 
-  let prepU8State = null;
-  let prepF32State = null;
-  let transposeU8State = null;
-  let probGpuState = null;
+  let prepU8Promise = null;
+  let prepF32Promise = null;
+  let transposeU8Promise = null;
+  let probGpuPromise = null;
 
   const mkBgEntries = (bgl, entries) =>
     device.createBindGroup({
@@ -1372,100 +1500,141 @@ function createGpuIoController({
       })),
     });
 
-  async function ensurePrepU8() {
-    if (prepU8State) return prepU8State;
-    const key = hasF16 ? 'prep_in_u8_f16' : 'prep_in_u8_f32';
-    const { bgl, pipe } = await getIoPipe(
-      device,
-      key,
-      () => buildPrepInWgsl(true, hasF16),
-      'main',
-      ['read-only-storage', 'storage', 'uniform']
-    );
-    const ubo = mkBuf(256 * 4, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    const lutF32 = new Float32Array(256);
-    const bg = mkBgEntries(bgl, [{ buffer: labels8Buf, offset: 0, size: nvox }, inpBuf, ubo]);
-    prepU8State = { pipe, ubo, lutF32, bg };
-    return prepU8State;
+  function ensurePrepU8() {
+    if (!prepU8Promise) {
+      const key = hasF16 ? 'prep_in_u8_f16' : 'prep_in_u8_f32';
+      prepU8Promise = (async () => {
+        const { bgl, pipe } = await getIoPipe(
+          device,
+          key,
+          () => buildPrepInWgsl(true, hasF16),
+          'main',
+          ['read-only-storage', 'storage', 'uniform']
+        );
+        if (disposed) return null;
+        const ubo = mkBuf(256 * 4, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        const lutF32 = new Float32Array(256);
+        const bg = mkBgEntries(bgl, [{ buffer: labels8Buf, offset: 0, size: nvox }, inpBuf, ubo]);
+        return { pipe, ubo, lutF32, bg };
+      })().catch((err) => {
+        prepU8Promise = null;
+        throw err;
+      });
+    }
+    return prepU8Promise;
   }
 
-  async function ensurePrepF32() {
-    if (prepF32State) return prepF32State;
-    const key = hasF16 ? 'prep_in_f32_f16' : 'prep_in_f32_f32';
-    const { bgl, pipe } = await getIoPipe(
-      device,
-      key,
-      () => buildPrepInWgsl(false, hasF16),
-      'main',
-      ['read-only-storage', 'storage', 'uniform']
-    );
-    const ubo = mkBuf(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    const f32Tmp = new Float32Array(4);
-    const bgLabels = outBufBytes >= nvox * 4
-      ? mkBgEntries(bgl, [{ buffer: labels8Buf, offset: 0, size: nvox * 4 }, inpBuf, ubo])
-      : null;
-    const bgAct0 = act8_0.size >= nvox * 4
-      ? mkBgEntries(bgl, [{ buffer: act8_0, offset: 0, size: nvox * 4 }, inpBuf, ubo])
-      : null;
-    prepF32State = { pipe, ubo, f32Tmp, bgLabels, bgAct0 };
-    return prepF32State;
+  function ensurePrepF32() {
+    if (!prepF32Promise) {
+      const key = hasF16 ? 'prep_in_f32_f16' : 'prep_in_f32_f32';
+      prepF32Promise = (async () => {
+        const { bgl, pipe } = await getIoPipe(
+          device,
+          key,
+          () => buildPrepInWgsl(false, hasF16),
+          'main',
+          ['read-only-storage', 'storage', 'uniform']
+        );
+        if (disposed) return null;
+        const ubo = mkBuf(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+        const f32Tmp = new Float32Array(4);
+        const bgLabels = outBufBytes >= nvox * 4
+          ? mkBgEntries(bgl, [{ buffer: labels8Buf, offset: 0, size: nvox * 4 }, inpBuf, ubo])
+          : null;
+        const bgAct0 = act8_0.size >= nvox * 4
+          ? mkBgEntries(bgl, [{ buffer: act8_0, offset: 0, size: nvox * 4 }, inpBuf, ubo])
+          : null;
+        return { pipe, ubo, f32Tmp, bgLabels, bgAct0 };
+      })().catch((err) => {
+        prepF32Promise = null;
+        throw err;
+      });
+    }
+    return prepF32Promise;
   }
 
-  async function ensureTransposeU8() {
-    if (transposeU8State) return transposeU8State;
-    const { bgl, pipe } = await getIoPipe(
-      device,
-      'transpose_u8_v4',
-      buildTransposeU8Wgsl,
-      'main',
-      ['read-only-storage', 'storage']
-    );
-    const bg = mkBgEntries(bgl, [
-      { buffer: labels8Buf, offset: 0, size: nvox },
-      { buffer: inpBuf, offset: 0, size: nvox },
-    ]);
-    transposeU8State = { pipe, bg };
-    return transposeU8State;
+  function ensureTransposeU8() {
+    if (!transposeU8Promise) {
+      transposeU8Promise = (async () => {
+        const { bgl, pipe } = await getIoPipe(
+          device,
+          'transpose_u8_v4',
+          buildTransposeU8Wgsl,
+          'main',
+          ['read-only-storage', 'storage']
+        );
+        if (disposed) return null;
+        const bg = mkBgEntries(bgl, [
+          { buffer: labels8Buf, offset: 0, size: nvox },
+          { buffer: inpBuf, offset: 0, size: nvox },
+        ]);
+        return { pipe, bg };
+      })().catch((err) => {
+        transposeU8Promise = null;
+        throw err;
+      });
+    }
+    return transposeU8Promise;
   }
 
-  async function ensureProbGpu() {
-    if (probGpuState) return probGpuState;
-    const [pUnpack, pBlurAxis, pBlurZGate, pTransposeF32] = await Promise.all([
-      getIoPipe(device, 'prob_unpack_two', buildProbUnpackTwoWgsl, 'main', ['read-only-storage', 'storage', 'storage']),
-      getIoPipe(device, 'prob_blur_axis', buildProbBlurWgsl, 'blur_axis', ['read-only-storage', 'storage', 'read-only-storage', 'uniform']),
-      getIoPipe(device, 'prob_blur_z_gate', buildProbBlurWgsl, 'blur_z_gate', ['read-only-storage', 'storage', 'read-only-storage', 'uniform']),
-      getIoPipe(device, 'transpose_f32', buildTransposeF32Wgsl, 'main', ['read-only-storage', 'storage']),
-    ]);
-    const UCD = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
-    const uboBytes = (4 + 32) * 4;
-    const uboX = mkBuf(uboBytes, UCD);
-    const uboY = mkBuf(uboBytes, UCD);
-    const uboZ = mkBuf(uboBytes, UCD);
-    const s64 = (buf) => ({ buffer: buf, offset: 0, size: outBufBytes });
-    const bgUnpack0 = mkBgEntries(pUnpack.bgl, [s64(probSlots.pass0HoldBuf), s64(probSlots.y0), s64(probSlots.y1)]);
-    const bgUnpack1 = mkBgEntries(pUnpack.bgl, [s64(labels8Buf), s64(probSlots.b), s64(probSlots.sup)]);
-    const tissues = [probSlots.y0, probSlots.y1, probSlots.b].map((tBuf) => ({
-      buf: tBuf,
-      bgBlurX: mkBgEntries(pBlurAxis.bgl, [s64(tBuf), s64(labels8Buf), s64(probSlots.sup), uboX]),
-      bgBlurY: mkBgEntries(pBlurAxis.bgl, [s64(labels8Buf), s64(tBuf), s64(probSlots.sup), uboY]),
-      bgBlurZ: mkBgEntries(pBlurZGate.bgl, [s64(tBuf), s64(labels8Buf), s64(probSlots.sup), uboZ]),
-      bgTranspose: mkBgEntries(pTransposeF32.bgl, [s64(labels8Buf), s64(tBuf)]),
-    }));
-    probGpuState = {
-      pUnpack: pUnpack.pipe,
-      pBlurAxis: pBlurAxis.pipe,
-      pBlurZGate: pBlurZGate.pipe,
-      pTransposeF32: pTransposeF32.pipe,
-      bgUnpack0,
-      bgUnpack1,
-      tissues,
-      uboX,
-      uboY,
-      uboZ,
-      uboScratch: new ArrayBuffer(uboBytes),
-      lastBlurKey: null,
-    };
-    return probGpuState;
+  function ensureProbGpu() {
+    if (!probGpuPromise) {
+      probGpuPromise = (async () => {
+        const [pUnpack, pBlurAxis, pBlurZGate, pTransposeF32] = await Promise.all([
+          getIoPipe(device, 'prob_unpack_two', buildProbUnpackTwoWgsl, 'main', ['read-only-storage', 'storage', 'storage']),
+          getIoPipe(device, 'prob_blur_axis', buildProbBlurWgsl, 'blur_axis', ['read-only-storage', 'storage', 'read-only-storage', 'uniform']),
+          getIoPipe(device, 'prob_blur_z_gate', buildProbBlurWgsl, 'blur_z_gate', ['read-only-storage', 'storage', 'read-only-storage', 'uniform']),
+          getIoPipe(device, 'transpose_f32', buildTransposeF32Wgsl, 'main', ['read-only-storage', 'storage']),
+        ]);
+        if (disposed) return null;
+        const UCD = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+        const uboBytes = (4 + 32) * 4;
+        const uboX = mkBuf(uboBytes, UCD);
+        const uboY = mkBuf(uboBytes, UCD);
+        const uboZ = mkBuf(uboBytes, UCD);
+        const s64 = (buf) => ({ buffer: buf, offset: 0, size: outBufBytes });
+        const bgUnpack0 = mkBgEntries(pUnpack.bgl, [s64(probSlots.pass0HoldBuf), s64(probSlots.y0), s64(probSlots.y1)]);
+        const bgUnpack1 = mkBgEntries(pUnpack.bgl, [s64(labels8Buf), s64(probSlots.b), s64(probSlots.sup)]);
+        const tissues = [probSlots.y0, probSlots.y1, probSlots.b].map((tBuf) => ({
+          buf: tBuf,
+          bgBlurX: mkBgEntries(pBlurAxis.bgl, [s64(tBuf), s64(labels8Buf), s64(probSlots.sup), uboX]),
+          bgBlurY: mkBgEntries(pBlurAxis.bgl, [s64(labels8Buf), s64(tBuf), s64(probSlots.sup), uboY]),
+          bgBlurZ: mkBgEntries(pBlurZGate.bgl, [s64(tBuf), s64(labels8Buf), s64(probSlots.sup), uboZ]),
+          bgTranspose: mkBgEntries(pTransposeF32.bgl, [s64(labels8Buf), s64(tBuf)]),
+        }));
+        return {
+          pUnpack: pUnpack.pipe,
+          pBlurAxis: pBlurAxis.pipe,
+          pBlurZGate: pBlurZGate.pipe,
+          pTransposeF32: pTransposeF32.pipe,
+          bgUnpack0,
+          bgUnpack1,
+          tissues,
+          uboX,
+          uboY,
+          uboZ,
+          uboScratch: new ArrayBuffer(uboBytes),
+          lastBlurKey: null,
+        };
+      })().catch((err) => {
+        probGpuPromise = null;
+        throw err;
+      });
+    }
+    return probGpuPromise;
+  }
+
+  function warmupIoPipelines() {
+    if (probCfg) {
+      if (canGpuProb) ensureProbGpu().catch(() => {});
+    } else {
+      ensurePrepU8().catch(() => {});
+      ensureTransposeU8().catch(() => {});
+    }
+  }
+
+  function dispose() {
+    disposed = true;
   }
 
   async function prepareInput({ volume, ioOpts, useCone, padInputHost, headRowHost, hasF16Flag }) {
@@ -1835,7 +2004,7 @@ function createGpuIoController({
     return maps;
   }
 
-  return { prepareInput, finishAndReadback };
+  return { prepareInput, finishAndReadback, warmupIoPipelines, dispose };
 }
 
 function buildShaders(cfg) {
@@ -1966,7 +2135,7 @@ var<workgroup> sh_res_mn  : array<f32, 16>;
 var<workgroup> sh_res_inv : array<f32, 16>;\n`;
 
   // --- 0. INIT_ACT8 SHADER ---
-  const initActWgsl = `
+  const initActWgsl = () => `
 @group(0) @binding(0) var<storage, read_write> act0 : array<u32>;
 @group(0) @binding(1) var<storage, read_write> act1 : array<u32>;
 @compute @workgroup_size(${X4_PAD}, 1, 1)
@@ -1983,7 +2152,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
 
   // --- 1. CONV0 SHADER (@workgroup_size(64, 4, 1)) ---
   const d0 = dilations[0];
-  const conv0Wgsl = (() => {
+  const conv0Wgsl = () => {
     const halfPass0 = !hasF16 && splitHalves;
     const fmaRange = (cStart, cEnd) => {
       const gStart = cStart / 4;
@@ -2120,10 +2289,10 @@ struct Params0 {
 @group(0) @binding(7) var<storage, read> strips0 : array<u32>;
 @group(0) @binding(8) var<uniform> p0 : Params0;
 ${sharedReductionDecls}${entries}`;
-  })();
+  };
 
   // --- 2. MOMENTS_FINISH + PREP_WEFF SHADER ---
-  const prepWgsl = `${f16Enable}
+  const prepWgsl = () => `${f16Enable}
 ${getActivationWgsl(activation)}
 struct PrepParams {
   meta_off : u32,
@@ -2275,7 +2444,7 @@ fn prep_weff(@builtin(local_invocation_index) lid : u32) {
 }`;
 
   // --- 3. NORM_QUANT8 + HALO FILL SHADER (@workgroup_size(64, 4, 1)) ---
-  const normWgsl = `${getActivationWgsl(activation)}
+  const normWgsl = () => `${getActivationWgsl(activation)}
 struct NormParams {
   is_full : u32,
   bg_row : u32,
@@ -2624,7 +2793,7 @@ ${sharedReductionDecls}${entries}`;
   };
 
   // --- 5. CLASSIFY_V4 SHADER ---
-  const clsWgsl = `${f16Enable}
+  const clsWgsl = () => `${f16Enable}
 ${getActivationWgsl(activation)}
 struct ClsParams {
   w_vec4_off : u32,
@@ -2698,15 +2867,12 @@ ${buildClassifierLoopsWgsl({
 })}
 }`;
 
-  const uniqueDilations = Array.from(new Set(dilations.slice(1)));
-  const convWgsls = Object.fromEntries(uniqueDilations.map((d) => [d, buildConvForDilation(d)]));
-
   return {
     initActWgsl,
     conv0Wgsl,
     prepWgsl,
     normWgsl,
-    convWgsls,
+    getConvWgsl: buildConvForDilation,
     clsWgsl,
     totalWEffVec4s,
     useUniformWeff,
@@ -2714,28 +2880,6 @@ ${buildClassifierLoopsWgsl({
     halfPass0: !hasF16 && splitHalves,
     halfPassConv: !hasF16 && splitHalves,
   };
-}
-
-async function compileModule(device, label, code) {
-  const hasScope = typeof device.pushErrorScope === 'function' && typeof device.popErrorScope === 'function';
-  let mod;
-  let scopePromise = Promise.resolve(null);
-  if (hasScope) device.pushErrorScope('validation');
-  try {
-    mod = device.createShaderModule({ label, code });
-  } finally {
-    if (hasScope) scopePromise = device.popErrorScope().catch((e) => e);
-  }
-  const infoPromise = mod.getCompilationInfo ? mod.getCompilationInfo() : Promise.resolve(null);
-  const [info, scopeErr] = await Promise.all([infoPromise, scopePromise]);
-  const errs = info ? info.messages.filter((m) => m.type === 'error') : [];
-  if (errs.length) {
-    throw new Error(`meshnet_fast_v4 [${label}] WGSL error: ` + errs.map((e) => `L${e.lineNum}:${e.linePos} ${e.message}`).join(' | '));
-  }
-  if (scopeErr) {
-    throw new Error(`meshnet_fast_v4 [${label}] WGSL error: ${scopeErr.message || scopeErr}`);
-  }
-  return mod;
 }
 
 /**
@@ -2887,7 +3031,7 @@ var<workgroup> sh_res_inv : array<f32, 16>;\n`;
   };
 
   // --- 0. INIT_ACT8 (4 storage bindings) ---
-  const initActWgsl = `
+  const initActWgsl = () => `
 @group(0) @binding(0) var<storage, read_write> act0 : array<u32>;
 @group(0) @binding(1) var<storage, read_write> act1 : array<u32>;
 @group(0) @binding(2) var<storage, read_write> act2 : array<u32>;
@@ -2909,7 +3053,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
   // --- 1. CONV0 (8 storage + 3 uniform bindings) ---
   const d0 = dilations[0];
   const halfPass0 = !hasF16 && cs >= 16;
-  const conv0Wgsl = (() => {
+  const conv0Wgsl = () => {
     const fmaRange = (cStart, cEnd) => {
       const gStart = cStart / 4;
       const gEnd = cEnd / 4;
@@ -3050,14 +3194,14 @@ struct Params0 {
 @group(0) @binding(5) var<storage, read_write> stage : array<u32>;
 @group(0) @binding(6) var<storage, read> w16_4 : array<${V4}>;
 @group(0) @binding(7) var<storage, read_write> mom : array<vec4<f32>>;
-@group(0) @binding(8) var<uniform> qmeta_u : array<vec4<f32>, ${qmetaVec4Len}>;
+@group(0) @binding(8) var<uniform> qmeta_u : array<vec4<f32>, ${cs}>;
 @group(0) @binding(9) var<uniform> strips0_u : array<vec4<u32>, 4096>;
 @group(0) @binding(10) var<uniform> p0 : Params0;
 ${sharedReductionDecls}${entries}`;
-  })();
+  };
 
   // --- 2. MOMENTS_FINISH + PREP_WEFF (5 storage + 1 uniform) ---
-  const prepWgsl = `${f16Enable}
+  const prepWgsl = () => `${f16Enable}
 ${getActivationWgsl(activation)}
 struct PrepParams {
   meta_off : u32,
@@ -3207,7 +3351,7 @@ fn prep_weff(@builtin(local_invocation_index) lid : u32) {
 }`;
 
   // --- 3. FLUSH_STAGE SHADER (6 storage + 1 dynamic uniform) ---
-  const flushWgsl = `
+  const flushWgsl = () => `
 struct BandFlushParams {
   is_full : u32,
   z_start : u32,
@@ -3275,7 +3419,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
   }`;
   };
 
-  const normWgsl = `${getActivationWgsl(activation)}
+  const normWgsl = () => `${getActivationWgsl(activation)}
 struct NormParams {
   is_full : u32,
   bg_row : u32,
@@ -3603,7 +3747,7 @@ ${sharedReductionDecls}${entries}`;
   }`;
   };
 
-  const clsWgsl = `${f16Enable}
+  const clsWgsl = () => `${f16Enable}
 ${getActivationWgsl(activation)}
 struct ClsParams {
   w_vec4_off : u32,
@@ -3661,17 +3805,16 @@ ${buildClassifierLoopsWgsl({
 })}
 }`;
 
-  const uniqueDilations = Array.from(new Set(dilations.slice(1)));
-  const convWgsls = Object.fromEntries(uniqueDilations.map((d) => [d, buildConvForDilation(d)]));
-
   return {
     initActWgsl,
     conv0Wgsl,
     prepWgsl,
     flushWgsl,
     normWgsl,
-    convWgsls,
+    getConvWgsl: buildConvForDilation,
     clsWgsl,
+    qmetaVec4Len,
+    numConvs,
     totalWEffVec4s,
     useUniformWeff,
     csQ,
@@ -3722,31 +3865,51 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
   const U = GPUBufferUsage.UNIFORM;
   const CD = GPUBufferUsage.COPY_DST;
   const CS = GPUBufferUsage.COPY_SRC;
-  const ownedBuffers = [];
-  const mkBuf = (size, usage) => {
-    const buf = device.createBuffer({ size: Math.max(16, Math.ceil(size / 16) * 16), usage });
-    ownedBuffers.push(buf);
-    return buf;
-  };
 
   const paddedVox = DIM * DIM * ROW_SCALARS_PAD;
   const inpBytes = paddedVox * (hasF16 ? 2 : 4);
   const wEffBytes = hasF16 ? Math.ceil(shaders.totalWEffVec4s / 2) * 16 : shaders.totalWEffVec4s * 16;
+  const canGpuProb = Boolean(probCfg && actQBytes >= outBufBytes);
 
-  const inpBuf = mkBuf(inpBytes, S | CD | CS);
-  const act8_0 = mkBuf(actQBytes, S | CD | CS);
-  const act8_1 = mkBuf(actQBytes, S | CD | CS);
-  const act8_2 = mkBuf(actQBytes, S | CD | CS);
-  const act8_3 = mkBuf(actQBytes, S | CD | CS);
-  const stageBuf = mkBuf(stageBytes, S);
+  const wsKey = `128|${d.cs}|${hasF16 ? 1 : 0}|${outBufBytes}|${canGpuProb ? 1 : 0}`;
+  const ws = acquireV4Workspace(device, wsKey, () => {
+    const buffers = [];
+    const wsAlloc = createBufAllocator(device, buffers);
+    const mkWs = wsAlloc.alloc;
+    const named = {
+      inpBuf: mkWs(inpBytes, S | CD | CS),
+      act8_0: mkWs(actQBytes, S | CD | CS),
+      act8_1: mkWs(actQBytes, S | CD | CS),
+      act8_2: mkWs(actQBytes, S | CD | CS),
+      act8_3: mkWs(actQBytes, S | CD | CS),
+      stageBuf: mkWs(stageBytes, S),
+      momBuf: mkWs(momBytes, S),
+      labels8Buf: mkWs(outBufBytes, S | CD | CS),
+      readbackBuf: mkWs(outBufBytes, GPUBufferUsage.MAP_READ | CD),
+      probPackTmpBuf: canGpuProb ? mkWs(outBufBytes, S | CD | CS) : null,
+    };
+    return { buffers, named, bytes: wsAlloc.getBytes() };
+  });
+  const {
+    inpBuf,
+    act8_0,
+    act8_1,
+    act8_2,
+    act8_3,
+    stageBuf,
+    momBuf,
+    labels8Buf,
+    readbackBuf,
+    probPackTmpBuf,
+  } = ws.named;
+
+  const ownedBuffers = [];
+  const ownedAlloc = createBufAllocator(device, ownedBuffers);
+  const mkBuf = ownedAlloc.alloc;
+
   const wRawBuf = mkBuf(hasF16 ? packed.wF16.byteLength : packed.wF32.byteLength, S | CD);
   const qmetaBuf = mkBuf(packed.qmetaF32.byteLength, S | U | CD);
-  const momBuf = mkBuf(momBytes, S);
   const wEffBuf = mkBuf(wEffBytes, shaders.useUniformWeff ? (S | U) : S);
-  const labels8Buf = mkBuf(outBufBytes, S | CD | CS);
-  const readbackBuf = mkBuf(outBufBytes, GPUBufferUsage.MAP_READ | CD);
-  const canGpuProb = !!(probCfg && actQBytes >= outBufBytes);
-  const probPackTmpBuf = canGpuProb ? mkBuf(outBufBytes, S | CD | CS) : null;
 
   const canCone = d.norm === 'gn' && !modelEntry?.disableConeSkip;
   const strips0Ubo = mkBuf(TOTAL_STRIPS * 4, U | CD);
@@ -3769,17 +3932,31 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
   device.queue.writeBuffer(wRawBuf, 0, hasF16 ? packed.wF16 : packed.wF32);
   device.queue.writeBuffer(qmetaBuf, 0, packed.qmetaF32);
 
-  const dilKeys = Object.keys(shaders.convWgsls).map(Number);
-  const { pInit, pMomFin, pPrepW, pFlush, pNorm, pNormHalo, pCls, pConv0, convPipes } = await getNetPipes128(
-    device,
-    d,
-    packed,
-    hasF16,
-    hasSubgroups32,
-    probCfg,
-    shaders,
-    dilKeys
-  );
+  const dilKeys = Array.from(new Set(d.dilations.slice(1)));
+  let pipes;
+  try {
+    pipes = await getNetPipes128(
+      device,
+      d,
+      packed,
+      hasF16,
+      hasSubgroups32,
+      probCfg,
+      shaders,
+      dilKeys
+    );
+  } catch (err) {
+    for (const b of ownedBuffers) b.destroy();
+    ownedBuffers.length = 0;
+    if (!ws.pooled) {
+      for (const b of ws.buffers) b.destroy();
+      ws.buffers.length = 0;
+    } else if (v4WorkspacePool.get(device) === ws) {
+      releaseV4Workspace(device);
+    }
+    throw err;
+  }
+  const { pInit, pMomFin, pPrepW, pFlush, pNorm, pNormHalo, pCls, pConv0, convPipes } = pipes;
 
   const mkBg = (bgl, resources) => device.createBindGroup({
     layout: bgl,
@@ -3802,7 +3979,19 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
   }
 
   const p0Bgl = (shaders.halfPass0 ? pConv0.lo : pConv0.main).bgl;
-  const bgConv0 = mkBg(p0Bgl, [inpBuf, act8_0, act8_1, act8_2, act8_3, stageBuf, wRawBuf, momBuf, qmetaBuf, strips0Ubo, conv0Ubo]);
+  const bgConv0 = mkBg(p0Bgl, [
+    inpBuf,
+    act8_0,
+    act8_1,
+    act8_2,
+    act8_3,
+    stageBuf,
+    wRawBuf,
+    momBuf,
+    { buffer: qmetaBuf, offset: 0, size: d.cs * 16 },
+    strips0Ubo,
+    conv0Ubo,
+  ]);
   const bgCls = mkBg(pCls.bgl, [act8_0, act8_1, act8_2, act8_3, stageBuf, wRawBuf, momBuf, labels8Buf, qmetaBuf, clsStripsUbo, clsUbo]);
   const clsUbo1 = canGpuProb ? mkBuf(16, U | CD) : null;
   const bgCls1 = canGpuProb
@@ -4168,12 +4357,26 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
     return ioCtl.finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts });
   }
 
-  execute.dispose = () => {
+  ioCtl.warmupIoPipelines();
+
+  execute.dispose = ({ keepSharedWorkspace = false } = {}) => {
+    ioCtl.dispose();
     for (const b of ownedBuffers) b.destroy();
     ownedBuffers.length = 0;
+    ownedAlloc.resetBytes();
+    if (!ws.pooled) {
+      for (const b of ws.buffers) b.destroy();
+      ws.buffers.length = 0;
+    } else if (keepSharedWorkspace) {
+      ws.inUse = false;
+    } else if (v4WorkspacePool.get(device) === ws) {
+      releaseV4Workspace(device);
+    }
   };
+  execute.gpuBytes = () => ws.bytes + ownedAlloc.getBytes();
   execute.__passCategories = [];
   execute.__coneInfo = () => ({ paddedVox, actMiB: actQBytes / 1048576, mode: 'LowMem128' });
+  execute.kernels = 'v4-int8';
   return execute;
 }
 
@@ -4246,12 +4449,6 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
   const S = GPUBufferUsage.STORAGE;
   const CD = GPUBufferUsage.COPY_DST;
   const CS = GPUBufferUsage.COPY_SRC;
-  const ownedBuffers = [];
-  const mkBuf = (size, usage) => {
-    const buf = device.createBuffer({ size: Math.max(16, Math.ceil(size / 16) * 16), usage });
-    ownedBuffers.push(buf);
-    return buf;
-  };
 
   const paddedVox = DIM * DIM * ROW_SCALARS_PAD;
   const inpBytes = paddedVox * (hasF16 ? 2 : 4);
@@ -4260,19 +4457,45 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
   const momStatsBytes = (d.cs * 2 + 4) * 16;
   const wEffBytes = hasF16 ? Math.ceil(shaders.totalWEffVec4s / 2) * 16 : shaders.totalWEffVec4s * 16;
 
-  const inpBuf = mkBuf(inpBytes, S | CD | CS);
-  const act8_0 = mkBuf(actBytes, S | CD | CS);
-  const act8_1 = mkBuf(splitHalves ? actBytes : 16, S | CD | CS);
-  const y8_0 = mkBuf(y8Bytes, S | CD | CS);
-  const y8_1 = mkBuf(splitHalves ? y8Bytes : 16, S | CD | CS);
+  const wsKey = `std|${d.cs}|${splitHalves ? 1 : 0}|${hasF16 ? 1 : 0}|${outBufBytes}`;
+  const ws = acquireV4Workspace(device, wsKey, () => {
+    const buffers = [];
+    const wsAlloc = createBufAllocator(device, buffers);
+    const mkWs = wsAlloc.alloc;
+    const named = {
+      inpBuf: mkWs(inpBytes, S | CD | CS),
+      act8_0: mkWs(actBytes, S | CD | CS),
+      act8_1: mkWs(splitHalves ? actBytes : 16, S | CD | CS),
+      y8_0: mkWs(y8Bytes, S | CD | CS),
+      y8_1: mkWs(splitHalves ? y8Bytes : 16, S | CD | CS),
+      momMainBuf: mkWs(momMainBytes, S),
+      momExtBuf: mkWs(momExtBytes, S),
+      momStatsBuf: mkWs(momStatsBytes, S),
+      labels8Buf: mkWs(outBufBytes, S | CD | CS),
+      readbackBuf: mkWs(outBufBytes, GPUBufferUsage.MAP_READ | CD),
+    };
+    return { buffers, named, bytes: wsAlloc.getBytes() };
+  });
+  const {
+    inpBuf,
+    act8_0,
+    act8_1,
+    y8_0,
+    y8_1,
+    momMainBuf,
+    momExtBuf,
+    momStatsBuf,
+    labels8Buf,
+    readbackBuf,
+  } = ws.named;
+
+  const ownedBuffers = [];
+  const ownedAlloc = createBufAllocator(device, ownedBuffers);
+  const mkBuf = ownedAlloc.alloc;
+
   const wRawBuf = mkBuf(hasF16 ? packed.wF16.byteLength : packed.wF32.byteLength, S | CD);
   const qmetaBuf = mkBuf(packed.qmetaF32.byteLength, S | CD);
-  const momMainBuf = mkBuf(momMainBytes, S);
-  const momExtBuf = mkBuf(momExtBytes, S);
-  const momStatsBuf = mkBuf(momStatsBytes, S);
   const wEffBuf = mkBuf(wEffBytes, shaders.useUniformWeff ? (S | GPUBufferUsage.UNIFORM) : S);
-  const labels8Buf = mkBuf(outBufBytes, S | CD | CS);
-  const readbackBuf = mkBuf(outBufBytes, GPUBufferUsage.MAP_READ | CD);
 
   const numConvs = d.dilations.length;
   const canCone = d.norm === 'gn' && !modelEntry?.disableConeSkip;
@@ -4289,19 +4512,33 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
   device.queue.writeBuffer(wRawBuf, 0, hasF16 ? packed.wF16 : packed.wF32);
   device.queue.writeBuffer(qmetaBuf, 0, packed.qmetaF32);
 
-  // Compile/cache all shader modules and pipelines in parallel per device
-  const dilKeys = Object.keys(shaders.convWgsls).map(Number);
-  const { pInit, pMomFin, pPrepW, pNorm, pNormHalo, pCls, pConv0, convPipes } = await getNetPipesStd(
-    device,
-    d,
-    packed,
-    hasF16,
-    hasSubgroups32,
-    splitHalves,
-    probCfg,
-    shaders,
-    dilKeys
-  );
+  // Compile/cache shader modules and pipelines per kernel group per device
+  const dilKeys = Array.from(new Set(d.dilations.slice(1)));
+  let pipes;
+  try {
+    pipes = await getNetPipesStd(
+      device,
+      d,
+      packed,
+      hasF16,
+      hasSubgroups32,
+      splitHalves,
+      probCfg,
+      shaders,
+      dilKeys
+    );
+  } catch (err) {
+    for (const b of ownedBuffers) b.destroy();
+    ownedBuffers.length = 0;
+    if (!ws.pooled) {
+      for (const b of ws.buffers) b.destroy();
+      ws.buffers.length = 0;
+    } else if (v4WorkspacePool.get(device) === ws) {
+      releaseV4Workspace(device);
+    }
+    throw err;
+  }
+  const { pInit, pMomFin, pPrepW, pNorm, pNormHalo, pCls, pConv0, convPipes } = pipes;
 
   const mkBg = (bgl, bufs) => device.createBindGroup({
     layout: bgl,
@@ -4606,14 +4843,85 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     return ioCtl.finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts });
   }
 
-  execute.dispose = () => {
+  ioCtl.warmupIoPipelines();
+
+  execute.dispose = ({ keepSharedWorkspace = false } = {}) => {
+    ioCtl.dispose();
     for (const b of ownedBuffers) b.destroy();
     ownedBuffers.length = 0;
+    ownedAlloc.resetBytes();
+    if (!ws.pooled) {
+      for (const b of ws.buffers) b.destroy();
+      ws.buffers.length = 0;
+    } else if (keepSharedWorkspace) {
+      ws.inUse = false;
+    } else if (v4WorkspacePool.get(device) === ws) {
+      releaseV4Workspace(device);
+    }
   };
+  execute.gpuBytes = () => ws.bytes + ownedAlloc.getBytes();
   execute.__passCategories = [];
   execute.__coneInfo = () => ({ paddedVox, actMiB: actBytes / 1048576 });
   execute.kernels = 'v4-int8';
   return execute;
+}
+
+export async function warmupV4CorePipelines(device) {
+  if (!device) return;
+  const hasF16 = !!device.features?.has?.('shader-f16');
+  const adInfo = device.__adapterInfo || device.adapterInfo || {};
+  const hasSubgroups32 = !!device.features?.has?.('subgroups') &&
+    adInfo.subgroupMinSize === 32 && adInfo.subgroupMaxSize === 32;
+  const lim = device.limits || {};
+  const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
+
+  const warmSpecs = [
+    { chan: 24, cs: 24, nclass: 0, dilations: DEEP13, activation: 'gelu_tanh', norm: 'gn' },
+    { chan: 16, cs: 16, nclass: 0, dilations: [16, 8, 4, 2, 1], activation: 'gelu_tanh', norm: 'gn' },
+  ];
+  const tasks = [
+    getIoPipe(device, hasF16 ? 'prep_in_u8_f16' : 'prep_in_u8_f32', () => buildPrepInWgsl(true, hasF16), 'main', ['read-only-storage', 'storage', 'uniform']),
+    getIoPipe(device, 'transpose_u8_v4', buildTransposeU8Wgsl, 'main', ['read-only-storage', 'storage']),
+  ];
+  for (const d of warmSpecs) {
+    const splitHalves = d.cs >= 16;
+    const csHalf = splitHalves ? d.cs / 2 : d.cs;
+    const actBytes = DIM * DIM * csHalf * X4_PAD * 4;
+    const use128 = actBytes > maxAllowed;
+    const dilKeys = Array.from(new Set(d.dilations.slice(1)));
+    if (use128) {
+      const shaders = buildShadersLowMem128({
+        cs: d.cs,
+        chan: d.chan,
+        nclass: 0,
+        clsK4: 0,
+        dilations: d.dilations,
+        activation: d.activation,
+        norm: d.norm,
+        hasF16,
+        hasSubgroups32,
+        numConvs: d.dilations.length,
+        probCfg: null,
+      });
+      tasks.push(getNetPipes128(device, d, null, hasF16, hasSubgroups32, null, shaders, dilKeys, { includeCls: false }));
+    } else {
+      const shaders = buildShaders({
+        cs: d.cs,
+        chan: d.chan,
+        nclass: 0,
+        clsK4: 0,
+        dilations: d.dilations,
+        activation: d.activation,
+        norm: d.norm,
+        hasF16,
+        hasSubgroups32,
+        splitHalves,
+        probCfg: null,
+      });
+      tasks.push(getNetPipesStd(device, d, null, hasF16, hasSubgroups32, splitHalves, null, shaders, dilKeys, { includeCls: false }));
+    }
+  }
+  await Promise.all(tasks);
 }
 
 const load = async (device, weightPath) => {
@@ -4622,4 +4930,4 @@ const load = async (device, weightPath) => {
 };
 
 export const supportsGpuNativeIO = true;
-export default { load, setupNet, supportsF32Fallback, supportsGpuNativeIO };
+export default { load, setupNet, warmupV4CorePipelines, supportsF32Fallback, supportsGpuNativeIO };
