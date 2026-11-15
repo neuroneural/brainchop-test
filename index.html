@@ -19,12 +19,11 @@
   <link rel="stylesheet" href="./niivue.css" />
 
   <title>AI powered brain segmentation</title>
-  <script type="module" crossorigin src="./assets/index-D00n8DRw.js"></script>
-  <link rel="modulepreload" crossorigin href="./assets/vendor-math-SZZ51dKR.js">
-  <link rel="modulepreload" crossorigin href="./assets/vendor-niivue-D0ofrYwJ.js">
-  <link rel="modulepreload" crossorigin href="./assets/vendor-CzDLLqvp.js">
-  <link rel="modulepreload" crossorigin href="./assets/vendor-tf-D3pORYhs.js">
-  <link rel="stylesheet" crossorigin href="./assets/index-Mq5KCxnq.css">
+  <script type="module" crossorigin src="./assets/index-BvZRKbX9.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/vendor-CKvLRpOF.js">
+  <link rel="modulepreload" crossorigin href="./assets/vendor-math-oqRZD8Fx.js">
+  <link rel="modulepreload" crossorigin href="./assets/vendor-niivue-BztUWqGV.js">
+  <link rel="stylesheet" crossorigin href="./assets/index-Bc6v0XZO.css">
 </head>
 
 <body>
@@ -50,6 +49,19 @@
     <select id="modelSelect" class="model-select" title="Choose a segmentation model to run">
       <option value="-1" disabled selected>Loading models...</option>
     </select>
+
+    <button
+      id="turboToggle"
+      type="button"
+      class="turbo-tumbler active"
+      role="switch"
+      aria-checked="true"
+      aria-label="Turbo 8-bit acceleration"
+      title="Turbo ON: 8-bit V4 WebGPU / RGBA8 WebGL2 acceleration (~3x faster, mobile and cross-browser friendly). Click to run FP16 reference mode."
+    >
+      <span class="turbo-glyph" aria-hidden="true">&#9889;</span>
+      <span class="turbo-track" aria-hidden="true"><span class="turbo-thumb"></span></span>
+    </button>
 
     <span class="tb-divider"></span>
 
