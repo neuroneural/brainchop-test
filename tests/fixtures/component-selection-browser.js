@@ -10,7 +10,7 @@ import generated from '../../webgpu_runners/dkatlas24_synth_runner.js'
 
 const shape = [256, 256, 256], length = 256 ** 3
 const family = c => c >= 1 && c <= 34 ? 1 : c >= 35 && c <= 68 ? 2 : 0
-const methods = ['largest_original_cluster_labels', 'filter_clusters']
+const methods = ['largest_original_cluster_labels', 'filter_clusters', 'filterHierarchicalFromLabels']
 const original = methods.map(name => BWLabeler.prototype[name])
 const useReference = reference => methods.forEach((name, i) => {
   BWLabeler.prototype[name] = reference ? QuadraticBWLabeler.prototype[name] : original[i]
@@ -120,7 +120,7 @@ export function stress({ pairs = 9 } = {}) {
       ls.fill(i, offset, offset + size(i))
       offset += size(i) + 1
     }
-    for (const method of methods) {
+    for (const method of ['largest_original_cluster_labels', 'filter_clusters']) {
       const before = new QuadraticBWLabeler(), after = new BWLabeler(), times = { before: [], after: [] }
       for (let pair = -1; pair < pairs; pair++) {
         const outputs = {}

@@ -1261,22 +1261,42 @@ export class BWLabeler {
   }
 
   /**
-   * Single-pass hierarchical 18-class filter reusing conn=6 per-class guard labels:
-   * selects largest binary foreground component (larger root wins ties) and within it
-   * retains only the largest component for classes in `targetClasses` (smaller component
-   * index wins ties), keeping all other classes intact.
+   * Single-pass hierarchical filter reusing conn=6 per-class guard labels:
+   * 1. Selects the largest 6-connected binary foreground component (larger root wins ties),
+   *    dropping all disconnected exterior or resection-cavity islands to 0.
+   * 2. Within that main binary component, retains only the largest connected component
+   *    for classes in `targetClasses` ('all' or a Set of class IDs), breaking per-class
+   *    size ties via `largerIndexWins` (true matches largest_original_cluster_labels;
+   *    false matches filter_clusters).
+   * 3. Optionally relabels suppressed components inside the main binary component via
+   *    neighbor_winners (components outside bestRoot touch no kept 6-neighbors and stay 0).
    */
-  filter18ClassFromLabels(bw, cl, ls, dim, targetClasses, relabelSuppressed = false, familyOf = null, inPlace = false) {
+  filterHierarchicalFromLabels(
+    bw,
+    cl,
+    ls,
+    dim,
+    targetClasses = 'all',
+    largerIndexWins = true,
+    relabelSuppressed = false,
+    familyOf = null,
+    inPlace = false
+  ) {
     if (cl === 0) {
-      return [0, new Uint8Array(bw.length)]
+      const out = bw instanceof Uint8Array ? (inPlace ? bw : new Uint8Array(bw.length)) : new Uint32Array(bw.length)
+      return [0, out]
     }
     const { parent, compSize, compClass, bestRoot } = this._binaryComponentsFromLabels(bw, cl, ls, dim, true)
     const activeCompClass = new Uint32Array(cl + 1)
     for (let c = 1; c <= cl; c++) {
       if (parent[c] === bestRoot) activeCompClass[c] = compClass[c]
     }
-    const kept = this._buildKeptMap(activeCompClass, compSize, cl, targetClasses, false)
+    const kept = this._buildKeptMap(activeCompClass, compSize, cl, targetClasses, largerIndexWins)
     return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf, inPlace)
+  }
+
+  filter18ClassFromLabels(bw, cl, ls, dim, targetClasses, relabelSuppressed = false, familyOf = null, inPlace = false) {
+    return this.filterHierarchicalFromLabels(bw, cl, ls, dim, targetClasses, false, relabelSuppressed, familyOf, inPlace)
   }
 
   // for an explanation and optimized C code see

@@ -100,4 +100,25 @@ export class QuadraticBWLabeler extends BWLabeler {
     return this.finalize_volume(ls, dim, kept, cl, relabelSuppressed, bw, familyOf)
   }
 
+  filterHierarchicalFromLabels(
+    bw,
+    _cl,
+    _ls,
+    dim,
+    targetClasses = 'all',
+    largerIndexWins = true,
+    relabelSuppressed = false,
+    familyOf = null
+  ) {
+    const [, binaryMask] = this.bwlabel(bw, dim, 6, true, true)
+    const masked = bw instanceof Uint8Array ? new Uint8Array(bw.length) : new Uint32Array(bw.length)
+    for (let i = 0; i < bw.length; i++) {
+      if (binaryMask[i]) masked[i] = bw[i]
+    }
+    const [mcl, mls] = this.bwlabel(masked, dim, 6, false, false)
+    return largerIndexWins && targetClasses === 'all'
+      ? this.largest_original_cluster_labels(masked, mcl, mls, dim, relabelSuppressed, familyOf)
+      : this.filter_clusters(masked, mcl, mls, targetClasses, dim, relabelSuppressed, familyOf)
+  }
+
 }
