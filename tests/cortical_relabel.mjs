@@ -17,6 +17,7 @@
  * meets its neighbouring parcel along a thin tangential rim.
  */
 import { BWLabeler } from '../bwlabels.js'
+import { processSegmentationVolume } from '../tensor-utils.js'
 
 const NX = 20, NY = 12, NZ = 8
 const DIM = [NX, NY, NZ]
@@ -84,6 +85,81 @@ for (let i = 0; i < noGate.length; i++) {
 }
 console.log(`\nvoxels changed by the gate: ${drift} (expected 96 = the fragment only)`)
 if (drift !== 96) failures++
+
+// Regression test for 104-class binary main-brain gate on resection cavities
+// (processSegmentationVolume for models 5, 14, 60).
+console.log('\n--- 104-class resection-cavity island gate (models 5 / 14 / 60) ---')
+const RX = 24, RY = 14, RZ = 8
+const RDIM = [RX, RY, RZ]
+const rat = (x, y, z) => z * RX * RY + y * RX + x
+const CTX_MT = 14 // ctx-lh-middletemporal
+const CTX_FUS = 6 // ctx-lh-fusiform
+const CTX_TP = 32 // ctx-lh-temporalpole
+
+function buildResectionVolume(includeStumpRemnant) {
+  const v = new Uint8Array(RX * RY * RZ)
+  // Main brain core: WM (x=1..13, y=6..12, z=1..6) + cortical ribbon (y=4..5, z=1..6)
+  for (let z = 1; z <= 6; z++) {
+    for (let y = 6; y <= 12; y++) {
+      for (let x = 1; x <= 13; x++) v[rat(x, y, z)] = WM
+    }
+    for (let y = 4; y <= 5; y++) {
+      for (let x = 2; x <= 8; x++) v[rat(x, y, z)] = CTX_MT
+      for (let x = 9; x <= 10; x++) v[rat(x, y, z)] = CTX_FUS
+      for (let x = 11; x <= 12; x++) v[rat(x, y, z)] = CTX_MT // attached fragment on main brain -> relabels to CTX_FUS
+    }
+  }
+  // Optional 8-voxel temporalpole remnant attached to the main brain stump
+  if (includeStumpRemnant) {
+    for (let z = 2; z <= 5; z++) {
+      for (let y = 4; y <= 5; y++) v[rat(1, y, z)] = CTX_TP
+    }
+  }
+  // Empty resection cavity across x=14..16; disconnected 40-voxel island at x=17..21
+  for (let z = 2; z <= 5; z++) {
+    for (let y = 4; y <= 5; y++) {
+      for (let x = 17; x <= 19; x++) v[rat(x, y, z)] = CTX_TP // 24 voxels (> 8-voxel stump remnant)
+      for (let x = 20; x <= 21; x++) v[rat(x, y, z)] = CTX_MT // 16 voxels touching cavity CTX_TP
+    }
+  }
+  return v
+}
+
+const CAVITY_TP = rat(18, 4, 3)
+const CAVITY_MT = rat(20, 4, 3)
+const STUMP_TP = rat(1, 4, 3)
+const ATTACHED_MT = rat(11, 4, 3)
+const MAIN_MT = rat(4, 4, 3)
+const MAIN_WM = rat(6, 8, 3)
+
+for (const id of [5, 14, 60]) {
+  const caseA = await processSegmentationVolume(
+    buildResectionVolume(false),
+    null,
+    { id, type: 'Atlas' },
+    { isPostProcessEnable: true },
+    null,
+    RDIM
+  )
+  check(`model ${id} Case A: cavity CTX_TP dropped to 0`, caseA[CAVITY_TP], 0)
+  check(`model ${id} Case A: cavity CTX_MT dropped to 0`, caseA[CAVITY_MT], 0)
+  check(`model ${id} Case A: attached cortical fragment relabels to CTX_FUS`, caseA[ATTACHED_MT], CTX_FUS)
+  check(`model ${id} Case A: main CTX_MT untouched`, caseA[MAIN_MT], CTX_MT)
+  check(`model ${id} Case A: main WM untouched`, caseA[MAIN_WM], WM)
+
+  const caseB = await processSegmentationVolume(
+    buildResectionVolume(true),
+    null,
+    { id, type: 'Atlas' },
+    { isPostProcessEnable: true },
+    null,
+    RDIM
+  )
+  check(`model ${id} Case B: larger cavity CTX_TP island dropped to 0`, caseB[CAVITY_TP], 0)
+  check(`model ${id} Case B: cavity CTX_MT dropped to 0`, caseB[CAVITY_MT], 0)
+  check(`model ${id} Case B: smaller attached stump CTX_TP survives`, caseB[STUMP_TP], CTX_TP)
+  check(`model ${id} Case B: attached cortical fragment relabels to CTX_FUS`, caseB[ATTACHED_MT], CTX_FUS)
+}
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

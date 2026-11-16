@@ -48,10 +48,26 @@ try {
         assert.deepEqual(current.largest_original_cluster_labels(...args, dims, refill, gate),
           reference.largest_original_cluster_labels(...args, dims, refill, gate), `largest trial=${trial} conn=${conn}`)
         comparisons++
+        if (conn === 6) {
+          assert.deepEqual(
+            current.filterHierarchicalFromLabels(data, count, labels, dims, 'all', true, refill, gate),
+            reference.filterHierarchicalFromLabels(data, count, labels, dims, 'all', true, refill, gate),
+            `hierarchical all trial=${trial} conn=${conn}`
+          )
+          comparisons++
+        }
         for (const targets of ['all', new Set(), new Set([1, 5, 85, 4000000000])]) {
           assert.deepEqual(current.filter_clusters(...args, targets, dims, refill, gate),
             reference.filter_clusters(...args, targets, dims, refill, gate), `targeted trial=${trial} conn=${conn}`)
           comparisons++
+          if (conn === 6) {
+            assert.deepEqual(
+              current.filterHierarchicalFromLabels(data, count, labels, dims, targets, false, refill, gate),
+              reference.filterHierarchicalFromLabels(data, count, labels, dims, targets, false, refill, gate),
+              `hierarchical targeted trial=${trial} conn=${conn}`
+            )
+            comparisons++
+          }
         }
       }
       assert.deepEqual(labels, originalLabels, 'component map is immutable')
@@ -61,9 +77,9 @@ try {
 
   // Integration through the same postprocessor called by all inference backends.
   const dims = [12, 10, 4], data = Int32Array.from({ length: 480 }, () => random(6) ? 1 + random(103) : 0)
-  const methods = ['largest_original_cluster_labels', 'filter_clusters']
+  const methods = ['largest_original_cluster_labels', 'filter_clusters', 'filterHierarchicalFromLabels']
   const saved = methods.map(name => BWLabeler.prototype[name])
-  for (const id of [1, 3, 4, 5, 7, 8, 9, 14, 15, 21]) for (const refill of [false, true]) {
+  for (const id of [1, 3, 4, 5, 7, 8, 9, 14, 15, 21, 60]) for (const refill of [false, true]) {
     const run = () => processSegmentationVolume({ shape: dims, data: async () => data.slice() }, null,
       { id, type: 'Atlas' }, { isPostProcessEnable: true, fillSuppressedWithNeighborLabel: refill })
     const actual = await run()

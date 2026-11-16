@@ -455,11 +455,16 @@ export async function processSegmentationVolume(
           { label: `model${modelEntry.id}`, topN: 60 }
         );
       }
-      const [_mx, res2] = BWInstance.largest_original_cluster_labels(
+      // 104-class hierarchical filter reusing guardLabels:
+      // Step 1: drop disconnected exterior/resection-cavity islands outside the main 6-connected binary brain mass.
+      // Step 2: retain largest component per class + class-family neighbor relabeling inside the main brain.
+      const [_mx, res2] = BWInstance.filterHierarchicalFromLabels(
         segmentationData,
         guardComponentCount,
         guardLabels,
         Vshape,
+        'all',
+        true,
         relabelSuppressed,
         voteFamilyOf,
         ownsBuffer
