@@ -6,6 +6,7 @@ import { runInferenceWebGpu, warmupWebGpuRunners, yieldForPaint } from "./infere
 import { inferenceModelsList, brainChopOpts, resolveModelEntry } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import { getLabelHistogramU8 } from "./tensor-utils.js";
+import { buildFreeSurferLut, remapLabelsToFreeSurfer } from "./freesurfer-labels.js";
 import { installResponsiveLayout } from "./responsive-layout.js";
 import { installTouchViewControls } from "./touch-view.js";
 
@@ -506,11 +507,20 @@ async function main() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") openDrawPopover(false);
   });
-  // Dismiss any modal by clicking its backdrop.
+  // Dismiss any modal by clicking its backdrop (fallback where <dialog closedby="any"> is unsupported).
   const appDialogEl = document.getElementById("appDialog");
-  if (appDialogEl) {
-    appDialogEl.addEventListener("click", (e) => {
-      if (e.target === appDialogEl) appDialogEl.close();
+  if (appDialogEl && !("closedBy" in HTMLDialogElement.prototype)) {
+    let pressedOutside = false;
+    const isOutsideDialog = (e) => {
+      const r = appDialogEl.getBoundingClientRect();
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+    };
+    appDialogEl.addEventListener("pointerdown", (e) => {
+      pressedOutside = e.target === appDialogEl && isOutsideDialog(e);
+    });
+    appDialogEl.addEventListener("pointerup", (e) => {
+      if (pressedOutside && e.target === appDialogEl && isOutsideDialog(e)) appDialogEl.close();
+      pressedOutside = false;
     });
   }
 
@@ -960,15 +970,33 @@ async function main() {
     return mask;
   }
 
-  async function saveSegmentationConformed(includeMask = false) {
+  async function saveSegmentationConformed({ includeMask = false, useFreeSurfer = false } = {}) {
     if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
     // The overlay already carries the right intent from callbackImg: LABEL for
     // discrete segmentations, none for intensity outputs (e.g. skull-stripped
-    // brain). So save it as-is — don't force LABEL here.
+    // brain). So save it as-is unless FreeSurfer label-ID remapping is requested.
+    const fsLut = useFreeSurfer ? buildFreeSurferLut(lastSegLabelNames) : null;
     const overlays = nv1.volumes.slice(1);
     // Serial: three concurrent 256³ gzips compete for memory.
     await withPristineLabels(async () => {
-      for (const overlay of overlays) await downloadVolume(overlay, overlayFilename(overlay, overlays.length, ""));
+      for (const overlay of overlays) {
+        const isLabelOverlay = !!overlay.colormapLabel || overlay.hdr.intent_code === 1002;
+        if (fsLut && isLabelOverlay) {
+          const { img: fsImg, maxLabel } = remapLabelsToFreeSurfer(overlay.img, fsLut);
+          const fsVol = cloneOverlayVolume(overlay, fsImg, overlay.name, {
+            datatypeCode: 4,      // DT_INT16 (FreeSurfer cortical IDs reach 2035)
+            numBitsPerVoxel: 16,
+            scl_slope: 1,
+            scl_inter: 0,
+            cal_min: 0,
+            cal_max: maxLabel,
+            intent_code: 1002,    // NIFTI_INTENT_LABEL
+          });
+          await downloadVolume(fsVol, overlayFilename(overlay, overlays.length, "_fs"));
+        } else {
+          await downloadVolume(overlay, overlayFilename(overlay, overlays.length, ""));
+        }
+      }
       if (includeMask) await downloadVolume(binaryMaskVolume(), "binary_mask.nii.gz");
     });
   }
@@ -990,19 +1018,22 @@ async function main() {
 
   // Native-space segmentation: reslice the conformed (256³, 1 mm) labels back
   // onto the original input grid. See resliceLabelsToNative() for the method.
-  async function saveSegmentationNative(includeMask = false) {
+  async function saveSegmentationNative({ includeMask = false, useFreeSurfer = false } = {}) {
     if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
     if (!nativeInputNV || !nativeInputNV.hdr || !nativeInputNV.hdr.affine) {
       window.alert("Original input grid is unavailable — reload the image and try again.");
       return;
     }
+    const fsLut = useFreeSurfer ? buildFreeSurferLut(lastSegLabelNames) : null;
     callbackUI("Reslicing to native space…", 0);
     await new Promise((r) => setTimeout(r, 30)); // let the status paint before the blocking loop
     try {
       const overlays = nv1.volumes.slice(1);
       for (const overlay of overlays) {
-        const outNV = await withPristineLabels(() => resliceLabelsToNative(overlay));
-        await downloadVolume(outNV, overlayFilename(overlay, overlays.length, "_native"));
+        const isLabelOverlay = !!overlay.colormapLabel || overlay.hdr.intent_code === 1002;
+        const activeLut = fsLut && isLabelOverlay ? fsLut : null;
+        const outNV = await withPristineLabels(() => resliceLabelsToNative(overlay, activeLut));
+        await downloadVolume(outNV, overlayFilename(overlay, overlays.length, activeLut ? "_fs_native" : "_native"));
       }
       if (includeMask) {
         const mask = resliceLabelsToNative(binaryMaskVolume());
@@ -1019,7 +1050,7 @@ async function main() {
   //
   // For a label map (segmentation): nearest-neighbour with 2× supersampling and
   // a majority vote per output voxel — crisper categorical boundaries — written
-  // as Int16 tagged NIFTI_INTENT_LABEL.
+  // as Int16 tagged NIFTI_INTENT_LABEL (optionally remapped via `labelLut`).
   // For an intensity output (e.g. skull-stripped brain): plain nearest-neighbour
   // keeping the native datatype and NOT tagged as a label — it's an image.
   // For a Float32 probability map (CAT-lite): trilinear, uint8 with scl_slope 1/255.
@@ -1028,7 +1059,7 @@ async function main() {
   // at four basis points (origin + unit steps), so it is correct for any
   // orientation without us re-deriving affine conventions. Validated: when the
   // two grids are identical the map is the identity.
-  function resliceLabelsToNative(seg) {
+  function resliceLabelsToNative(seg, labelLut = null) {
     const labels = seg.img;                    // pristine labels (see withPristineLabels)
     const A = nativeInputNV.hdr.affine;        // native storage-voxel -> mm (row-major 4x4)
     const nx = nativeInputNV.hdr.dims[1], ny = nativeInputNV.hdr.dims[2], nz = nativeInputNV.hdr.dims[3];
@@ -1082,6 +1113,7 @@ async function main() {
               dx * ex[2] + dy * ey[2] + dz * ez[2],
             ]);
       const out = new Int16Array(nvox);
+      const lutLen = labelLut ? labelLut.length : 0;
       let maxLabel = 0;
       const tv = new Int32Array(8), tc = new Int32Array(8); // majority tally (≤8 distinct)
       let idx = 0;
@@ -1103,6 +1135,7 @@ async function main() {
             }
             let best = tv[0], bc = tc[0];
             for (let q = 1; q < nt; q++) if (tc[q] > bc) { bc = tc[q]; best = tv[q]; }
+            if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
             if (best > maxLabel) maxLabel = best;
             out[idx++] = best;
             bx += ex[0]; by += ex[1]; bz += ex[2];
@@ -1166,40 +1199,118 @@ async function main() {
     return outNV;
   }
 
+  let saveUseFreeSurfer = false;
+  let saveIncludeBinaryMask = false;
+
+  const SAVE_ICONS = {
+    cube: '<svg viewBox="0 0 24 24" class="save-opt-ico" aria-hidden="true"><path d="M12 2.75l8.25 4.75v9L12 21.25 3.75 16.5v-9z"/><path d="M12 12v9.25M3.75 7.5L12 12l8.25-4.5"/></svg>',
+    grid: '<svg viewBox="0 0 24 24" class="save-opt-ico" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="2.5"/><path d="M3.5 9.5h17M3.5 14.5h17M9.5 3.5v17M14.5 3.5v17"/></svg>',
+    volume: '<svg viewBox="0 0 24 24" class="save-opt-ico" aria-hidden="true"><path d="M12 3.5l8.5 4.5-8.5 4.5L3.5 8z"/><path d="M3.5 12l8.5 4.5 8.5-4.5M3.5 16l8.5 4.5 8.5-4.5"/></svg>',
+    scene: '<svg viewBox="0 0 24 24" class="save-opt-ico" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M3.5 9.5h17M9.5 9.5v10"/></svg>',
+    arrow: '<svg viewBox="0 0 24 24" class="save-opt-arrow" aria-hidden="true"><path d="M12 4.5v11"/><path d="M7.5 11.5L12 16l4.5-4.5"/><path d="M5 19.5h14"/></svg>',
+  };
+
   const SAVE_OPTIONS = [
-    { act: saveSegmentationConformed, title: "Segmentation: conformed", sub: "256³ · 1 mm iso", need: "seg" },
-    { act: saveSegmentationNative, title: "Segmentation: native space", sub: "resampled to the input grid", need: "seg" },
-    { act: saveConformedInput, title: "Conformed input volume", sub: "the resampled T1 (256³ · 1 mm)", need: "img" },
-    { act: saveScene, title: "Scene", sub: "everything, as a .nvd document", need: "img" },
+    { act: saveSegmentationConformed, group: "seg", icon: "cube", title: "Conformed space", sub: "256³ · 1 mm isotropic", need: "seg" },
+    { act: saveSegmentationNative, group: "seg", icon: "grid", title: "Native space", sub: "Resampled to the input grid", need: "seg" },
+    { act: saveConformedInput, group: "vol", icon: "volume", title: "Conformed input volume", sub: "Resampled T1 · 256³ · 1 mm", need: "img" },
+    { act: saveScene, group: "vol", icon: "scene", title: "Scene (.nvd)", sub: "Full viewer state document", need: "img" },
   ];
 
   function openSaveModal() {
     const hasImg = nv1.volumes.length >= 1;
     const hasSeg = nv1.volumes.length >= 2;
-    const hasMask = hasSeg && lastModelEntry && lastModelEntry.outputType !== 'probability'
-      && (lastModelEntry.type !== 'Brain_Extraction' || !!lastBrainMask);
+    const hasMask = hasSeg && lastModelEntry && lastModelEntry.outputType !== "probability"
+      && (lastModelEntry.type !== "Brain_Extraction" || !!lastBrainMask);
+    const hasFreeSurfer = hasSeg && lastModelEntry && lastModelEntry.outputType !== "probability"
+      && lastModelEntry.type !== "Brain_Extraction"
+      && !!buildFreeSurferLut(lastSegLabelNames);
     const ready = (need) => (need === "seg" ? hasSeg : hasImg);
-    const rows = SAVE_OPTIONS.map((o, i) => {
-      const dis = ready(o.need) ? "" : " disabled";
-      return `<button type="button" class="save-opt${dis}" data-i="${i}"${dis ? " disabled" : ""}>
-        <span class="save-opt-title">${o.title}</span>
-        <span class="save-opt-sub">${o.sub}</span>
-      </button>`;
-    }).join("");
-    const maskOption = hasMask
-      ? '<label class="save-mask-option"><input type="checkbox" id="saveBinaryMask">' +
-        '<span><strong>Also save binary mask</strong><small>Foreground 1 · background 0</small></span></label>'
-      : '';
-    showModal("Save", `<div class="save-options">${rows}</div>${maskOption}`, { hideClose: true, saveMode: true });
+
+    let autofocusAssigned = false;
+    const renderCards = (group) => SAVE_OPTIONS
+      .map((o, i) => ({ o, i }))
+      .filter(({ o }) => o.group === group)
+      .map(({ o, i }) => {
+        const enabled = ready(o.need);
+        const autoAttr = enabled && !autofocusAssigned ? (autofocusAssigned = true, " autofocus") : "";
+        const disClass = enabled ? "" : " disabled";
+        const disAttr = enabled ? "" : " disabled";
+        return `<button type="button" class="save-opt${disClass}" data-i="${i}"${disAttr}${autoAttr}>
+          ${SAVE_ICONS[o.icon]}
+          <span class="save-opt-copy">
+            <span class="save-opt-title">${o.title}</span>
+            <span class="save-opt-sub">${o.sub}</span>
+          </span>
+          ${SAVE_ICONS.arrow}
+        </button>`;
+      }).join("");
+
+    const modifierRows = [];
+    if (hasFreeSurfer) {
+      modifierRows.push(`
+        <label class="save-check-row" for="saveFreeSurfer">
+          <input type="checkbox" id="saveFreeSurfer" class="save-checkbox"${saveUseFreeSurfer ? " checked" : ""}>
+          <span class="save-check-copy">
+            <span class="save-check-title">FreeSurfer label IDs <span class="save-badge">Freeview</span></span>
+            <span class="save-check-sub">FreeSurferColorLUT numbering · open directly with :colormap=lut</span>
+          </span>
+        </label>`);
+    }
+    if (hasMask) {
+      modifierRows.push(`
+        <label class="save-check-row" for="saveBinaryMask">
+          <input type="checkbox" id="saveBinaryMask" class="save-checkbox"${saveIncludeBinaryMask ? " checked" : ""}>
+          <span class="save-check-copy">
+            <span class="save-check-title">Also save binary mask</span>
+            <span class="save-check-sub">Foreground 1 · background 0</span>
+          </span>
+        </label>`);
+    }
+    const modifiersHtml = modifierRows.length
+      ? `<div class="save-modifiers" role="group" aria-label="Segmentation export options">${modifierRows.join("")}</div>`
+      : "";
+
+    const segHint = !hasSeg ? '<span class="save-section-hint">Run a model first</span>' : "";
+    const html = `
+      <div class="save-sheet">
+        <section class="save-section">
+          <div class="save-section-head">
+            <span class="save-section-label">Segmentation</span>
+            ${segHint}
+          </div>
+          <div class="save-options">${renderCards("seg")}</div>
+          ${modifiersHtml}
+        </section>
+        <section class="save-section save-section-divider">
+          <div class="save-section-head">
+            <span class="save-section-label">Volume &amp; Scene</span>
+          </div>
+          <div class="save-options">${renderCards("vol")}</div>
+        </section>
+      </div>`;
+
+    showModal("Save", html, { hideClose: true, saveMode: true });
     const msg = document.getElementById("dialogMessage");
     if (!msg) return;
+
+    const fsInput = msg.querySelector("#saveFreeSurfer");
+    if (fsInput) fsInput.onchange = () => { saveUseFreeSurfer = fsInput.checked; };
+    const maskInput = msg.querySelector("#saveBinaryMask");
+    if (maskInput) maskInput.onchange = () => { saveIncludeBinaryMask = maskInput.checked; };
+
     msg.querySelectorAll(".save-opt:not(.disabled)").forEach((btn) => {
       btn.onclick = () => {
         const opt = SAVE_OPTIONS[parseInt(btn.dataset.i, 10)];
         const includeMask = opt.need === "seg" && !!msg.querySelector("#saveBinaryMask")?.checked;
+        const useFreeSurfer = opt.need === "seg" && hasFreeSurfer && !!msg.querySelector("#saveFreeSurfer")?.checked;
         const dlg = document.getElementById("appDialog");
         if (dlg && dlg.open) dlg.close();  // dismiss first so the native save dialog is unobstructed
-        opt.act(includeMask);
+        if (opt.need === "seg") {
+          opt.act({ includeMask, useFreeSurfer });
+        } else {
+          opt.act();
+        }
       };
     });
   }
@@ -1264,20 +1375,25 @@ async function main() {
     return rows;
   }
 
-  function buildStatsCsv(rows) {
-    const header = ["label", "name", "voxels", "volume_mm3", "min", "max", "q1", "median", "q3", "mean", "stdev"];
+  function buildStatsCsv(rows, fsLut = null) {
+    const header = fsLut
+      ? ["label", "fs_label", "name", "voxels", "volume_mm3", "min", "max", "q1", "median", "q3", "mean", "stdev"]
+      : ["label", "name", "voxels", "volume_mm3", "min", "max", "q1", "median", "q3", "mean", "stdev"];
     const fmt = (x) => (Number.isInteger(x) ? String(x) : x.toFixed(6));
     const esc = (s) => /[",\n]/.test(s) ? `"${String(s).replace(/"/g, '""')}"` : String(s);
     const lines = [header.join(",")];
     for (const r of rows) {
-      lines.push([r.label, esc(r.name), r.voxels, fmt(r.volume_mm3),
-        r.min, r.max, r.q1, r.median, r.q3, fmt(r.mean), fmt(r.stdev)].join(","));
+      const cols = fsLut
+        ? [r.label, r.label < fsLut.length ? fsLut[r.label] : r.label, esc(r.name)]
+        : [r.label, esc(r.name)];
+      cols.push(r.voxels, fmt(r.volume_mm3), r.min, r.max, r.q1, r.median, r.q3, fmt(r.mean), fmt(r.stdev));
+      lines.push(cols.join(","));
     }
     return lines.join("\n") + "\n";
   }
 
-  function downloadCsv(rows) {
-    const blob = new Blob([buildStatsCsv(rows)], { type: "text/csv" });
+  function downloadCsv(rows, fsLut = null) {
+    const blob = new Blob([buildStatsCsv(rows, fsLut)], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -1290,8 +1406,8 @@ async function main() {
 
   const fmtCm3 = (mm3) => { const v = mm3 / 1000; return v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1); };
 
-  function buildStatsPanelHtml(rows, totalMm3) {
-    const maxVol = Math.max(...rows.map(r => r.volume_mm3));
+  function buildStatsPanelHtml(rows, totalMm3, fsLut = null) {
+    const maxVol = Math.max(...rows.map((r) => r.volume_mm3));
     const colorOf = (r) => (lastSegColors && lastSegColors.R && lastSegColors.R[r.label] != null)
       ? `rgb(${lastSegColors.R[r.label]},${lastSegColors.G[r.label]},${lastSegColors.B[r.label]})`
       : "#6b9bd1";
@@ -1299,87 +1415,84 @@ async function main() {
     for (const r of rows) {
       const pct = totalMm3 > 0 ? (r.volume_mm3 / totalMm3) * 100 : 0;
       const wAbs = maxVol > 0 ? (r.volume_mm3 / maxVol) * 100 : 0;
+      const isIso = isolatedLabel === r.label;
+      const fsId = fsLut && r.label < fsLut.length ? fsLut[r.label] : null;
       const val = `<span class="stat-val" data-cm3="${fmtCm3(r.volume_mm3)}" data-pct="${pct.toFixed(1)}%">${fmtCm3(r.volume_mm3)}</span>`;
       const bar = `<span class="stat-bar" style="width:${wAbs.toFixed(2)}%;background:${colorOf(r)}" data-w-abs="${wAbs.toFixed(2)}" data-w-pct="${pct.toFixed(2)}"></span>`;
-      const cell = (k, v) => `<div><span class="k">${k}</span><span class="v">${v}</span></div>`;
+      const cell = (k, v) => `<div class="stat-kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;
       const detail = cell("min", r.min) + cell("max", r.max)
         + cell("Q1", r.q1) + cell("Q3", r.q3)
         + cell("median", r.median) + cell("mean", r.mean.toFixed(2))
         + cell("SD", r.stdev.toFixed(2)) + cell("voxels", r.voxels.toLocaleString());
       body += `
-        <div class="stat-row" role="button" tabindex="0" data-label="${r.label}" style="cursor:pointer">
+        <div class="stat-row${isIso ? " is-isolated" : ""}" data-label="${r.label}" data-name="${escapeHtml(r.name.toLowerCase())}">
           <div class="stat-line">
-            <span class="stat-name">${escapeHtml(r.name)}</span>
-            <span class="stat-track">${bar}</span>
-            ${val}
-            <button type="button" class="stat-iso" title="Show only this region in the viewer">isolate</button>
+            <button type="button" class="stat-trigger" aria-expanded="false">
+              <span class="stat-chevron" aria-hidden="true"></span>
+              <span class="stat-swatch" style="background:${colorOf(r)}" aria-hidden="true"></span>
+              <span class="stat-name">${escapeHtml(r.name)}</span>
+              <span class="stat-track" aria-hidden="true">${bar}</span>
+              ${val}
+            </button>
+            <button type="button" class="stat-iso${isIso ? " active" : ""}" aria-pressed="${isIso}" aria-label="Isolate ${escapeHtml(r.name)}">${isIso ? "isolated" : "isolate"}</button>
           </div>
-          <div class="stat-detail" style="display:none">${detail}</div>
+          <div class="stat-detail" hidden>
+            <div class="stat-detail-meta">
+              <span class="stat-detail-fullname">${escapeHtml(r.name)}</span>
+              <span class="stat-detail-badges">
+                <span class="stat-id-chip">ID ${r.label}</span>
+                ${fsId ? `<span class="save-badge">FS ${fsId}</span>` : ""}
+              </span>
+            </div>
+            <div class="stat-detail-grid">${detail}</div>
+          </div>
         </div>`;
     }
+    const regionWord = rows.length === 1 ? "region" : "regions";
+    const searchHtml = rows.length > 8
+      ? `<search class="stat-search">
+           <input type="search" id="statsFilterInput" class="stat-filter" placeholder="Filter regions…" aria-label="Filter regions" autocorrect="off" autocapitalize="none" spellcheck="false">
+         </search>`
+      : "";
     return `
-      <style>
-        /* niivue.css sets a global "div{display:table-row}"; force block/flex on our
-           plain container divs so width/1fr track sizing works. */
-        /* Cap the dialog and let ONLY the region list scroll, so the header,
-           toggle, Download and Close stay pinned/visible with long atlases. */
-        #appDialog[open]{max-height:88vh;display:flex;flex-direction:column;box-sizing:border-box}
-        #appDialog[open] h3{flex:0 0 auto}
-        #appDialog[open] #dialogCloseBtn{flex:0 0 auto;align-self:center;width:auto;float:none}
-        #dialogMessage{display:flex;flex-direction:column;flex:1 1 auto;min-height:0}
-        #statsPanel{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;width:440px;max-width:100%;box-sizing:border-box}
-        #statsPanel .stat-head{flex:0 0 auto;display:flex;justify-content:space-between;align-items:baseline;margin:0 0 8px}
-        #statsPanel .stat-total{opacity:.7;font-size:.95em}
-        #statsPanel .stat-toggle{flex:0 0 auto;align-self:flex-start;display:inline-flex;border:1px solid #444;border-radius:8px;overflow:hidden;margin:0 0 10px}
-        #statsPanel .stat-toggle button{background:transparent;color:inherit;border:0;padding:6px 16px;cursor:pointer;font:inherit;float:none;margin:0}
-        #statsPanel .stat-toggle button.active{background:#3a3a3a;font-weight:600}
-        #statsPanel #statsRows{flex:1 1 auto;min-height:0;overflow-y:auto;display:block}
-        #statsPanel .stat-row{display:block;padding:6px 4px;border-radius:6px}
-        #statsPanel .stat-row:hover{background:rgba(255,255,255,.05)}
-        #statsPanel .stat-line{display:grid;grid-template-columns:120px 1fr 60px auto;align-items:center;gap:10px}
-        #statsPanel .stat-iso{background:transparent;color:inherit;border:1px solid #555;border-radius:6px;padding:2px 8px;font:inherit;font-size:.78em;opacity:.55;cursor:pointer;float:none;margin:0}
-        #statsPanel .stat-row:hover .stat-iso{opacity:.9}
-        #statsPanel .stat-iso:hover{background:#3a3a3a;border-color:#777}
-        #statsPanel .stat-name{text-align:right;opacity:.85;font-size:.9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-        #statsPanel .stat-track{background:rgba(255,255,255,.06);border-radius:5px;height:18px;overflow:hidden;min-width:0}
-        #statsPanel .stat-bar{display:block;height:100%;border-radius:5px;min-width:3px}
-        #statsPanel .stat-val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
-        #statsPanel .stat-detail{margin:4px 0 6px 0;display:grid;grid-template-rows:auto auto;grid-auto-flow:column;grid-auto-columns:1fr;gap:2px 14px;font-size:.78em;font-variant-numeric:tabular-nums}
-        #statsPanel .stat-detail>div{display:flex;justify-content:space-between;gap:6px;white-space:nowrap}
-        #statsPanel .stat-detail .k{opacity:.55}
-        #statsPanel .stat-detail .v{font-weight:600}
-        #statsPanel .stat-actions{flex:0 0 auto;display:block;margin-top:12px;border-top:1px solid #444;padding-top:10px;text-align:right}
-      </style>
       <div id="statsPanel">
-        <div class="stat-head">
-          <span class="stat-total" id="statsUnitLabel">total ${fmtCm3(totalMm3)} cm³</span>
+        <div class="stat-toolbar">
+          <div class="stat-toggle" role="group" aria-label="Volume display unit">
+            <button type="button" data-mode="cm3" class="active" aria-pressed="true">cm³</button>
+            <button type="button" data-mode="pct" aria-pressed="false">% of total</button>
+          </div>
+          <span class="stat-total" id="statsUnitLabel">${rows.length} ${regionWord} &middot; ${fmtCm3(totalMm3)} cm³</span>
+          ${searchHtml}
         </div>
-        <div class="stat-toggle">
-          <button type="button" data-mode="cm3" class="active">cm³</button>
-          <button type="button" data-mode="pct">% of total</button>
+        <div id="statsRows">
+          ${body}
+          <p id="statsEmpty" class="stat-empty" hidden>No matching regions</p>
         </div>
-        <div id="statsRows">${body}</div>
-        <div class="stat-actions">
-          <button type="button" id="statsDownloadBtn">Download CSV</button>
+        <div class="stat-footer">
+          <span class="stat-footer-hint">Select a row for intensity stats &middot; Isolate solos in 3D</span>
+          <button type="button" id="statsDownloadBtn" class="stat-csv-btn">
+            ${SAVE_ICONS.arrow}
+            <span>Download CSV</span>
+          </button>
         </div>
       </div>`;
   }
 
   saveStatsBtn.onclick = function () {
     if (nv1.volumes.length < 2) {
-      window.alert("No segmentation to measure (run a model first).");
+      showModal("Region volumes", "<p>No segmentation to measure — run a model first.</p>");
       return;
     }
     // Each distinct float would become its own label (and 256-bin histogram).
     if (nv1.volumes[1].img instanceof Float32Array) {
-      window.alert("Stats need a label segmentation, not probability maps.");
+      showModal("Region volumes", "<p>Region statistics require a discrete label segmentation, not continuous probability maps.</p>");
       return;
     }
     const imgArr = nv1.volumes[0].img;   // conformed input intensities
     // Use pristine labels so region stats stay whole-brain even while isolated.
     const labelArr = originalSegImg || nv1.volumes[1].img; // segmentation labels
     if (!imgArr || !labelArr || imgArr.length !== labelArr.length) {
-      window.alert("Input and segmentation grids do not match.");
+      showModal("Region volumes", "<p>Input and segmentation grids do not match.</p>");
       return;
     }
     const pd = nv1.volumes[0].hdr.pixDims || [];
@@ -1387,49 +1500,93 @@ async function main() {
 
     let rows = computeLabelStats(imgArr, labelArr, voxelVolMm3);
     if (rows.length === 0) {
-      window.alert("No non-background labels found in the segmentation.");
+      showModal("Region volumes", "<p>No non-background labels found in the segmentation.</p>");
       return;
     }
     // Largest region first, matching the reference panel layout.
     rows = rows.slice().sort((a, b) => b.volume_mm3 - a.volume_mm3);
     const totalMm3 = rows.reduce((s, r) => s + r.volume_mm3, 0);
+    const fsLut = lastModelEntry && lastModelEntry.type !== "Brain_Extraction"
+      ? buildFreeSurferLut(lastSegLabelNames)
+      : null;
 
-    showModal("Region volumes", buildStatsPanelHtml(rows, totalMm3));
+    showModal("Region volumes", buildStatsPanelHtml(rows, totalMm3, fsLut), { hideClose: true, statsMode: true });
 
     // Wire up interactivity (innerHTML strips <script>, so attach handlers here).
     const panel = document.getElementById("statsPanel");
     if (!panel) return;
 
-    panel.querySelectorAll(".stat-toggle button").forEach(btn => {
+    let currentMode = "cm3";
+    let visibleCount = rows.length;
+    const updateUnitSummary = () => {
+      const unitEl = document.getElementById("statsUnitLabel");
+      if (!unitEl) return;
+      const countText = visibleCount === rows.length
+        ? `${rows.length} ${rows.length === 1 ? "region" : "regions"}`
+        : `${visibleCount} of ${rows.length} regions`;
+      const totalText = currentMode === "pct" ? "100% of volume" : `${fmtCm3(totalMm3)} cm³`;
+      unitEl.innerHTML = `${countText} &middot; ${totalText}`;
+    };
+
+    panel.querySelectorAll(".stat-toggle button").forEach((btn) => {
       btn.onclick = () => {
-        const mode = btn.dataset.mode;
-        panel.querySelectorAll(".stat-toggle button").forEach(b => b.classList.toggle("active", b === btn));
-        document.getElementById("statsUnitLabel").textContent =
-          mode === "pct" ? "100% of segmented volume" : `total ${fmtCm3(totalMm3)} cm³`;
-        panel.querySelectorAll(".stat-row").forEach(row => {
+        currentMode = btn.dataset.mode;
+        panel.querySelectorAll(".stat-toggle button").forEach((b) => {
+          const active = b === btn;
+          b.classList.toggle("active", active);
+          b.setAttribute("aria-pressed", String(active));
+        });
+        updateUnitSummary();
+        panel.querySelectorAll(".stat-row").forEach((row) => {
           const val = row.querySelector(".stat-val");
           const bar = row.querySelector(".stat-bar");
-          val.textContent = mode === "pct" ? val.dataset.pct : val.dataset.cm3;
-          bar.style.width = (mode === "pct" ? bar.dataset.wPct : bar.dataset.wAbs) + "%";
+          val.textContent = currentMode === "pct" ? val.dataset.pct : val.dataset.cm3;
+          bar.style.width = (currentMode === "pct" ? bar.dataset.wPct : bar.dataset.wAbs) + "%";
         });
       };
     });
 
-    panel.querySelectorAll(".stat-row").forEach(row => {
-      const toggle = () => {
-        const d = row.querySelector(".stat-detail");
-        d.style.display = d.style.display === "none" ? "grid" : "none";
+    const filterInput = document.getElementById("statsFilterInput");
+    const emptyEl = document.getElementById("statsEmpty");
+    if (filterInput) {
+      const applyFilter = () => {
+        const q = filterInput.value.trim().toLowerCase();
+        visibleCount = 0;
+        panel.querySelectorAll(".stat-row").forEach((row) => {
+          const match = !q || row.dataset.name.includes(q) || row.dataset.label === q;
+          row.hidden = !match;
+          if (match) visibleCount++;
+        });
+        if (emptyEl) emptyEl.hidden = visibleCount > 0;
+        updateUnitSummary();
       };
-      row.onclick = toggle;
-      row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } };
+      filterInput.oninput = applyFilter;
+      // Clear a non-empty filter query on Escape without closing the modal dialog.
+      filterInput.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && filterInput.value !== "") {
+          e.preventDefault();
+          e.stopPropagation();
+          filterInput.value = "";
+          applyFilter();
+        }
+      });
+    }
+
+    panel.querySelectorAll(".stat-trigger").forEach((trigger) => {
+      trigger.onclick = () => {
+        const row = trigger.closest(".stat-row");
+        const detail = row.querySelector(".stat-detail");
+        const open = detail.hidden;
+        detail.hidden = !open;
+        row.classList.toggle("is-expanded", open);
+        trigger.setAttribute("aria-expanded", String(open));
+      };
     });
 
     // Per-row "isolate": show only that region in the viewer and close the
-    // dialog so it's visible. stopPropagation so the row's detail toggle
-    // doesn't also fire.
-    panel.querySelectorAll(".stat-iso").forEach(btn => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
+    // dialog so it's visible.
+    panel.querySelectorAll(".stat-iso").forEach((btn) => {
+      btn.onclick = () => {
         const labelVal = parseInt(btn.closest(".stat-row").dataset.label, 10);
         if (!Number.isNaN(labelVal)) isolateLabel(labelVal);
         const dlg = document.getElementById("appDialog");
@@ -1437,7 +1594,7 @@ async function main() {
       };
     });
 
-    document.getElementById("statsDownloadBtn").onclick = () => downloadCsv(rows);
+    document.getElementById("statsDownloadBtn").onclick = () => downloadCsv(rows, fsLut);
   };
 
   function doLoadImage() {
@@ -1889,6 +2046,7 @@ function showModal(title, message, opts = {}) {
   closeBtn.style.display = opts.hideClose ? "none" : "";
   closeBtn.onclick = () => dialog.close();
   dialog.classList.toggle("dialog-save", !!opts.saveMode);
+  dialog.classList.toggle("dialog-stats", !!opts.statsMode);
   const xBtn = document.getElementById("dialogXBtn");
   if (xBtn) xBtn.onclick = () => dialog.close();
   dialog.showModal();

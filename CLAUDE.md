@@ -13,10 +13,11 @@ Guidance for AI sessions working on this repo: browser MRI segmentation app (Vit
 - `inference-webgl2.js` — thin wrapper that spawns `brainchop-webgl2-worker.js` and normalizes its result to resolve/reject.
 - `brainchop-webgl2-worker.js` — native WebGL2 path: raw GLSL via `webgl2_runners/` (descriptors, kernels, weights, MeshNet GL driver with RGBA8 quantized & RGBA16F paths, probability postprocess), pure typed-array `tensor-utils.js` (no `@tensorflow/tfjs`). Mirrors `inference-webgpu.js` pre/postprocessing exactly (load-bearing: same transpose convention as the safetensors export).
 - `tensor-utils.js` / `bwlabels.js` — pure typed-array normalization, 3D transpose, `Uint32Array(256)` single-pass histograms (`countUniqueLabelsU8`), `Uint8Array`-native `BWLabeler` (`filter18ClassFromLabels`, linear component selection & neighbor voting).
+- `freesurfer-labels.js` — `FreeSurferColorLUT.txt` label-ID lookup (`buildFreeSurferLut`, `remapLabelsToFreeSurfer`) for Freeview-ready `DT_INT16` NIfTI export across 18-, 50-, and 104-class parcellation models.
 - `cat-lite.js` — CAT-lite partial-volume postprocess (`applyCatLitePartialVolume`, plus `isCatLite`/`runCatLite` shared by both backends), pure JS, used by both the WebGPU and native WebGL2 paths. WebGPU V4 computes CAT-lite separable 3D Gaussian prior smoothing on GPU before readback.
 - `webgpu_runners/`, `webgl2_runners/` — per-model GPU kernels (`meshnet_fast_v4_runner.js` V4 8-bit `dp4a` engine with 3-tier `Subgroups f16 -> Shared-mem f16 -> f32` + `LowMem128` `<= 8` storage bindings) & WebGL2 descriptors.
 - `public/models/` — model weights (`model.json`/`.safetensors`, colormaps). CAT-lite uses `model24chan18cls_gdice_prio`.
-- `tests/` — `*.mjs` node scripts (`cat-lite.mjs`, `cortical_relabel.mjs`, `perclass_largest_wm.mjs`, `webgl2-probability.mjs`, `mindgrab-bias.mjs`, `component-selection.mjs`, `model5-app-smoke.mjs`, `meshnet-v4-benchmark.mjs`, `*-int8-browser.mjs`, `webgl2_gate.mjs`, `webgpu_runner_bench.mjs`) plus `*.spec.cjs` playwright specs.
+- `tests/` — `*.mjs` node scripts (`cat-lite.mjs`, `cortical_relabel.mjs`, `perclass_largest_wm.mjs`, `freesurfer-labels.mjs`, `save-modal-browser.mjs`, `webgl2-probability.mjs`, `mindgrab-bias.mjs`, `component-selection.mjs`, `model5-app-smoke.mjs`, `meshnet-v4-benchmark.mjs`, `*-int8-browser.mjs`, `webgl2_gate.mjs`, `webgpu_runner_bench.mjs`) plus `*.spec.cjs` playwright specs.
 - `docs/model5_demo_speed_investigation.md` — non-inference bottleneck breakdown and before/after timings.
 
 ## Build / run / test
