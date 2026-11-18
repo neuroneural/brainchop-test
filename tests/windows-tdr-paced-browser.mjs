@@ -63,6 +63,11 @@ try {
     assert.equal(suite.catLite.maxDiffCsf, 0, 'CAT-lite CSF prior must be bit-identical in paced mode');
     assert.ok(suite.catLite.progressTicks >= 20, 'CAT-lite paced mode must emit smooth progress ticks');
     assert.ok(suite.catLite.monotonic, 'CAT-lite progress fractions must be monotonic');
+
+    assert.equal(suite.windowsFirefox.uniformMatShaderCount, 0, 'no V4 WGSL shader may declare matCxR inside var<uniform> (breaks Naga HLSL on Windows Firefox)');
+    assert.equal(suite.windowsFirefox.ffWin24Mode, 'LowMem128', 'Windows Firefox redacted adapterInfo + Intel WebGL renderer must auto-select LowMem128');
+    assert.equal(suite.windowsFirefox.diff24FfWinVsSingle128, 0, 'Windows Firefox 24ch LowMem128 paced output must be bit-identical to single');
+    assert.ok(suite.windowsFirefox.mgF16VsF32AgreePct >= 99.95, `MindGrab f16 vec4<u32> uniform must match f32 >=99.95%, got ${suite.windowsFirefox.mgF16VsF32AgreePct}%`);
     await winContext.close();
   }
 

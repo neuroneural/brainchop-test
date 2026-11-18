@@ -71,7 +71,13 @@ export function probeWebgl2(d, dims, existingGl = null, opts = null) {
 
     const renderer = describeRenderer(gl);
     const q8 = !!(d.quantize8Bit && d.norm === 'gn');
-    const preferRgba8 = /ANGLE\s*\([^)]*Intel/i.test(renderer) && /Direct3D/i.test(renderer) && !/Arc/i.test(renderer);
+    const isWindowsHost = typeof navigator !== 'undefined' && /Windows|Win32|Win64/i.test(
+      `${navigator.userAgentData?.platform || ''} ${navigator.platform || ''} ${navigator.userAgent || ''}`
+    );
+    const preferRgba8 = !/\bArc\b/i.test(renderer) && (
+      (/ANGLE\s*\([^)]*Intel/i.test(renderer) && /Direct3D/i.test(renderer)) ||
+      (isWindowsHost && /\bIntel\b/i.test(renderer))
+    );
     if (!reasons.length && opts?.deferRgba16fOnLazyD3D11 && preferRgba8 && !q8 && d.norm === 'gn') {
       const bytes = d.planes * nx * ny * nz * 16;
       return {
@@ -673,7 +679,11 @@ export function runMeshNetGL(o) {
       o.onLog?.(`[webgl2] layer 1 sample: ${s}`);
     }
 
-    const isD3D11 = /Direct3D/i.test(describeRenderer(gl));
+    const isD3D11 = /Direct3D/i.test(describeRenderer(gl)) || (
+      typeof navigator !== 'undefined' && /Windows|Win32|Win64/i.test(
+        `${navigator.userAgentData?.platform || ''} ${navigator.platform || ''} ${navigator.userAgent || ''}`
+      )
+    );
     for (let li = 1; li < nlayer; li++) {
       const vox2 = useVox2 && !!progs.convHidden2;
       const p = vox2 ? progs.convHidden2 : progs.convHidden;
