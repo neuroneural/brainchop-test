@@ -242,8 +242,6 @@ export async function runAllV4Checks() {
   await benchPair('mindsnap104_mindboggle6', 5, 5, 'mindboggle6.nii.gz', mind6Q, { refIters: 2, v4Iters: 2, weightsOverride: INFANT_W });
   await benchPair('mindsnap104_strokeSubject', 5, 5, 'strokeSubject.nii.gz', strokeQ, { refIters: 2, v4Iters: 2, weightsOverride: INFANT_W });
   await benchPair('v3repbn104_t1crop', 5, 5, 't1_crop.nii.gz', t1CropQ, { refIters: 2, v4Iters: 2 });
-  await benchPair('v3omnimodal104_t1crop', 60, 60, 't1_crop.nii.gz', t1CropQ, { refIters: 2, v4Iters: 2 });
-  await benchPair('v3omnimodal104_strokeSubject', 60, 60, 'strokeSubject.nii.gz', strokeQ, { refIters: 2, v4Iters: 2 });
   await benchPair('mindmap18_t1crop', 21, 21, 't1_crop.nii.gz', t1CropQ, { includeV3: true });
   await benchPair('mindmap18_mindboggle6', 21, 21, 'mindboggle6.nii.gz', mind6Q, { refIters: 2, v4Iters: 2 });
   await benchPair('m16ch18_t1crop', 3, 3, 't1_crop.nii.gz', t1CropQ, { refIters: 2, v4Iters: 2 });

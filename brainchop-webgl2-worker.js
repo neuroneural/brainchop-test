@@ -92,7 +92,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   const raw = await stRes.arrayBuffer();
   const tensors = parseSafetensors(raw);
   const desc = applyClassifierBias(describeSafetensors(tensors), modelEntry.classifierBias);
-  const d = deriveDescriptor(desc, {
+  let d = deriveDescriptor(desc, {
     nx: dim, ny: dim, nz: dim,
     activation: entry.activation,
     dilations: entry.dilations,
@@ -100,13 +100,23 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   });
 
   // ---- probe before doing any real work --------------------------------
-  const probe = probeWebgl2(d, dims);
+  let probe = probeWebgl2(d, dims);
+  if (!probe.supported && !d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
+    console.warn(`[webgl2-native] RGBA16F probe declined (${probe.reasons.join('; ')}); falling back to RGBA8 quantized activations.`);
+    d = deriveDescriptor(desc, {
+      nx: dim, ny: dim, nz: dim,
+      activation: entry.activation,
+      dilations: entry.dilations,
+      quantize8Bit: true,
+    });
+    probe = probeWebgl2(d, dims);
+  }
   console.log(`[webgl2-native] ${entry.name}: ${d.chan}ch P=${d.planes} ${d.nclass}cls ` +
-    `norm=${d.norm} affine=${d.affine} act=${d.activation} | ` +
+    `norm=${d.norm} affine=${d.affine} act=${d.activation} q8=${!!d.quantize8Bit} | ` +
     `${Math.round(probe.activationBytes / 1048576)} MB activations | ${probe.renderer}`);
   if (!probe.supported) { refuse(probe.reasons.join('; ')); return; }
 
-  const packed = packWeights(desc, d);
+  let packed = packWeights(desc, d);
   const Setup_t = ((performance.now() - setupStart) / 1000).toFixed(4);
 
   // ---- preprocessing, identical to inference-webgpu.js ------------------
@@ -132,16 +142,42 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   // ---- inference -------------------------------------------------------
   callbackUI('Running inference...', 0.2);
   const t0 = performance.now();
-  const out = runMeshNetGL({
-    descriptor: d,
-    packed: packed.data,
-    offsets: packed.offsets,
-    input,
-    probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
-    vox2: probe.vox2,
-    onProgress: (frac, msg) => callbackUI(msg, 0.2 + 0.7 * frac),
-    onLog: (msg) => console.log(msg),
-  });
+  let out;
+  try {
+    out = runMeshNetGL({
+      descriptor: d,
+      packed: packed.data,
+      offsets: packed.offsets,
+      input,
+      probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
+      vox2: probe.vox2,
+      onProgress: (frac, msg) => callbackUI(msg, 0.2 + 0.7 * frac),
+      onLog: (msg) => console.log(msg),
+    });
+  } catch (err) {
+    if (!d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
+      console.warn('[webgl2-native] RGBA16F execution failed; retrying once with RGBA8 quantized activations.', err);
+      d = deriveDescriptor(desc, {
+        nx: dim, ny: dim, nz: dim,
+        activation: entry.activation,
+        dilations: entry.dilations,
+        quantize8Bit: true,
+      });
+      packed = packWeights(desc, d);
+      out = runMeshNetGL({
+        descriptor: d,
+        packed: packed.data,
+        offsets: packed.offsets,
+        input,
+        probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
+        vox2: probe.vox2,
+        onProgress: (frac, msg) => callbackUI(msg, 0.2 + 0.7 * frac),
+        onLog: (msg) => console.log(msg),
+      });
+    } else {
+      throw err;
+    }
+  }
   const Inference_t = ((performance.now() - t0) / 1000).toFixed(4);
   console.log(`[webgl2-native] ---- Inference Time: ${Inference_t} s ---- (${out.path})`);
   input = null;
