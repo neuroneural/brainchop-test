@@ -64,21 +64,55 @@ function getV4ExecOverride(modelEntry) {
   return '';
 }
 
+function probeGlRendererHint(device) {
+  if (!device) return '';
+  if (typeof device.__glRenderer === 'string') return device.__glRenderer;
+  let renderer = '';
+  try {
+    const isFirefox = typeof navigator !== 'undefined' && /Firefox/i.test(navigator.userAgent || '');
+    const canvas = typeof OffscreenCanvas !== 'undefined'
+      ? new OffscreenCanvas(1, 1)
+      : (typeof document !== 'undefined' ? document.createElement('canvas') : null);
+    const gl = canvas?.getContext?.('webgl2', { powerPreference: 'high-performance' });
+    if (gl) {
+      if (isFirefox) {
+        renderer = String(gl.getParameter(gl.RENDERER) || '');
+      } else {
+        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        renderer = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || '');
+      }
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+  } catch { /* ignore fallback probe failure */ }
+  device.__glRenderer = renderer;
+  return renderer;
+}
+
 function detectV4Platform(device) {
   const adInfo = device?.__adapterInfo || device?.adapterInfo || {};
   const vendor = String(adInfo.vendor || '').toLowerCase();
   const arch = String(adInfo.architecture || '').toLowerCase();
-  const desc = `${adInfo.device || ''} ${adInfo.description || ''}`;
   const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
   const plat = (typeof navigator !== 'undefined' && (navigator.userAgentData?.platform || navigator.platform || '')) || '';
   const isApple = vendor === 'apple' ||
     (/Mac|iPhone|iPad|iPod/i.test(`${plat} ${ua}`) && !['intel', 'amd', 'nvidia', 'microsoft'].includes(vendor));
   const isWindows = !isApple && (/Win/i.test(plat) || /Windows/i.test(ua));
-  const isWindowsSharedIgpu = isWindows && (
-    vendor === 'microsoft' ||
-    (vendor === 'intel' && (/^gen-(9|11|12lp)/i.test(arch) || /UHD Graphics|HD Graphics|Iris\(R\)\s*(Plus|Xe)|Pentium|Celeron/i.test(desc)))
+  // Firefox redacts GPUAdapterInfo strings to ""; consult WebGL2 RENDERER on Windows
+  // so shared-RAM Intel UHD/HD/Iris iGPUs still select the 678 MiB LowMem128 workspace.
+  const glRenderer = isWindows && !vendor ? probeGlRendererHint(device) : String(device?.__glRenderer || '');
+  const desc = `${adInfo.device || ''} ${adInfo.description || ''} ${glRenderer}`;
+  const effVendor = vendor || (
+    /\bintel\b/i.test(glRenderer) ? 'intel' :
+    /\bmicrosoft\b|\bbasic render\b/i.test(glRenderer) ? 'microsoft' : ''
   );
-  return { vendor, arch, desc, isApple, isWindows, isWindowsSharedIgpu };
+  const isWindowsSharedIgpu = isWindows && (
+    effVendor === 'microsoft' ||
+    (effVendor === 'intel' && !/\bArc\b/i.test(desc) && (
+      /^gen-(9|11|12lp)/i.test(arch) ||
+      /(?:UHD|HD)\s+Graphics|Iris(?:\(R\))?\s*(?:Plus|Xe)|Pentium|Celeron/i.test(desc)
+    ))
+  );
+  return { vendor: effVendor, arch, desc, isApple, isWindows, isWindowsSharedIgpu };
 }
 
 function resolveV4InitialExecMode(device, modelEntry) {
@@ -2748,12 +2782,12 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
             let wp0 = w_eff_u[wbu + ${hp}u];
             let wp1 = w_eff_u[wbu + ${hp1 + hp}u];
             let wp2 = w_eff_u[wbu + ${hp2 + hp}u];
-            let w0a = wp0[0];
-            let w0b = wp0[1];
-            let w1a = wp1[0];
-            let w1b = wp1[1];
-            let w2a = wp2[0];
-            let w2b = wp2[1];
+            let w0a = u4_lo(wp0);
+            let w0b = u4_hi(wp0);
+            let w1a = u4_lo(wp1);
+            let w1b = u4_hi(wp1);
+            let w2a = u4_lo(wp2);
+            let w2b = u4_hi(wp2);
             a_${o}     = fma(vn, vec4<f16>(w0a.x), fma(vc, vec4<f16>(w1a.x), fma(vp, vec4<f16>(w2a.x), a_${o})));
             a_${o + 1} = fma(vn, vec4<f16>(w0a.y), fma(vc, vec4<f16>(w1a.y), fma(vp, vec4<f16>(w2a.y), a_${o + 1})));
             a_${o + 2} = fma(vn, vec4<f16>(w0a.z), fma(vc, vec4<f16>(w1a.z), fma(vp, vec4<f16>(w2a.z), a_${o + 2})));
@@ -2789,8 +2823,8 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
           const sw = ['x', 'y', 'z', 'w'][c & 3];
           if (useUniformWeff) {
             const uVecIdx = (biasEffVec4Off + g) >>> 1;
-            const colIdx = (biasEffVec4Off + g) & 1;
-            return `  var a_${c} = ${V4}(w_eff_u[${uVecIdx}u][${colIdx}].${sw});\n`;
+            const ufn = ((biasEffVec4Off + g) & 1) ? 'u4_hi' : 'u4_lo';
+            return `  var a_${c} = ${V4}(${ufn}(w_eff_u[${uVecIdx}u]).${sw});\n`;
           }
           return `  var a_${c} = ${V4}(w_eff[${biasEffVec4Off + g}u].${sw});\n`;
         }
@@ -2916,8 +2950,18 @@ ${emitEpilogue({
       : emitConvEntry('main', 0, cs, false) +
         emitConvEntry('main_ext', 0, cs, true);
 
+    // Pack paired vec4<f16> weights as vec4<u32> (never mat2x4<f16>): Naga's HLSL
+    // backend emits `cbuffer { row_major half2x4 w_eff_u[N]; }` without decomposing
+    // 8-byte half4 rows, so DXC aligns every row to 16 bytes (32-byte stride vs WGSL's
+    // 16-byte stride) and misreads/zeros half the convolution taps on Windows Firefox.
     const wEffDecl = useUniformWeff
-      ? `@group(0) @binding(6) var<uniform> w_eff_u : array<mat2x4<f16>, ${Math.ceil(totalWEffVec4s / 2)}>;`
+      ? `fn u4_lo(u : vec4<u32>) -> vec4<f16> {
+  return vec4<f16>(vec2<f16>(unpack2x16float(u.x)), vec2<f16>(unpack2x16float(u.y)));
+}
+fn u4_hi(u : vec4<u32>) -> vec4<f16> {
+  return vec4<f16>(vec2<f16>(unpack2x16float(u.z)), vec2<f16>(unpack2x16float(u.w)));
+}
+@group(0) @binding(6) var<uniform> w_eff_u : array<vec4<u32>, ${Math.ceil(totalWEffVec4s / 2)}>;`
       : `@group(0) @binding(6) var<storage, read> w_eff : array<${V4}>;`;
 
     const convParamsDecl = chunkableStd
@@ -3700,12 +3744,12 @@ ${rep(4, (q) => emitNormQuarter(q, true))}
             let wp0 = w_eff_u[wbu + ${hp}u];
             let wp1 = w_eff_u[wbu + ${hp1 + hp}u];
             let wp2 = w_eff_u[wbu + ${hp2 + hp}u];
-            let w0a = wp0[0];
-            let w0b = wp0[1];
-            let w1a = wp1[0];
-            let w1b = wp1[1];
-            let w2a = wp2[0];
-            let w2b = wp2[1];
+            let w0a = u4_lo(wp0);
+            let w0b = u4_hi(wp0);
+            let w1a = u4_lo(wp1);
+            let w1b = u4_hi(wp1);
+            let w2a = u4_lo(wp2);
+            let w2b = u4_hi(wp2);
             a_${o}     = fma(vn, vec4<f16>(w0a.x), fma(vc, vec4<f16>(w1a.x), fma(vp, vec4<f16>(w2a.x), a_${o})));
             a_${o + 1} = fma(vn, vec4<f16>(w0a.y), fma(vc, vec4<f16>(w1a.y), fma(vp, vec4<f16>(w2a.y), a_${o + 1})));
             a_${o + 2} = fma(vn, vec4<f16>(w0a.z), fma(vc, vec4<f16>(w1a.z), fma(vp, vec4<f16>(w2a.z), a_${o + 2})));
@@ -3760,8 +3804,8 @@ ${emitFmas(cStart, cEnd)}
           const sw = ['x', 'y', 'z', 'w'][c & 3];
           if (useUniformWeff) {
             const uVecIdx = (biasEffVec4Off + g) >>> 1;
-            const colIdx = (biasEffVec4Off + g) & 1;
-            return `  var a_${c} = ${V4}(w_eff_u[${uVecIdx}u][${colIdx}].${sw});\n`;
+            const ufn = ((biasEffVec4Off + g) & 1) ? 'u4_hi' : 'u4_lo';
+            return `  var a_${c} = ${V4}(${ufn}(w_eff_u[${uVecIdx}u]).${sw});\n`;
           }
           return `  var a_${c} = ${V4}(w_eff[${biasEffVec4Off + g}u].${sw});\n`;
         }
@@ -3859,8 +3903,18 @@ ${emitEpilogue128({
         emitConvEntry('main_ext', 0, cs, 'ext') +
         emitConvEntry('main_bg', 0, cs, 'bg');
 
+    // Pack paired vec4<f16> weights as vec4<u32> (never mat2x4<f16>): Naga's HLSL
+    // backend emits `cbuffer { row_major half2x4 w_eff_u[N]; }` without decomposing
+    // 8-byte half4 rows, so DXC aligns every row to 16 bytes (32-byte stride vs WGSL's
+    // 16-byte stride) and misreads/zeros half the convolution taps on Windows Firefox.
     const wEffDecl = useUniformWeff
-      ? `@group(0) @binding(6) var<uniform> w_eff_u : array<mat2x4<f16>, ${Math.ceil(totalWEffVec4s / 2)}>;`
+      ? `fn u4_lo(u : vec4<u32>) -> vec4<f16> {
+  return vec4<f16>(vec2<f16>(unpack2x16float(u.x)), vec2<f16>(unpack2x16float(u.y)));
+}
+fn u4_hi(u : vec4<u32>) -> vec4<f16> {
+  return vec4<f16>(vec2<f16>(unpack2x16float(u.z)), vec2<f16>(unpack2x16float(u.w)));
+}
+@group(0) @binding(6) var<uniform> w_eff_u : array<vec4<u32>, ${Math.ceil(totalWEffVec4s / 2)}>;`
       : `@group(0) @binding(6) var<storage, read> w_eff : array<${V4}>;`;
 
     return `${f16Enable}${sgEnable}

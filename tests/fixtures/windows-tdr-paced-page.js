@@ -26,6 +26,12 @@ export async function runWindowsPacedSuite() {
   const device = await createDevice({ disableSubgroups: true });
   // Override Apple vendor in Part 1 so Windows/Linux platform logic is exercised directly
   device.__adapterInfo = { vendor: 'nvidia', architecture: 'ada', description: 'Simulated Windows GPU' };
+  const capturedWgsl = [];
+  const origCreateShaderModule = device.createShaderModule.bind(device);
+  device.createShaderModule = (desc) => {
+    if (desc?.code) capturedWgsl.push(String(desc.code));
+    return origCreateShaderModule(desc);
+  };
   const results = {};
 
   try {
@@ -170,6 +176,66 @@ export async function runWindowsPacedSuite() {
       progressTicks: progProb.length,
       monotonic: progProb.every((v, i) => i === 0 || v >= progProb[i - 1] - 1e-9),
     };
+
+    // 4. Windows Firefox regression guard:
+    //    (a) Intercept every WGSL shader compiled for Std + LowMem128 across GroupNorm
+    //        and MindGrab (norm='none') and assert zero matrix types in `var<uniform>`
+    //        (which Naga's HLSL backend emits as `row_major half2x4` with 32B row-padded stride).
+    //    (b) Verify Firefox's redacted GPUAdapterInfo (`vendor: ''`) + sanitized Windows
+    //        WebGL2 RENDERER (`Intel(R) HD Graphics 400, or similar`) still triggers LowMem128.
+    const origAd = device.__adapterInfo;
+    const origGl = device.__glRenderer;
+    try {
+      const entryMg = resolveModelEntry(inferenceModelsList.find((m) => m.id === 2), true);
+      const wMg = new Uint8Array(await (await fetch('/models/mindgrab/model.safetensors')).arrayBuffer());
+
+      const execMgRef = await v4Runner.setupNet(device, wMg, null, {
+        ...entryMg,
+        disableSubgroups: true,
+        disableF16: true,
+        webgpuExecMode: 'single',
+      });
+      const [outMgF32] = await execMgRef(input);
+      execMgRef.dispose();
+
+      // Simulate Windows Firefox (empty adapterInfo strings + sanitized WebGL2 RENDERER)
+      device.__adapterInfo = { vendor: '', architecture: '', device: '', description: '' };
+      device.__glRenderer = 'Intel(R) HD Graphics 400, or similar';
+
+      const exec24FfWin = await v4Runner.setupNet(device, w24, null, {
+        ...entry24,
+        disableSubgroups: true,
+        webgpuExecMode: 'paced',
+      });
+      const ffWinCone = exec24FfWin.__coneInfo?.() || null;
+      const [out24FfWin] = await exec24FfWin(input);
+      exec24FfWin.dispose();
+
+      const execMgFfWin = await v4Runner.setupNet(device, wMg, null, {
+        ...entryMg,
+        disableSubgroups: true,
+        forceLowMem128: true,
+        webgpuExecMode: 'paced',
+      });
+      const [outMgFfWin] = await execMgFfWin(input);
+      execMgFfWin.dispose();
+
+      const uniformMatDecls = capturedWgsl.filter((code) => /var<\s*uniform\s*>[^;]*\bmat\d+x\d+/s.test(code));
+      let mgAgree = 0;
+      for (let i = 0; i < outMgFfWin.length; i++) {
+        if (outMgFfWin[i] === outMgF32[i]) mgAgree++;
+      }
+      results.windowsFirefox = {
+        compiledShadersChecked: capturedWgsl.length,
+        uniformMatShaderCount: uniformMatDecls.length,
+        ffWin24Mode: ffWinCone?.mode || 'Std',
+        diff24FfWinVsSingle128: countDiffs(out24Single128, out24FfWin),
+        mgF16VsF32AgreePct: (mgAgree / outMgFfWin.length) * 100,
+      };
+    } finally {
+      device.__adapterInfo = origAd;
+      device.__glRenderer = origGl;
+    }
 
     const oom = await device.popErrorScope();
     const val = await device.popErrorScope();

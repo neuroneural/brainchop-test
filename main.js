@@ -179,7 +179,7 @@ const ENABLE_NATIVE_WEBGL2 = true;
  * Detects WebGPU support and initializes the device.
  * Provides detailed diagnostics for troubleshooting.
  */
-async function initializeBackend() {
+async function initializeBackend(viewerGl = null) {
   const diagnostics = {
     secureContext: window.isSecureContext,
     navigatorGpuExists: 'gpu' in navigator,
@@ -247,6 +247,18 @@ async function initializeBackend() {
 
         const createdDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
         createdDevice.__adapterInfo = adapter.info || null;
+        if (viewerGl && typeof viewerGl.getParameter === "function") {
+          try {
+            if (/Firefox/i.test(navigator.userAgent || "")) {
+              createdDevice.__glRenderer = String(viewerGl.getParameter(viewerGl.RENDERER) || "");
+            } else {
+              const dbg = viewerGl.getExtension("WEBGL_debug_renderer_info");
+              createdDevice.__glRenderer = String(
+                (dbg ? viewerGl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : viewerGl.getParameter(viewerGl.RENDERER)) || ""
+              );
+            }
+          } catch { /* viewer may use WebGPU backend */ }
+        }
         createdDevice.__isLost = false;
         if (createdDevice.lost && typeof createdDevice.lost.then === "function") {
           createdDevice.lost.then((lossInfo) => {
@@ -886,7 +898,7 @@ async function main() {
       if (window.webgpuDiagnostics?.adapterObtained) {
         gpuDeviceLostRecoveries++;
         console.info(`[WebGPU] Re-initializing device after prior loss (attempt ${gpuDeviceLostRecoveries})...`);
-        await initializeBackend();
+        await initializeBackend(nv1.view?.gl);
       }
     }
     if (isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost && !skipWebGpu && modelEntry.webgpu_safetensor) {
@@ -1987,7 +1999,7 @@ async function main() {
   syncModelSelectTooltip();
   setPen(-1);
 
-  await initializeBackend();
+  await initializeBackend(nv1.view?.gl);
 
   // --- FIX IS HERE ---
   // Use URLSearchParams to correctly parse the query string.

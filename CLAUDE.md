@@ -68,6 +68,7 @@ Each entry in `inferenceModelsList` is a plain object read by `runInferenceChain
 - `npm test` currently fails at browser launch: @playwright/test 1.57.0 wants `chromium_headless_shell-1200`, and only 1194/1228 are in `~/Library/Caches/ms-playwright`. Run `npx playwright install chromium` to fix.
 - Even once installed, the bundled browsers do not expose WebGPU here; a test that needs it would have to use system Chrome (`channel: 'chrome'`, `--enable-unsafe-webgpu`). Nothing in `tests/` does — `webgl2_gate.mjs` drives bundled chromium/firefox for WebGL2 only.
 - CAT-lite needs WebGPU or native WebGL2 (`120–240 MiB` max storage buffer in Turbo mode; `~1.5 GiB` in FP16 mode).
+- **Never put `f16` matrices (e.g. `mat2x4<f16>`) inside WGSL `var<uniform>`**: Firefox on Windows uses `wgpu` + Naga's HLSL backend, which only decomposes `matCx2<f32>` (`naga/src/back/hlsl/writer.rs`) and emits raw `cbuffer { row_major half2x4 ... }` for `mat2x4<f16>`. DXC pads each 8-byte `half4` row to a 16-byte constant-buffer register (32-byte stride vs WGSL's 16-byte stride), corrupting/zeroing half of the weights. Always bind packed `f16` uniform arrays as `array<vec4<u32>, N>` and unpack with `unpack2x16float`.
 
 ## NiiVue 1.0 migration notes
 
