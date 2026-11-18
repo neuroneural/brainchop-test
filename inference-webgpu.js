@@ -169,7 +169,7 @@ function castSafetensorsToF16(bytes, callbackUI) {
     out.fill(0x20, 8 + headerBytes.byteLength, 8 + headerBytes.byteLength + pad); // pad with spaces
     let p = 8 + headerBytes.byteLength + pad;
     for (const c of chunks) { out.set(c, p); p += c.byteLength; }
-    if (callbackUI) callbackUI('Cast fp32 master weights -> fp16 for WebGPU.', 0.05);
+    console.log('[WebGPU] Cast fp32 master weights -> fp16.');
     return out;
 }
 
@@ -394,7 +394,6 @@ async function setupNetwork(device, modelEntry, callbackUI) {
         } else if (!f16Supported && runnerExists(`${runnerName}_f32`)) {
             useF32 = true;
             console.log('[WebGPU] shader-f16 not supported on this device -> auto-selecting fp32 runner and weights.');
-            callbackUI('fp16 not supported - using fp32 WebGPU runner.', 0.05);
         }
 
         if (useF32) {
@@ -423,7 +422,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
     }
 
     const nextIsFastV4 = Boolean(nativeReason && isFastV4RunnerName(runnerName));
-    callbackUI('Loading model runner...', 0.1);
+    callbackUI('Loading model\u2026', 0.1);
 
     // Dispose previous model's GPU buffers before allocating the next model so peak GPU memory never doubles.
     if (cached) {
@@ -457,7 +456,7 @@ async function setupNetwork(device, modelEntry, callbackUI) {
                 gpuBytes: sumBufferBytes(nativeBuffers),
             };
             activeRunnerByDevice.set(device, entry);
-            callbackUI('Using hand-written WebGPU kernels.', 0.2);
+            console.log('[WebGPU-native] Using hand-written WebGPU kernels.');
             return { ...entry, cacheHit: false };
         } catch (error) {
             destroyBuffers(nativeBuffers);
@@ -544,7 +543,9 @@ async function setupNetwork(device, modelEntry, callbackUI) {
 }
 
 export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
-    callbackUI('Starting WebGPU inference...', 0);
+    const isProbabilityOutput = modelEntry.outputType === 'probability';
+    console.log('Starting WebGPU inference...');
+    callbackUI(isProbabilityOutput ? 'Starting tissue estimation\u2026' : 'Starting segmentation\u2026', 0);
     const statData = createStatData(modelEntry, ExecutionModes.WEBGPU);
     statData.isModelFullVol = true;
 
@@ -584,7 +585,6 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
                 const requiredMB = toMB(requiredStorageBuffer);
                 const msg = `[WebGPU] Device buffer limit (${limitMB} MB) is below the ${requiredMB} MB this model needs - using WebGL2 fallback.`;
                 console.warn(msg);
-                callbackUI(msg, 0.1);
                 throw new Error(msg); // propagates to main.js -> WebWorker fallback
             }
         }
@@ -605,7 +605,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         // --- PRE-PROCESSING: FULL VOLUME ---
         const prepStart = performance.now();
-        callbackUI('Preparing input data...', 0.25);
+        callbackUI('Preparing volume\u2026', 0.25);
 
         const CONFORMED_SHAPE = [256, 256, 256];
         const useGpuNativeInput =
@@ -653,16 +653,16 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             }
         }
         const Preprocess_t = ((performance.now() - prepStart) / 1000).toFixed(4);
-        callbackUI('Input data prepared (full volume).', 0.3);
+        callbackUI('', 0.3);
 
         // --- INFERENCE ---
-        callbackUI('Running inference...', 0.3);
+        callbackUI(isProbabilityOutput ? 'Estimating tissue maps\u2026' : 'Segmenting\u2026', 0.3);
         await yieldForPaint();
         const inferStart = performance.now();
         const onInferProgress = activeEntry.supportsGpuNativeIO
-            ? (frac, layerMsg) => {
+            ? (frac) => {
                 const clamped = Math.max(0, Math.min(1, Number(frac) || 0));
-                callbackUI(layerMsg || '', 0.3 + 0.6 * clamped);
+                callbackUI('', 0.3 + 0.6 * clamped);
             }
             : undefined;
         const ioOpts = (useGpuNativeInput || useGpuNativeOutput || onInferProgress)
@@ -719,15 +719,14 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         statData.GPU_Memory_MiB = Math.round(gpuMiB);
         statData.WebGPU_Kernels = activeEntry.execute.kernels || 'tinygrad';
         const gpuMemory = gpuMiB >= 1024 ? `${(gpuMiB / 1024).toFixed(2)} GiB` : `${Math.round(gpuMiB)} MiB`;
-        callbackUI(
-            `WebGPU inference took ${Inference_t}s (${statData.WebGPU_Kernels} kernels, ${gpuMemory} GPU memory).`,
-            0.9
+        console.log(
+            `WebGPU inference took ${Inference_t}s (${statData.WebGPU_Kernels} kernels, ${gpuMemory} GPU memory).`
         );
+        callbackUI('Finishing up\u2026', 0.9);
 
         // --- POST-PROCESSING ---
         console.log('Inference result shapes:', inferenceResultArray.map((result) => result?.length));
 
-        const isProbabilityOutput = modelEntry.outputType === 'probability';
         const outPerm = modelEntry.outputPermutation || (modelEntry.enableTranspose ? [2, 1, 0] : null);
 
         const postStart = performance.now();
@@ -737,7 +736,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             if (inferenceResultArray.length !== 3) {
                 throw new Error(`CAT-lite expected three tissue maps; received ${inferenceResultArray.length}.`);
             }
-            callbackUI('CAT-lite: fitting GM/WM/CSF and partial-volume classes...', 0.92);
+            callbackUI('Refining tissue fractions\u2026', 0.92);
             const toNative = useGpuNativeOutput
                 ? (prior) => prior
                 : (prior) => (outPerm
@@ -796,12 +795,15 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             `cache=${activeEntry.cacheHit ? 'hit' : 'miss'}`
         );
 
+        const elapsedText = `${Number(Inference_t).toFixed(1)} s`;
+        const finishLabel = isProbabilityOutput
+            ? `Tissue maps finished (${elapsedText})`
+            : `Segmentation finished (${elapsedText})`;
+        const isolateHint = !isProbabilityOutput && (modelEntry.numClasses ?? 0) > 2
+            ? ' \u00b7 Option/Alt-click a region to isolate'
+            : '';
         callbackUI(
-            modelEntry.modelName + (isProbabilityOutput
-                ? '<br>Probability map finished.'
-                : '<br>Segmentation finished.') +
-            ` Inference ${Number(Inference_t).toFixed(2)} s · ${gpuMemory} GPU memory` +
-            ` (${statData.WebGPU_Kernels} kernels).`,
+            `${modelEntry.modelName} \u00b7 ${finishLabel}${isolateHint}`,
             1,
             '',
             statData

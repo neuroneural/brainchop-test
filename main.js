@@ -841,6 +841,9 @@ async function main() {
     if (selectedModelIndex === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
 
+    const memstatusItem = document.getElementById("memstatusItem");
+    if (memstatusItem) memstatusItem.hidden = true;
+
     resetLabelIsolation(); // drop any active single-label state + HUD; callbackImg swaps overlays in one pass
     await ensureConformed();
 
@@ -1631,14 +1634,6 @@ async function main() {
     }
     syncModelUnderlayOpacityNoRender(modelEntry);
     await nv1.updateGLVolume();
-
-    // One-line discoverability hint (only for multi-label overlays where
-    // isolation applies). It sits in the location bar until the next mouse move.
-    if (segOverlay() && lastSegLabelNames && lastSegLabelNames.length > 2) {
-      const loc = document.getElementById("location");
-      if (loc) loc.innerHTML =
-        `<p style="font-size:14px;margin:0;opacity:.75;">Tip: Option/Alt-click a region to show only it — Esc restores all</p>`;
-    }
   }
 
   async function reportTelemetry(statData) {
@@ -1659,14 +1654,29 @@ async function main() {
     }
   }
 
+  function formatStatusSegments(message) {
+    const parts = String(message)
+      .split(" · ")
+      .map((part) => part.trim())
+      .filter((part) => part !== "");
+    if (parts.length <= 1) return escapeHtml(String(message));
+    return parts
+      .map((part, idx) =>
+        `<span class="loc-seg"${idx >= 2 ? ' style="opacity:.75"' : ""}>${escapeHtml(part)}</span>`)
+      .join('<span class="loc-sep">&middot;</span>');
+  }
+
   function callbackUI(message = "", progressFrac = -1, modalMessage = "", statData = []) {
     if (message) {
       console.log(message);
-      document.getElementById("location").innerHTML = message;
+      const locEl = document.getElementById("location");
+      if (locEl) locEl.innerHTML = formatStatusSegments(message);
     }
     if (isNaN(progressFrac)) {
-      memstatus.style.color = "red";
-      memstatus.innerHTML = "Memory Issue";
+      const memstatusItem = document.getElementById("memstatusItem");
+      if (memstatusItem) memstatusItem.hidden = false;
+      memstatus.style.color = "#ef4444";
+      memstatus.textContent = "Memory Issue";
     } else if (progressFrac >= 0) {
       modelProgress.value = progressFrac * modelProgress.max;
     }
