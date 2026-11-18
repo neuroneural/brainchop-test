@@ -34,7 +34,7 @@ import { buildSources, WTEX_W, LAB_W } from './kernels.js';
  * 256^3 model and 2.1 GiB for a 32-channel one. An honest "won't fit" is only
  * obtainable by trying, so this allocates one full plane and checks glGetError.
  */
-export function probeWebgl2(d, dims, existingGl = null) {
+export function probeWebgl2(d, dims, existingGl = null, opts = null) {
   const reasons = [];
   const [nx, ny, nz] = dims;
   let gl = existingGl, canvas = null;
@@ -69,6 +69,23 @@ export function probeWebgl2(d, dims, existingGl = null) {
     if (maxAttach < d.planes) reasons.push(`MAX_COLOR_ATTACHMENTS is ${maxAttach}, ${d.chan} channels need ${d.planes}`);
     if (maxTex < LAB_W) reasons.push(`MAX_TEXTURE_SIZE is ${maxTex}, the label texture needs ${LAB_W}`);
 
+    const renderer = describeRenderer(gl);
+    const q8 = !!(d.quantize8Bit && d.norm === 'gn');
+    const preferRgba8 = /ANGLE\s*\([^)]*Intel/i.test(renderer) && /Direct3D/i.test(renderer) && !/Arc/i.test(renderer);
+    if (!reasons.length && opts?.deferRgba16fOnLazyD3D11 && preferRgba8 && !q8 && d.norm === 'gn') {
+      const bytes = d.planes * nx * ny * nz * 16;
+      return {
+        supported: false,
+        preferRgba8: true,
+        reasons: ['ANGLE Direct3D11 Intel iGPU lazily commits RGBA16F 3D textures; preferring RGBA8 quantized activations'],
+        vox2: maxDraw >= 2 * d.planes && maxAttach >= 2 * d.planes,
+        renderer,
+        limits: { max3d, maxTex, maxDraw, maxAttach },
+        activationBytes: bytes,
+        allocates: false,
+      };
+    }
+
     // Allocate the REAL working set, not one plane.
     //
     // brainchopC's probe tries a single 128 MB texture, and this one used to copy
@@ -78,7 +95,6 @@ export function probeWebgl2(d, dims, existingGl = null) {
     // 32 need 2.0 GiB. Guessing from one plane would refuse those on principle or
     // admit them on hope. So allocate all 2*planes and free them.
     let allocates = false;
-    const q8 = !!(d.quantize8Bit && d.norm === 'gn');
     const probeTex = [];
     if (!reasons.length) {
       while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
@@ -101,9 +117,10 @@ export function probeWebgl2(d, dims, existingGl = null) {
     const bytes = d.planes * nx * ny * nz * (q8 ? 12 : 16);
     return {
       supported: reasons.length === 0,
+      preferRgba8,
       reasons,
       vox2: maxDraw >= 2 * d.planes && maxAttach >= 2 * d.planes,
-      renderer: describeRenderer(gl),
+      renderer,
       limits: { max3d, maxTex, maxDraw, maxAttach },
       activationBytes: bytes,
       allocates,
@@ -656,6 +673,7 @@ export function runMeshNetGL(o) {
       o.onLog?.(`[webgl2] layer 1 sample: ${s}`);
     }
 
+    const isD3D11 = /Direct3D/i.test(describeRenderer(gl));
     for (let li = 1; li < nlayer; li++) {
       const vox2 = useVox2 && !!progs.convHidden2;
       const p = vox2 ? progs.convHidden2 : progs.convHidden;
@@ -677,12 +695,14 @@ export function runMeshNetGL(o) {
           gl.bindFramebuffer(gl.FRAMEBUFFER, fboQ2[k]);
           gl.uniform1i(uZ, k * 2);
           draw();
+          if (isD3D11 && ((k & 31) === 31)) gl.flush();
         }
       } else {
         for (let z = 0; z < nz; z++) {
           gl.bindFramebuffer(gl.FRAMEBUFFER, nxtFbo[z]);
           gl.uniform1i(uZ, z);
           draw();
+          if (isD3D11 && ((z & 63) === 63)) gl.flush();
         }
       }
       checkGl(gl, `conv layer ${li}`);
@@ -693,8 +713,17 @@ export function runMeshNetGL(o) {
         [cur, nxt] = [nxt, cur]; [curFbo, nxtFbo] = [nxtFbo, curFbo];
       }
 
-      // Bound the command queue without ever reading back an activation.
-      if (li % 8 === 0) hardSync(gl, fboLab);
+      // On Windows ANGLE D3D11, queueing 8 full layers before syncing causes a
+      // multi-second flush at Layer 9/13 that trips WDDM TDR / OOM and resets
+      // NiiVue's shared GPU-process context. Sync per layer on D3D11, and issue a
+      // non-blocking flush elsewhere.
+      if (isD3D11) {
+        hardSync(gl, fboLab);
+        checkGl(gl, `sync layer ${li}`);
+      } else {
+        gl.flush();
+        if (li % 8 === 0) hardSync(gl, fboLab);
+      }
       report(li);
     }
 

@@ -89,7 +89,6 @@ export async function benchmarkInt8({ variant = 'original', iterations = 3, mode
   const FAMILY_CFG = {
     mindsnap104: { modelId: 5, nclass: 104, weightsPath: '/models/model24chan104cls_infant_refit_synth/model.safetensors', fp16Mod: synthFp16, int8Mod: int8Runner, hasV3: true },
     v3_repbn:    { modelId: 5, nclass: 104, weightsPath: '/models/model24chan104cls_v3_repbn/model.safetensors', fp16Mod: synthFp16, int8Mod: int8Runner, hasV3: true },
-    v3_omnimodal: { modelId: 60, nclass: 104, weightsPath: '/models/model24chan104cls_v3_omnimodal/model.safetensors', fp16Mod: synthFp16, int8Mod: int8Runner, hasV3: false },
     lesion104:   { modelId: 14, nclass: 104, weightsPath: '/models/model24chan104cls_synth/model.safetensors', fp16Mod: synthFp16, int8Mod: int8Runner, hasV3: false },
     mindmap18:   { modelId: 21, nclass: 18, weightsPath: '/models/model24chan18cls_gdice_prio/model.safetensors', fp16Mod: mindmapFp16, int8Mod: mindmapInt8, hasV3: true },
     mindmap16:   { modelId: 3, nclass: 18, weightsPath: '/models/model16chan18cls/model.safetensors', fp16Mod: m16Fp16, int8Mod: m16Int8, hasV3: false },

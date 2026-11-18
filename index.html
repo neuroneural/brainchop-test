@@ -46,19 +46,6 @@
       <option value="-1" disabled selected>Loading models...</option>
     </select>
 
-    <button
-      id="turboToggle"
-      type="button"
-      class="turbo-tumbler active"
-      role="switch"
-      aria-checked="true"
-      aria-label="Turbo 8-bit acceleration"
-      title="Turbo ON: 8-bit V4 WebGPU / RGBA8 WebGL2 acceleration (~3x faster, mobile and cross-browser friendly). Click to run FP16 reference mode."
-    >
-      <span class="turbo-glyph" aria-hidden="true">&#9889;</span>
-      <span class="turbo-track" aria-hidden="true"><span class="turbo-thumb"></span></span>
-    </button>
-
     <span class="tb-divider"></span>
 
     <!-- Interaction mode: compact icon toggle (values are DRAG_MODE, set as primaryDragMode) -->
@@ -98,10 +85,10 @@
       </svg>
     </button>
 
-    <!-- Draw tools: single button opening a popover -->
-    <div class="popover-wrap">
+    <!-- Draw tools: disabled/hidden until multi-label editing is supported -->
+    <div class="popover-wrap" hidden>
       <button type="button" id="drawBtn" class="tb-btn" aria-haspopup="true" aria-expanded="false"
-        title="Drawing tools">
+        title="Drawing tools" disabled>
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <path d="M4 20l4-1L20 7a2 2 0 0 0-3-3L5 16l-1 4z" />
           <path d="M14 6l4 4" />
@@ -176,11 +163,11 @@
           <progress id="modelProgress" value="0" max="100" title="Model progress"></progress>
         </div>
 
-        <div class="footer-item">
+        <div class="footer-item" id="memstatusItem" hidden>
           <span id="memstatus" class="status-text" style="color: #4CAF50" title="Memory status">Memory OK</span>
         </div>
 
-        <div class="footer-item">
+        <div class="footer-item" id="backendStatusItem" hidden>
           <span id="backendStatus" class="status-text" style="color: #9aa0a6; cursor: help"
             title="Detecting backend...">Checking&hellip;</span>
         </div>

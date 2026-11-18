@@ -80,7 +80,7 @@ export function runInferenceWebGl2(opts, modelEntry, niftiHeader, niftiImage, ca
             `prep=${(Number(t.Preprocess_t || 0) * 1000).toFixed(1)}ms infer=${(Number(t.Inference_t || 0) * 1000).toFixed(1)}ms ` +
             `post=${(Number(t.Postprocess_t || 0) * 1000).toFixed(1)}ms disp=${(Number(displaySec || 0) * 1000).toFixed(1)}ms`
           );
-          callbackUI(message, 0, '', JSON.stringify(fullStat));
+          callbackUI(message, 1, '', JSON.stringify(fullStat));
           done(resolve);
         }).catch((err) => done(reject, err));
       }

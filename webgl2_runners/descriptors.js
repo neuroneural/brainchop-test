@@ -84,14 +84,8 @@ export const DESCRIPTORS = {
     activation: 'gelu_tanh',
     fullVolume: true,
   },
-  // Folded RepWNConv3d + d=31 DeepSup (WiSE-RepBN v3 preview): identical runtime graph.
+  // Folded RepWNConv3d + d=31 DeepSup (WiSE-RepBN v3): identical runtime graph.
   model24chan104cls_v3_repbn: {
-    dilations: DEEP13,
-    activation: 'gelu_tanh',
-    fullVolume: true,
-  },
-  // Omnimodal v3 champion (RepWNConv3d + d=31/d=7 DeepSup SWA + 0.08 WiSE): identical runtime graph.
-  model24chan104cls_v3_omnimodal: {
     dilations: DEEP13,
     activation: 'gelu_tanh',
     fullVolume: true,

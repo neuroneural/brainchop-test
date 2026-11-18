@@ -78,21 +78,21 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
 
   const statData = createStatData(modelEntry, ExecutionModes.WEBGL_WEBWORKER ?? 'webgl2-native');
   statData.TF_Backend = 'webgl2-native';
-  callbackUI(catLite ? 'CAT-lite probability estimation started' : 'Segmentation started', 0);
+  callbackUI(catLite ? 'Starting tissue estimation\u2026' : 'Starting segmentation\u2026', 0);
 
   const dim = 256;                      // main.js conforms before dispatching
   const dims = [dim, dim, dim];
 
   // ---- weights & GL setup ----------------------------------------------
   const setupStart = performance.now();
-  callbackUI('Loading weights...', 0.05);
+  callbackUI('Loading model\u2026', 0.05);
   const stUrl = `${opts.rootURL}${modelEntry.webgpu_safetensor.replace(/^\.\//, '/')}`;
   const stRes = await fetch(stUrl);
   if (!stRes.ok) { refuse(`could not fetch ${stUrl}: ${stRes.status}`); return; }
   const raw = await stRes.arrayBuffer();
   const tensors = parseSafetensors(raw);
   const desc = applyClassifierBias(describeSafetensors(tensors), modelEntry.classifierBias);
-  const d = deriveDescriptor(desc, {
+  let d = deriveDescriptor(desc, {
     nx: dim, ny: dim, nz: dim,
     activation: entry.activation,
     dilations: entry.dilations,
@@ -100,18 +100,29 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   });
 
   // ---- probe before doing any real work --------------------------------
-  const probe = probeWebgl2(d, dims);
+  const canAutoQ8 = !d.quantize8Bit && !!modelEntry.autoQuantize8BitFallback && desc.norm === 'gn';
+  let probe = probeWebgl2(d, dims, null, { deferRgba16fOnLazyD3D11: canAutoQ8 });
+  if (!probe.supported && canAutoQ8) {
+    console.warn(`[webgl2-native] RGBA16F probe declined (${probe.reasons.join('; ')}); falling back to RGBA8 quantized activations.`);
+    d = deriveDescriptor(desc, {
+      nx: dim, ny: dim, nz: dim,
+      activation: entry.activation,
+      dilations: entry.dilations,
+      quantize8Bit: true,
+    });
+    probe = probeWebgl2(d, dims);
+  }
   console.log(`[webgl2-native] ${entry.name}: ${d.chan}ch P=${d.planes} ${d.nclass}cls ` +
-    `norm=${d.norm} affine=${d.affine} act=${d.activation} | ` +
+    `norm=${d.norm} affine=${d.affine} act=${d.activation} q8=${!!d.quantize8Bit} | ` +
     `${Math.round(probe.activationBytes / 1048576)} MB activations | ${probe.renderer}`);
   if (!probe.supported) { refuse(probe.reasons.join('; ')); return; }
 
-  const packed = packWeights(desc, d);
+  let packed = packWeights(desc, d);
   const Setup_t = ((performance.now() - setupStart) / 1000).toFixed(4);
 
   // ---- preprocessing, identical to inference-webgpu.js ------------------
   const prepStart = performance.now();
-  callbackUI('Preparing input data...', 0.1);
+  callbackUI('Preparing volume\u2026', 0.1);
   const normed = modelEntry.enableQuantileNorm
     ? quantileNormalizeVolumeData(niftiImage)
     : minMaxNormalizeVolumeData(niftiImage);
@@ -130,27 +141,64 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   const Preprocess_t = ((performance.now() - prepStart) / 1000).toFixed(4);
 
   // ---- inference -------------------------------------------------------
-  callbackUI('Running inference...', 0.2);
+  callbackUI(catLite ? 'Estimating tissue maps\u2026' : 'Segmenting\u2026', 0.2);
   const t0 = performance.now();
-  const out = runMeshNetGL({
-    descriptor: d,
-    packed: packed.data,
-    offsets: packed.offsets,
-    input,
-    probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
-    vox2: probe.vox2,
-    onProgress: (frac, msg) => callbackUI(msg, 0.2 + 0.7 * frac),
-    onLog: (msg) => console.log(msg),
-  });
+  const hasAnyNonZero = (arr) => {
+    if (!arr) return false;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] !== 0) return true;
+    }
+    return false;
+  };
+  let out;
+  try {
+    out = runMeshNetGL({
+      descriptor: d,
+      packed: packed.data,
+      offsets: packed.offsets,
+      input,
+      probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
+      vox2: probe.vox2,
+      onProgress: (frac) => callbackUI('', 0.2 + 0.7 * frac),
+      onLog: (msg) => console.log(msg),
+    });
+    if (!catLite && !hasAnyNonZero(out.labels)) {
+      throw new Error('native WebGL2 produced an all-zero volume');
+    }
+  } catch (err) {
+    if (!d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
+      console.warn('[webgl2-native] RGBA16F execution failed; retrying once with RGBA8 quantized activations.', err);
+      d = deriveDescriptor(desc, {
+        nx: dim, ny: dim, nz: dim,
+        activation: entry.activation,
+        dilations: entry.dilations,
+        quantize8Bit: true,
+      });
+      packed = packWeights(desc, d);
+      out = runMeshNetGL({
+        descriptor: d,
+        packed: packed.data,
+        offsets: packed.offsets,
+        input,
+        probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
+        vox2: probe.vox2,
+        onProgress: (frac) => callbackUI('', 0.2 + 0.7 * frac),
+        onLog: (msg) => console.log(msg),
+      });
+    } else {
+      throw err;
+    }
+  }
   const Inference_t = ((performance.now() - t0) / 1000).toFixed(4);
   console.log(`[webgl2-native] ---- Inference Time: ${Inference_t} s ---- (${out.path})`);
   input = null;
 
   // ---- postprocessing, identical to inference-webgpu.js ----------------
+  const elapsedText = `${Number(Inference_t).toFixed(1)} s`;
   const outPerm = modelEntry.outputPermutation || (modelEntry.enableTranspose ? [2, 1, 0] : null);
   if (catLite) {
     const p0 = performance.now();
-    callbackUI('CAT-lite: smoothing priors and fitting partial-volume classes...', 0.92);
+    callbackUI('Refining tissue fractions\u2026', 0.92);
     smoothAndGateTissuePriors(out.tissues, out.support, dims, modelEntry);
     out.support = null;
     const toNative = (prior) => (outPerm
@@ -160,7 +208,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
     const Postprocess_t = ((performance.now() - p0) / 1000).toFixed(4);
     markSuccess(statData, Inference_t, Postprocess_t, { Preprocess_t, Setup_t });
     callbackImg(tissues, opts, modelEntry);
-    callbackComplete(modelEntry.modelName + '<br>CAT-lite probability map finished', statData, {
+    callbackComplete(`${modelEntry.modelName} \u00b7 Tissue maps finished (${elapsedText})`, statData, {
       Setup_t,
       Preprocess_t,
       Inference_t,
@@ -169,6 +217,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
     return;
   }
 
+  callbackUI('Finishing up\u2026', 0.9);
   const p0 = performance.now();
   const nativeLabels = outPerm
     ? transposeVolume3DToU8(out.labels, finalShape, outPerm)
@@ -195,7 +244,8 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   addLabelStats(statData, modelEntry.numClasses || actualLabels, actualLabels);
   markSuccess(statData, Inference_t, Postprocess_t, { Preprocess_t, Setup_t });
   callbackImg(outimg, opts, modelEntry, maskResult.mask);
-  callbackComplete(modelEntry.modelName + '<br>Segmentation finished', statData, {
+  const isolateHint = (modelEntry.numClasses ?? 0) > 2 ? ' \u00b7 Option/Alt-click a region to isolate' : '';
+  callbackComplete(`${modelEntry.modelName} \u00b7 Segmentation finished (${elapsedText})${isolateHint}`, statData, {
     Setup_t,
     Preprocess_t,
     Inference_t,

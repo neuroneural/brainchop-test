@@ -144,6 +144,7 @@ async function downloadVolume(vol, filename) {
 // --- Backend State ---
 let gpuDevice = null;
 let isWebGpuAvailable = false;
+let gpuDeviceLostRecoveries = 0;
 
 // --- Backend fallback chain state -----------------------------------------
 // runSelectedInference() tries WebGPU, then the native WebGL2 runner, then the
@@ -243,8 +244,26 @@ async function initializeBackend() {
         if (hasF16) requiredFeatures.push("shader-f16");
         if (hasSubgroups) requiredFeatures.push("subgroups");
 
-        gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
-        gpuDevice.__adapterInfo = adapter.info || null;
+        const createdDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+        createdDevice.__adapterInfo = adapter.info || null;
+        createdDevice.__isLost = false;
+        if (createdDevice.lost && typeof createdDevice.lost.then === "function") {
+          createdDevice.lost.then((lossInfo) => {
+            createdDevice.__isLost = true;
+            if (lossInfo?.reason === "destroyed") return;
+            console.warn(
+              `[WebGPU] Device was lost (${lossInfo?.reason || "unknown"}): ${lossInfo?.message || ""}`
+            );
+            if (gpuDevice === createdDevice) {
+              gpuDevice = null;
+              isWebGpuAvailable = false;
+              diagnostics.deviceObtained = false;
+              diagnostics.error = lossInfo?.message || "WebGPU device lost";
+              updateBackendStatusUI(false, diagnostics);
+            }
+          });
+        }
+        gpuDevice = createdDevice;
         diagnostics.deviceObtained = true;
 
         isWebGpuAvailable = true;
@@ -343,30 +362,14 @@ async function main() {
   let lastModelEntry = null;
   let lastBrainMask = null; // Mindgrab's postprocessed labels, before masking image intensities
 
-  const turboToggleEl = document.getElementById("turboToggle");
-  const initialTurboParam = new URLSearchParams(window.location.search).get("turbo");
-  let isTurboEnabled = !["0", "false", "off"].includes(String(initialTurboParam || "").toLowerCase());
-
   function getSelectedBaseModel() {
     const idx = modelSelect.value;
     if (idx === "-1" || modelSelect.selectedIndex < 0) return null;
     return inferenceModelsList[idx] || null;
   }
 
-  function syncTurboToggleUI() {
-    if (!turboToggleEl) return;
+  function syncModelSelectTooltip() {
     const baseEntry = getSelectedBaseModel();
-    const turboUnavailable = Boolean(baseEntry && baseEntry.type !== "Divider" && !baseEntry.turbo);
-    turboToggleEl.classList.toggle("active", isTurboEnabled);
-    turboToggleEl.classList.toggle("turbo-na", turboUnavailable);
-    turboToggleEl.setAttribute("aria-checked", isTurboEnabled ? "true" : "false");
-    if (turboUnavailable) {
-      turboToggleEl.title = `${baseEntry.modelName} has no 8-bit Turbo variant; it runs in standard mode while keeping your global Turbo (${isTurboEnabled ? "ON" : "OFF"}) setting.`;
-    } else if (isTurboEnabled) {
-      turboToggleEl.title = "Turbo ON: 8-bit V4 WebGPU / RGBA8 WebGL2 acceleration (~3x faster, mobile and cross-browser friendly). Click to run FP16 reference mode.";
-    } else {
-      turboToggleEl.title = "Turbo OFF: FP16 reference WebGPU / WebGL2 mode (requires large WebGPU buffers on desktop). Click to turn Turbo ON.";
-    }
     modelSelect.title = baseEntry?.description || "Choose a segmentation model to run";
   }
 
@@ -524,11 +527,10 @@ async function main() {
         • <strong>Option/Alt-click</strong> a segmentation label or CAT-lite tissue to show it alone in all panels + 3D. Click it again, click the background, or press Esc to restore all overlays.</p>
 
         <p><strong>🧠 AI Models</strong><br>
-        <strong>⚡ (toolbar switch, default ON):</strong> Global 8-bit V4 WebGPU &amp; RGBA8 WebGL2 acceleration (~3× faster, fits mobile/phone WebGPU limits, cross-browser across Chrome, Firefox &amp; Safari). Turn OFF for FP16 reference mode.<br>
-        <strong>🪓🌐 Omnimodal / Clinical:</strong> <em>omnimodal Skull Stripping</em> (MindGrab) and <em>Aparc+Aseg 104 (Omnimodal / Clinical)</em> (MindSnap v3-Omnimodal) for T2w, FLAIR, DWI, CT, thick clinical slices (2–5 mm), noise/bias, and skull-stripped scans.<br>
-        <strong>🪓🔪 / 🔪 Cortical + Subcortical Parcellation:</strong> <em>Aparc+Aseg 104</em> (MindSnap v3-RepBN) for standard T1-like MRIs; <em>Aparc+Aseg 104 (lesion scans)</em> after the divider for focal lesions; <em>Aparc+Aseg 50</em> for merged cortical homologues.<br>
-        <strong>⅔🧠 Tissue Fractions:</strong> <em>Tissue fraction maps (GM/WM/CSF)</em> for CAT-inspired continuous partial-volume estimation (Turbo-accelerated when ⚡ is ON).<br>
-        <strong>🪓 Subcortical &amp; Tissue:</strong> <em>Subcortical + GWM</em> and <em>Subcortical + GWM (fast)</em> for robust subcortical/tissue segmentation.</p>
+        <strong>🪓🧠 Omnimodal Skull Stripping:</strong> <em>Omnimodal Skull Stripping</em> (MindGrab) extracts the brain across T1, T2, FLAIR, DWI, EPI, MRA, PDw, qT1, CT, and PET.<br>
+        <strong>🪓 / ⚡🪓 Subcortical + Tissue:</strong> <em>Subcortical + Tissue</em> (MindMap 24-channel) and <em>⚡🪓 Subcortical + Tissue</em> (MindMap 16-channel) for sub-3s research and clinical T1w parcellation.<br>
+        <strong>⅔🧠 Tissue Fractions:</strong> <em>Tissue fraction maps (GM/WM/CSF)</em> for CAT-inspired continuous partial-volume estimation.<br>
+        <strong>🪓🔪 / 🔪 Cortical + Subcortical Parcellation:</strong> <em>Desikan-Killiany Atlas</em> (104-region cortical + subcortical + 5-part corpus callosum) for standard and clinical T1w MRIs; <em>Desikan-Killiany (lesion scans)</em> for large focal lesions; <em>Desikan-Killiany 50</em> for merged bilateral cortical homologues.</p>
         
         <p><em>Note: Models may run slower on limited devices to ensure memory safety.</em></p>
       </div>
@@ -647,7 +649,7 @@ async function main() {
     // addVolume re-ran doLoadImage with the conformed copy; keep the native grid and selected model.
     [nativeInputNV, nativeInputName] = [nativeNV, nativeName];
     modelSelect.value = prevModelVal;
-    syncTurboToggleUI();
+    syncModelSelectTooltip();
   }
 
   function removeOverlaysNoRender() {
@@ -830,7 +832,7 @@ async function main() {
     } finally {
       suppressBackendModals = false;
       modelSelect.value = "-1";
-      syncTurboToggleUI();
+      syncModelSelectTooltip();
     }
   }
 
@@ -839,11 +841,19 @@ async function main() {
     if (selectedModelIndex === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
 
+    const memstatusItem = document.getElementById("memstatusItem");
+    if (memstatusItem) memstatusItem.hidden = true;
+
     resetLabelIsolation(); // drop any active single-label state + HUD; callbackImg swaps overlays in one pass
     await ensureConformed();
 
     const baseModelEntry = inferenceModelsList[selectedModelIndex];
-    const modelEntry = resolveModelEntry(baseModelEntry, isTurboEnabled);
+    const precisionParam = (new URLSearchParams(window.location.search).get("precision") || "").toLowerCase();
+    const useWebGpuV4 = precisionParam !== "fp16" && precisionParam !== "fp32";
+    const modelEntry = {
+      ...resolveModelEntry(baseModelEntry, useWebGpuV4),
+      ...(precisionParam === "fp32" ? { forceFP32: true } : {}),
+    };
 
     const opts = { ...brainChopOpts };
     // Fix URL construction to handle './' base correctly and allow subfolders
@@ -854,13 +864,22 @@ async function main() {
     const niftiImage = nv1.volumes[0].img;
     let lastError = null;
 
-    // 1. Try WebGPU (legacy non-V4 runners stay gated on Safari unless ?inference=webgpu)
+    // 1. Try WebGPU (unconditionally V4 8-bit unless ?precision=fp16|fp32; legacy non-V4 runners stay gated on Safari unless ?inference=webgpu)
     const skipSafariLegacyWebGpu = SAFARI_LEGACY_WEBGPU_GATE && !modelEntry.quantize8Bit;
     const skipWebGpu = FORCE_WEBGL2_TESTING || skipSafariLegacyWebGpu;
     if (skipSafariLegacyWebGpu && isWebGpuAvailable && modelEntry.webgpu_safetensor) {
       console.info('Safari WebGPU legacy gate active for non-V4 model; routing to native WebGL2.');
     }
-    if (isWebGpuAvailable && !skipWebGpu && modelEntry.webgpu_safetensor) {
+    // If a prior GPU reset / sleep-wake lost the WebGPU device, try once to
+    // re-acquire a fresh device before dispatching this run.
+    if (!skipWebGpu && (!gpuDevice || gpuDevice.__isLost) && 'gpu' in navigator && gpuDeviceLostRecoveries < 2) {
+      if (window.webgpuDiagnostics?.adapterObtained) {
+        gpuDeviceLostRecoveries++;
+        console.info(`[WebGPU] Re-initializing device after prior loss (attempt ${gpuDeviceLostRecoveries})...`);
+        await initializeBackend();
+      }
+    }
+    if (isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost && !skipWebGpu && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
 
       const currentModelEntry = { ...modelEntry, enableTTA: false };
@@ -874,14 +893,21 @@ async function main() {
       }
     }
 
-    // 2. Native WebGL2 worker runner (webgl2_runners/)
-    if (ENABLE_NATIVE_WEBGL2 && modelEntry.webgpu_safetensor) {
+    // 2. Native WebGL2 worker runner (webgl2_runners/): prefer faster/exact RGBA16F first,
+    //    auto-falling back inside the worker to RGBA8 only if VRAM texture allocation fails.
+    if (ENABLE_NATIVE_WEBGL2 && baseModelEntry.webgpu_safetensor) {
+      const forceWebGl2Rgba8 = precisionParam === "int8" || precisionParam === "rgba8";
+      const webgl2Entry = {
+        ...resolveModelEntry(baseModelEntry, false),
+        quantize8Bit: forceWebGl2Rgba8,
+        autoQuantize8BitFallback: !forceWebGl2Rgba8 && Boolean(baseModelEntry.turbo),
+      };
       try {
         // Dynamic so WebGPU users never fetch this chunk (see ENABLE_NATIVE_WEBGL2).
         const { runInferenceWebGl2, nativeWebgl2Available } = await import("./inference-webgl2.js");
         if (nativeWebgl2Available()) {
           console.log("Attempting native WebGL2 runner...");
-          await runInferenceWebGl2(opts, modelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+          await runInferenceWebGl2(opts, webgl2Entry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
           return; // Success
         }
         lastError = new Error("Native WebGL2 unavailable (no OffscreenCanvas WebGL2 context).");
@@ -896,21 +922,10 @@ async function main() {
   }
 
   modelSelect.onchange = () => {
-    syncTurboToggleUI();
+    syncModelSelectTooltip();
     return runSelectedInference();
   };
-  if (turboToggleEl) {
-    turboToggleEl.onclick = async () => {
-      if (suppressBackendModals) return;
-      isTurboEnabled = !isTurboEnabled;
-      syncTurboToggleUI();
-      const baseEntry = getSelectedBaseModel();
-      if (baseEntry && baseEntry.turbo) {
-        await runSelectedInference();
-      }
-    };
-  }
-  syncTurboToggleUI();
+  syncModelSelectTooltip();
   // backendSelect.onchange = runSelectedInference; // Removed
 
   // --- Save actions -------------------------------------------------------
@@ -1436,7 +1451,7 @@ async function main() {
       lastBrainMask = null;
       syncModelUnderlayOpacityNoRender();
       modelSelect.value = "-1";
-      syncTurboToggleUI();
+      syncModelSelectTooltip();
       if (nv1.volumes[0]) opacitySlider0.oninput();
     }
   }
@@ -1619,14 +1634,6 @@ async function main() {
     }
     syncModelUnderlayOpacityNoRender(modelEntry);
     await nv1.updateGLVolume();
-
-    // One-line discoverability hint (only for multi-label overlays where
-    // isolation applies). It sits in the location bar until the next mouse move.
-    if (segOverlay() && lastSegLabelNames && lastSegLabelNames.length > 2) {
-      const loc = document.getElementById("location");
-      if (loc) loc.innerHTML =
-        `<p style="font-size:14px;margin:0;opacity:.75;">Tip: Option/Alt-click a region to show only it — Esc restores all</p>`;
-    }
   }
 
   async function reportTelemetry(statData) {
@@ -1647,14 +1654,29 @@ async function main() {
     }
   }
 
+  function formatStatusSegments(message) {
+    const parts = String(message)
+      .split(" · ")
+      .map((part) => part.trim())
+      .filter((part) => part !== "");
+    if (parts.length <= 1) return escapeHtml(String(message));
+    return parts
+      .map((part, idx) =>
+        `<span class="loc-seg"${idx >= 2 ? ' style="opacity:.75"' : ""}>${escapeHtml(part)}</span>`)
+      .join('<span class="loc-sep">&middot;</span>');
+  }
+
   function callbackUI(message = "", progressFrac = -1, modalMessage = "", statData = []) {
     if (message) {
       console.log(message);
-      document.getElementById("location").innerHTML = message;
+      const locEl = document.getElementById("location");
+      if (locEl) locEl.innerHTML = formatStatusSegments(message);
     }
     if (isNaN(progressFrac)) {
-      memstatus.style.color = "red";
-      memstatus.innerHTML = "Memory Issue";
+      const memstatusItem = document.getElementById("memstatusItem");
+      if (memstatusItem) memstatusItem.hidden = false;
+      memstatus.style.color = "#ef4444";
+      memstatus.textContent = "Memory Issue";
     } else if (progressFrac >= 0) {
       modelProgress.value = progressFrac * modelProgress.max;
     }
@@ -1805,7 +1827,7 @@ async function main() {
   // Actually, we set selected=true on placeholder, so browser should pick it up.
   // But let's be explicit.
   modelSelect.value = "-1";
-  syncTurboToggleUI();
+  syncModelSelectTooltip();
   setPen(-1);
 
   await initializeBackend();
@@ -1816,7 +1838,7 @@ async function main() {
   const modelParam = urlParams.get("model");
   if (modelParam !== null && modelParam !== "" && Number(modelParam) >= 0 && Number(modelParam) < inferenceModelsList.length) {
     modelSelect.value = String(Number(modelParam));
-    syncTurboToggleUI();
+    syncModelSelectTooltip();
     runSelectedInference();
   } else if (isWebGpuAvailable && !FORCE_WEBGL2_TESTING && gpuDevice) {
     const scheduleWarmup = window.requestIdleCallback
