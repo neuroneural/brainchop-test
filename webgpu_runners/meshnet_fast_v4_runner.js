@@ -52,8 +52,27 @@ const rep = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join('');
 // Windows GPUs run unthrottled pipelined per-layer queue.submit; slow Windows GPUs
 // self-calibrate into ~180ms Z-chunked submissions with live progress updates.
 const WINDOWS_FAST_LAYER_MAX_MS = 280;
-const PACED_TARGET_CHUNK_MS = 180;
+const PACED_TARGET_CHUNK_MS = 150;
+const PACED_UI_YIELD_MS = 55;
 const STD_SLOTS_PER_LAYER = 112; // <=64 main chunks (down to 256 strips) + <=48 ext chunks
+let activeUserSetups = 0;
+
+function packConvDilFlags(D, writeExtY8) {
+  const q = Math.floor(D / 4);
+  const r = D % 4;
+  const off0 = r === 0 ? q : q + 1;
+  const off1 = q;
+  const shR = r * 8;
+  const shL = r === 0 ? 0 : 32 - shR;
+  return (
+    (D & 63) |
+    ((off0 & 15) << 6) |
+    ((off1 & 15) << 10) |
+    ((shR & 31) << 14) |
+    ((shL & 31) << 19) |
+    ((writeExtY8 ? 1 : 0) << 24)
+  ) >>> 0;
+}
 
 function getV4ExecOverride(modelEntry) {
   if (modelEntry?.webgpuExecMode) return String(modelEntry.webgpuExecMode).toLowerCase();
@@ -161,6 +180,66 @@ function yieldAfterPacedChunk() {
       setTimeout(finish, 0);
     });
   });
+}
+
+// 2-in-flight overlapping chunk pacer for Windows WDDM TDR safety + responsive UI:
+// keeps at most 2 ~150ms submissions in the GPU hardware queue at once so the GPU
+// never drains to 0% idle while the browser paints #modelProgress / dwm.exe composes.
+function createPacedQueueController(device, initialMsPerStrip, onUiTick) {
+  let msPerStrip = initialMsPerStrip;
+  let prevDone = null;
+  let currDone = null;
+  let lastGpuDoneAt = performance.now();
+  let lastUiYieldAt = performance.now();
+
+  async function submitChunk(enc, strips, li, { forceUiYield = false, emitTick = true } = {}) {
+    if (prevDone) {
+      await prevDone;
+      prevDone = null;
+    }
+    const tSub = performance.now();
+    device.queue.submit([enc.finish()]);
+    const nextEnc = device.createCommandEncoder();
+
+    const pDone = device.queue.onSubmittedWorkDone().then(() => {
+      const tNow = performance.now();
+      const gpuStart = Math.max(tSub, lastGpuDoneAt);
+      const gpuDt = Math.max(0, tNow - gpuStart);
+      if (tNow > lastGpuDoneAt) lastGpuDoneAt = tNow;
+      if (strips >= 256 && gpuDt > 0.2) {
+        msPerStrip = Math.max(0.005, Math.min(2.0, 0.7 * msPerStrip + 0.3 * (gpuDt / strips)));
+        device.__v4MsPerStrip = msPerStrip;
+      }
+    });
+    prevDone = currDone;
+    currDone = pDone;
+
+    if (emitTick && onUiTick) onUiTick(li);
+    const now = performance.now();
+    if (forceUiYield || now - lastUiYieldAt >= PACED_UI_YIELD_MS) {
+      await yieldAfterPacedChunk();
+      lastUiYieldAt = performance.now();
+    }
+    return nextEnc;
+  }
+
+  async function waitBeforeFinalSubmit() {
+    if (prevDone) {
+      await prevDone;
+      prevDone = null;
+    }
+  }
+
+  return {
+    submitChunk,
+    waitBeforeFinalSubmit,
+    getMsPerStrip: () => msPerStrip,
+    setMsPerStrip: (v) => {
+      msPerStrip = Math.max(0.005, Math.min(2.0, v));
+      device.__v4MsPerStrip = msPerStrip;
+      lastGpuDoneAt = performance.now();
+    },
+  };
 }
 
 function estimateScheduleLayerWork(L, li, numConvs) {
@@ -666,7 +745,10 @@ function getProbCacheKey(probCfg) {
     : 'seg';
 }
 
-async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg, shaders, dilKeys, { includeCls = true } = {}) {
+async function getNetPipes128(
+  device, d, packed, hasF16, hasSubgroups32, probCfg, shaders,
+  { includeCls = true, sequential = false, shouldAbort = null } = {}
+) {
   const cache = getDeviceMap(netPipeCache, device);
   const f16Tag = hasF16 ? 1 : 0;
   const sgTag = hasSubgroups32 ? 1 : 0;
@@ -686,13 +768,14 @@ async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg
   const prepKey = `128|prep|${d.chan}|${d.cs}|${d.activation}|${d.norm}|${f16Tag}`;
   const flushKey = `128|flush|${d.cs}|${f16Tag}`;
   const normKey = `128|norm|${d.cs}|${d.activation}|${d.norm}|${f16Tag}`;
+  const convKey = `128|conv|${d.chan}|${d.cs}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}`;
   const clsKey = `128|cls|${d.chan}|${d.cs}|${d.nclass}|${packed?.clsK4 ?? 0}|${shaders.numConvs}|${d.activation}|${d.norm}|${f16Tag}|${getProbCacheKey(probCfg)}`;
 
-  const pInitP = getCachedKernelGroup(cache, initKey, () => {
+  const mkInit = () => getCachedKernelGroup(cache, initKey, () => {
     const mInit = createShaderModuleFast(device, 'init_act8_128', shaders.initActWgsl());
     return mk('init_act8_128', mInit, 'main', initTypes);
   });
-  const pConv0P = getCachedKernelGroup(cache, conv0Key, async () => {
+  const mkConv0 = () => getCachedKernelGroup(cache, conv0Key, async () => {
     const mConv0 = createShaderModuleFast(device, 'conv0_128', shaders.conv0Wgsl());
     const list = await Promise.all(
       shaders.halfPass0
@@ -711,7 +794,7 @@ async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg
       ? { lo: list[0], hi: list[1], bgLo: list[2], bgHi: list[3] }
       : { main: list[0], bg: list[1] };
   });
-  const pPrepP = getCachedKernelGroup(cache, prepKey, async () => {
+  const mkPrep = () => getCachedKernelGroup(cache, prepKey, async () => {
     const mPrep = createShaderModuleFast(device, 'prep_128', shaders.prepWgsl());
     const [pMomFin, pPrepW] = await Promise.all([
       mk('moments_finish_128', mPrep, 'moments_finish', prepTypes),
@@ -719,11 +802,11 @@ async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg
     ]);
     return { pMomFin, pPrepW };
   });
-  const pFlushP = getCachedKernelGroup(cache, flushKey, () => {
+  const mkFlush = () => getCachedKernelGroup(cache, flushKey, () => {
     const mFlush = createShaderModuleFast(device, 'flush_128', shaders.flushWgsl());
     return mk('flush_stage_128', mFlush, 'main', flushTypes);
   });
-  const pNormP = getCachedKernelGroup(cache, normKey, async () => {
+  const mkNorm = () => getCachedKernelGroup(cache, normKey, async () => {
     const mNorm = createShaderModuleFast(device, 'norm_128', shaders.normWgsl());
     const [pNorm, pNormHalo] = await Promise.all([
       mk('norm_quant8_128', mNorm, 'main', normTypes),
@@ -731,52 +814,50 @@ async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg
     ]);
     return { pNorm, pNormHalo };
   });
-  const pClsP = includeCls
+  const mkCls = () => (includeCls
     ? getCachedKernelGroup(cache, clsKey, () => {
         const mCls = createShaderModuleFast(device, 'cls_128', shaders.clsWgsl());
         return mk('classify_v4_128', mCls, 'main', clsTypes);
       })
-    : Promise.resolve(null);
-  const pConvPs = dilKeys.map((dil) =>
-    getCachedKernelGroup(
-      cache,
-      `128|conv|${d.chan}|${d.cs}|${dil}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}`,
-      async () => {
-        const mod = createShaderModuleFast(device, `conv_128_d${dil}`, shaders.getConvWgsl(dil));
-        if (shaders.halfPassConv) {
-          const [lo, hi, extLo, extHi, bgLo, bgHi] = await Promise.all([
-            mk(`conv_128_d${dil}_lo`, mod, 'main_lo', convTypes),
-            mk(`conv_128_d${dil}_hi`, mod, 'main_hi', convTypes),
-            mk(`conv_128_d${dil}_ext_lo`, mod, 'main_ext_lo', convTypes),
-            mk(`conv_128_d${dil}_ext_hi`, mod, 'main_ext_hi', convTypes),
-            mk(`conv_128_d${dil}_bg_lo`, mod, 'main_bg_lo', convTypes),
-            mk(`conv_128_d${dil}_bg_hi`, mod, 'main_bg_hi', convTypes),
-          ]);
-          return { lo, hi, extLo, extHi, bgLo, bgHi };
-        }
-        const [main, ext, bg] = await Promise.all([
-          mk(`conv_128_d${dil}`, mod, 'main', convTypes),
-          mk(`conv_128_d${dil}_ext`, mod, 'main_ext', convTypes),
-          mk(`conv_128_d${dil}_bg`, mod, 'main_bg', convTypes),
-        ]);
-        return { main, ext, bg };
-      }
-    )
-  );
-
-  const [pInit, pConv0, prepPair, pFlush, normPair, pCls, ...convList] = await Promise.all([
-    pInitP,
-    pConv0P,
-    pPrepP,
-    pFlushP,
-    pNormP,
-    pClsP,
-    ...pConvPs,
-  ]);
-  const convPipes = {};
-  dilKeys.forEach((dil, i) => {
-    convPipes[dil] = convList[i];
+    : Promise.resolve(null));
+  const mkConv = () => getCachedKernelGroup(cache, convKey, async () => {
+    const mod = createShaderModuleFast(device, 'conv_128', shaders.convWgsl());
+    if (shaders.halfPassConv) {
+      const [lo, hi, extLo, extHi, bgLo, bgHi] = await Promise.all([
+        mk('conv_128_lo', mod, 'main_lo', convTypes),
+        mk('conv_128_hi', mod, 'main_hi', convTypes),
+        mk('conv_128_ext_lo', mod, 'main_ext_lo', convTypes),
+        mk('conv_128_ext_hi', mod, 'main_ext_hi', convTypes),
+        mk('conv_128_bg_lo', mod, 'main_bg_lo', convTypes),
+        mk('conv_128_bg_hi', mod, 'main_bg_hi', convTypes),
+      ]);
+      return { lo, hi, extLo, extHi, bgLo, bgHi };
+    }
+    const [main, ext, bg] = await Promise.all([
+      mk('conv_128', mod, 'main', convTypes),
+      mk('conv_128_ext', mod, 'main_ext', convTypes),
+      mk('conv_128_bg', mod, 'main_bg', convTypes),
+    ]);
+    return { main, ext, bg };
   });
+
+  if (sequential) {
+    for (const step of [mkInit, mkPrep, mkFlush, mkNorm, mkConv0, mkConv, mkCls]) {
+      if (shouldAbort?.()) return null;
+      await step();
+    }
+    return null;
+  }
+
+  const [pInit, pConv0, prepPair, pFlush, normPair, pCls, pConv] = await Promise.all([
+    mkInit(),
+    mkConv0(),
+    mkPrep(),
+    mkFlush(),
+    mkNorm(),
+    mkCls(),
+    mkConv(),
+  ]);
   return {
     pInit,
     pMomFin: prepPair.pMomFin,
@@ -786,11 +867,14 @@ async function getNetPipes128(device, d, packed, hasF16, hasSubgroups32, probCfg
     pNormHalo: normPair.pNormHalo,
     pCls,
     pConv0,
-    convPipes,
+    pConv,
   };
 }
 
-async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHalves, probCfg, shaders, dilKeys, { includeCls = true } = {}) {
+async function getNetPipesStd(
+  device, d, packed, hasF16, hasSubgroups32, splitHalves, probCfg, shaders,
+  { includeCls = true, sequential = false, shouldAbort = null } = {}
+) {
   const cache = getDeviceMap(netPipeCache, device);
   const f16Tag = hasF16 ? 1 : 0;
   const sgTag = hasSubgroups32 ? 1 : 0;
@@ -820,13 +904,14 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
   const conv0Key = `std|conv0|${d.cs}|${d.dilations[0]}|${d.norm}|${f16Tag}|${sgTag}|${splitTag}`;
   const prepKey = `std|prep|${d.chan}|${d.cs}|${d.activation}|${d.norm}|${f16Tag}|${splitTag}`;
   const normKey = `std|norm|${d.cs}|${d.activation}|${d.norm}|${f16Tag}|${splitTag}`;
+  const convKey = `std|conv|${d.chan}|${d.cs}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}|${splitTag}${chunkTag ? '|chk1' : ''}`;
   const clsKey = `std|cls|${d.chan}|${d.cs}|${d.nclass}|${packed?.clsK4 ?? 0}|${d.activation}|${d.norm}|${f16Tag}|${splitTag}|${getProbCacheKey(probCfg)}`;
 
-  const pInitP = getCachedKernelGroup(cache, initKey, () => {
+  const mkInit = () => getCachedKernelGroup(cache, initKey, () => {
     const mInit = createShaderModuleFast(device, 'init_act8', shaders.initActWgsl());
     return mk('init_act8', mInit, 'main', initTypes);
   });
-  const pConv0P = getCachedKernelGroup(cache, conv0Key, async () => {
+  const mkConv0 = () => getCachedKernelGroup(cache, conv0Key, async () => {
     const mConv0 = createShaderModuleFast(device, 'conv0', shaders.conv0Wgsl());
     const list = await Promise.all(
       shaders.halfPass0
@@ -845,7 +930,7 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
       ? { lo: list[0], hi: list[1], bgLo: list[2], bgHi: list[3] }
       : { main: list[0], bg: list[1] };
   });
-  const pPrepP = getCachedKernelGroup(cache, prepKey, async () => {
+  const mkPrep = () => getCachedKernelGroup(cache, prepKey, async () => {
     const mPrep = createShaderModuleFast(device, 'prep', shaders.prepWgsl());
     const [pMomFin, pPrepW] = await Promise.all([
       mk('moments_finish', mPrep, 'moments_finish', prepTypes),
@@ -853,7 +938,7 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
     ]);
     return { pMomFin, pPrepW };
   });
-  const pNormP = getCachedKernelGroup(cache, normKey, async () => {
+  const mkNorm = () => getCachedKernelGroup(cache, normKey, async () => {
     const mNorm = createShaderModuleFast(device, 'norm', shaders.normWgsl());
     const [pNorm, pNormHalo] = await Promise.all([
       mk('norm_quant8', mNorm, 'main', normTypes),
@@ -861,48 +946,46 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
     ]);
     return { pNorm, pNormHalo };
   });
-  const pClsP = includeCls
+  const mkCls = () => (includeCls
     ? getCachedKernelGroup(cache, clsKey, () => {
         const mCls = createShaderModuleFast(device, 'cls', shaders.clsWgsl());
         return mk('classify_v4', mCls, 'main', clsTypes);
       })
-    : Promise.resolve(null);
-  const pConvPs = dilKeys.map((dil) =>
-    getCachedKernelGroup(
-      cache,
-      `std|conv|${d.chan}|${d.cs}|${dil}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}|${splitTag}${chunkTag ? '|chk1' : ''}`,
-      async () => {
-        const mod = createShaderModuleFast(device, `conv_d${dil}`, shaders.getConvWgsl(dil));
-        if (shaders.halfPassConv) {
-          const [lo, hi, extLo, extHi] = await Promise.all([
-            mk(`conv_d${dil}_lo`, mod, 'main_lo', convTypes),
-            mk(`conv_d${dil}_hi`, mod, 'main_hi', convTypes),
-            mk(`conv_d${dil}_ext_lo`, mod, 'main_ext_lo', convTypes),
-            mk(`conv_d${dil}_ext_hi`, mod, 'main_ext_hi', convTypes),
-          ]);
-          return { lo, hi, extLo, extHi };
-        }
-        const [main, ext] = await Promise.all([
-          mk(`conv_d${dil}`, mod, 'main', convTypes),
-          mk(`conv_d${dil}_ext`, mod, 'main_ext', convTypes),
-        ]);
-        return { main, ext };
-      }
-    )
-  );
-
-  const [pInit, pConv0, prepPair, normPair, pCls, ...convList] = await Promise.all([
-    pInitP,
-    pConv0P,
-    pPrepP,
-    pNormP,
-    pClsP,
-    ...pConvPs,
-  ]);
-  const convPipes = {};
-  dilKeys.forEach((dil, i) => {
-    convPipes[dil] = convList[i];
+    : Promise.resolve(null));
+  const mkConv = () => getCachedKernelGroup(cache, convKey, async () => {
+    const mod = createShaderModuleFast(device, 'conv', shaders.convWgsl());
+    if (shaders.halfPassConv) {
+      const [lo, hi, extLo, extHi] = await Promise.all([
+        mk('conv_lo', mod, 'main_lo', convTypes),
+        mk('conv_hi', mod, 'main_hi', convTypes),
+        mk('conv_ext_lo', mod, 'main_ext_lo', convTypes),
+        mk('conv_ext_hi', mod, 'main_ext_hi', convTypes),
+      ]);
+      return { lo, hi, extLo, extHi };
+    }
+    const [main, ext] = await Promise.all([
+      mk('conv', mod, 'main', convTypes),
+      mk('conv_ext', mod, 'main_ext', convTypes),
+    ]);
+    return { main, ext };
   });
+
+  if (sequential) {
+    for (const step of [mkInit, mkPrep, mkNorm, mkConv0, mkConv, mkCls]) {
+      if (shouldAbort?.()) return null;
+      await step();
+    }
+    return null;
+  }
+
+  const [pInit, pConv0, prepPair, normPair, pCls, pConv] = await Promise.all([
+    mkInit(),
+    mkConv0(),
+    mkPrep(),
+    mkNorm(),
+    mkCls(),
+    mkConv(),
+  ]);
   return {
     pInit,
     pMomFin: prepPair.pMomFin,
@@ -911,7 +994,7 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
     pNormHalo: normPair.pNormHalo,
     pCls,
     pConv0,
-    convPipes,
+    pConv,
   };
 }
 
@@ -2191,23 +2274,44 @@ function buildShaders(cfg) {
   const V4 = `vec4<${T}>`;
   const byteScale = hasF16 ? 256.0 : 255.0;
 
-  const emitEpilogue = ({
-    cStart, cEnd, hrExpr, yRowExpr, isPermuted,
-    momBinding, alsoWriteMomMain = false, writeY8Expr = 'true',
-  }) => {
+  const buildStdEpilogue = (isPermuted) => {
     const sw = isPermuted ? '.xzyw' : '';
-    const storeY = (c, wordExpr) => {
-      if (splitHalves && c >= csHalf) {
-        return `y8_1[${yRowExpr} + ${(c - csHalf) * X4_VALID}u] = ${wordExpr};`;
-      }
-      return `y8_0[${yRowExpr} + ${c * X4_VALID}u] = ${wordExpr};`;
-    };
+    const storeY = (yRowExpr, c, wordExpr) => (
+      splitHalves && c >= csHalf
+        ? `y8_1[${yRowExpr} + ${(c - csHalf) * X4_VALID}u] = ${wordExpr};`
+        : `y8_0[${yRowExpr} + ${c * X4_VALID}u] = ${wordExpr};`
+    );
 
     if (hasF16 && hasSubgroups32) {
-      return rep(cEnd - cStart, (idx) => {
-        const c = cStart + idx;
-        return `  {
-    let f = vec4<f32>(a_${c}${sw});
+      return {
+        decls: '',
+        localHeader: '',
+        emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) =>
+          rep(cEnd - cStart, (idx) => {
+            const c = cStart + idx;
+            const momWrite = momMode === 'ext_and_main'
+              ? `mom_ext[(${hrExpr}) * ${cs}u + ${c}u] = mv;\n      mom_main[(row_idx * 2u + sg) * ${cs}u + ${c}u] = mv;`
+              : momMode === 'ext_only'
+                ? `mom_ext[(${hrExpr}) * ${cs}u + ${c}u] = mv;`
+                : `mom_main[(${hrExpr}) * ${cs}u + ${c}u] = mv;`;
+            if (norm === 'none') {
+              return `  {
+    let f = vec4<f32>(${accVar}.v_${idx}${sw});
+    let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
+    let lmx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+    let sp = lmx - lmn;
+    let inv = select(0.0, 1.0 / sp, sp > 1e-7);
+    if (${writeY8Expr}) {
+      ${storeY(yRowExpr, c, 'pack4x8unorm((f - vec4<f32>(lmn)) * inv)')}
+    }
+    if (slane == 0u) {
+      let mv = vec4<f32>(0.0, 0.0, lmn, sp);
+      ${momWrite}
+    }
+  }\n`;
+            }
+            return `  {
+    let f = vec4<f32>(${accVar}.v_${idx}${sw});
     let ls = subgroupAdd(f.x + f.y + f.z + f.w);
     let lq = subgroupAdd(dot(f, f));
     let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
@@ -2215,85 +2319,335 @@ function buildShaders(cfg) {
     let sp = lmx - lmn;
     let inv = select(0.0, 1.0 / sp, sp > 1e-7);
     if (${writeY8Expr}) {
-      ${storeY(c, 'pack4x8unorm((f - vec4<f32>(lmn)) * inv)')}
+      ${storeY(yRowExpr, c, 'pack4x8unorm((f - vec4<f32>(lmn)) * inv)')}
     }
     if (slane == 0u) {
       let mv = vec4<f32>(ls, lq, lmn, sp);
-      ${momBinding}[(${hrExpr}) * ${cs}u + ${c}u] = mv;
-      ${alsoWriteMomMain ? `mom_main[(row_idx * 2u + sg) * ${cs}u + ${c}u] = mv;` : ''}
+      ${momWrite}
     }
   }\n`;
+          }),
+      };
+    }
+
+    const momSwitchStmt = `    let c_out = c_base + slane;
+    if (mom_mode == 0u) {
+      mom_main[main_off + c_out] = mv;
+    } else if (mom_mode == 1u) {
+      mom_ext[ext_off + c_out] = mv;
+      mom_main[main_off + c_out] = mv;
+    } else {
+      mom_ext[ext_off + c_out] = mv;
+    }`;
+
+    // Loop-free shared-memory epilogue: 2 barriers per 4-channel batch (12 total for 24ch vs 36,
+    // 8 total for 16ch MindGrab), zero inner loops (avoiding Naga's 64-bit loop_bound wrapper),
+    // native vec2<f16> min/max shared storage when shader-f16 is enabled (zero pack/unpack ops),
+    // and 1 shared helper function per module instead of duplicating unrolled blocks per entry.
+    if (norm === 'none' && hasF16) {
+      const unroll31 = rep(31, (i) => {
+        const k = i + 1;
+        return `    {
+      let m = sh_mm[rb + ${k}u];
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`;
       });
-    }
-
-    let out = '';
-    for (let c = cStart; c < cEnd; c += 2) {
-      const c0 = c;
-      const c1 = c + 1;
-      out += `  {
-    let f0 = vec4<f32>(a_${c0}${sw});
-    let f1 = vec4<f32>(a_${c1}${sw});
-    sh_s[tid]  = vec2<f32>(f0.x + f0.y + f0.z + f0.w, f1.x + f1.y + f1.z + f1.w);
-    sh_q[tid]  = vec2<f32>(dot(f0, f0), dot(f1, f1));
-    sh_mn[tid] = vec2<f32>(min(min(f0.x, f0.y), min(f0.z, f0.w)), min(min(f1.x, f1.y), min(f1.z, f1.w)));
-    sh_mx[tid] = vec2<f32>(max(max(f0.x, f0.y), max(f0.z, f0.w)), max(max(f1.x, f1.y), max(f1.z, f1.w)));
-    workgroupBarrier();
-    if (slane < 2u) {
-      var rs : f32 = 0.0;
-      var rq : f32 = 0.0;
-      var rmn : f32 = 3.0e38;
-      var rmx : f32 = -3.0e38;
-      if (slane == 0u) {
-        for (var k : u32 = 0u; k < 32u; k = k + 1u) {
-          rs  += sh_s[hbase + k].x;
-          rq  += sh_q[hbase + k].x;
-          rmn  = min(rmn, sh_mn[hbase + k].x);
-          rmx  = max(rmx, sh_mx[hbase + k].x);
-        }
-        let sp = rmx - rmn;
-        sh_res_mn[hslot]  = rmn;
-        sh_res_inv[hslot] = select(0.0, 1.0 / sp, sp > 1e-7);
-        let mv0 = vec4<f32>(rs, rq, rmn, sp);
-        ${momBinding}[(${hrExpr}) * ${cs}u + ${c0}u] = mv0;
-        ${alsoWriteMomMain ? `mom_main[(row_idx * 2u + sg) * ${cs}u + ${c0}u] = mv0;` : ''}
-      } else {
-        for (var k : u32 = 0u; k < 32u; k = k + 1u) {
-          rs  += sh_s[hbase + k].y;
-          rq  += sh_q[hbase + k].y;
-          rmn  = min(rmn, sh_mn[hbase + k].y);
-          rmx  = max(rmx, sh_mx[hbase + k].y);
-        }
-        let sp = rmx - rmn;
-        sh_res_mn[hslot + 1u]  = rmn;
-        sh_res_inv[hslot + 1u] = select(0.0, 1.0 / sp, sp > 1e-7);
-        let mv1 = vec4<f32>(rs, rq, rmn, sp);
-        ${momBinding}[(${hrExpr}) * ${cs}u + ${c1}u] = mv1;
-        ${alsoWriteMomMain ? `mom_main[(row_idx * 2u + sg) * ${cs}u + ${c1}u] = mv1;` : ''}
-      }
-    }
-    workgroupBarrier();
-    let p_mn0  = sh_res_mn[hslot];
-    let p_inv0 = sh_res_inv[hslot];
-    let p_mn1  = sh_res_mn[hslot + 1u];
-    let p_inv1 = sh_res_inv[hslot + 1u];
+      const decls = `var<workgroup> sh_mm  : array<vec2<f16>, 1024>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+fn vec_mm16(a : vec4<f16>) -> vec2<f16> {
+  return vec2<f16>(min(min(a.x, a.y), min(a.z, a.w)), max(max(a.x, a.y), max(a.z, a.w)));
+}
+fn reduce_pack4(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, c_base : u32, ext_off : u32, main_off : u32, mom_mode : u32
+) -> vec4<u32> {
+  let b0 = (h * 4u) * 32u + slane;
+  sh_mm[b0]       = vec_mm16(a0);
+  sh_mm[b0 + 32u] = vec_mm16(a1);
+  sh_mm[b0 + 64u] = vec_mm16(a2);
+  sh_mm[b0 + 96u] = vec_mm16(a3);
+  workgroupBarrier();
+  if (slane < 4u) {
+    let rb = (h * 4u + slane) * 32u;
+    let m0 = sh_mm[rb];
+    var rmn : f16 = m0.x;
+    var rmx : f16 = m0.y;
+${unroll31}    let fmn = f32(rmn);
+    let sp = f32(rmx) - fmn;
+    sh_res[h * 4u + slane] = vec2<f32>(fmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(0.0, 0.0, fmn, sp);
+${momSwitchStmt}
+  }
+  workgroupBarrier();
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let f2 = vec4<f32>(a2${sw});
+  let f3 = vec4<f32>(a3${sw});
+  let r0 = sh_res[h * 4u + 0u];
+  let r1 = sh_res[h * 4u + 1u];
+  let r2 = sh_res[h * 4u + 2u];
+  let r3 = sh_res[h * 4u + 3u];
+  return vec4<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y),
+    pack4x8unorm((f2 - vec4<f32>(r2.x)) * r2.y),
+    pack4x8unorm((f3 - vec4<f32>(r3.x)) * r3.y)
+  );
+}\n`;
+      return {
+        decls,
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) => {
+          const modeCode = momMode === 'ext_and_main' ? '1u' : momMode === 'ext_only' ? '2u' : '0u';
+          const extOff = momMode === 'main' ? '0u' : `(${hrExpr}) * ${cs}u`;
+          const mainOff = momMode === 'ext_only' ? '0u' : `(row_idx * 2u + sg) * ${cs}u`;
+          let out = `  let ep_ext_off = ${extOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, ${c}u, ep_ext_off, ep_main_off, ${modeCode});
     if (${writeY8Expr}) {
-      ${storeY(c0, 'pack4x8unorm((f0 - vec4<f32>(p_mn0)) * p_inv0)')}
-      ${storeY(c1, 'pack4x8unorm((f1 - vec4<f32>(p_mn1)) * p_inv1)')}
+      ${storeY(yRowExpr, c, 'qw.x')}
+      ${storeY(yRowExpr, c + 1, 'qw.y')}
+      ${storeY(yRowExpr, c + 2, 'qw.z')}
+      ${storeY(yRowExpr, c + 3, 'qw.w')}
     }
-    workgroupBarrier();
   }\n`;
+          }
+          return out;
+        },
+      };
     }
-    return out;
-  };
 
-  const sharedReductionDecls = hasF16 && hasSubgroups32
-    ? ''
-    : `var<workgroup> sh_s       : array<vec2<f32>, 256>;
-var<workgroup> sh_q       : array<vec2<f32>, 256>;
-var<workgroup> sh_mn      : array<vec2<f32>, 256>;
-var<workgroup> sh_mx      : array<vec2<f32>, 256>;
-var<workgroup> sh_res_mn  : array<f32, 16>;
-var<workgroup> sh_res_inv : array<f32, 16>;\n`;
+    if (norm === 'none') {
+      const unroll32 = rep(32, (k) => `    {
+      let m = sh_mm[rb + ${k}u];
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`);
+      const decls = `var<workgroup> sh_mm  : array<vec2<f32>, 1024>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+fn vec_mm(f : vec4<f32>) -> vec2<f32> {
+  return vec2<f32>(min(min(f.x, f.y), min(f.z, f.w)), max(max(f.x, f.y), max(f.z, f.w)));
+}
+fn reduce_pack4(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, c_base : u32, ext_off : u32, main_off : u32, mom_mode : u32
+) -> vec4<u32> {
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let f2 = vec4<f32>(a2${sw});
+  let f3 = vec4<f32>(a3${sw});
+  let b0 = (h * 4u) * 32u + slane;
+  sh_mm[b0]       = vec_mm(f0);
+  sh_mm[b0 + 32u] = vec_mm(f1);
+  sh_mm[b0 + 64u] = vec_mm(f2);
+  sh_mm[b0 + 96u] = vec_mm(f3);
+  workgroupBarrier();
+  if (slane < 4u) {
+    let rb = (h * 4u + slane) * 32u;
+    var rmn : f32 = 3.0e38;
+    var rmx : f32 = -3.0e38;
+${unroll32}    let sp = rmx - rmn;
+    sh_res[h * 4u + slane] = vec2<f32>(rmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(0.0, 0.0, rmn, sp);
+${momSwitchStmt}
+  }
+  workgroupBarrier();
+  let r0 = sh_res[h * 4u + 0u];
+  let r1 = sh_res[h * 4u + 1u];
+  let r2 = sh_res[h * 4u + 2u];
+  let r3 = sh_res[h * 4u + 3u];
+  return vec4<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y),
+    pack4x8unorm((f2 - vec4<f32>(r2.x)) * r2.y),
+    pack4x8unorm((f3 - vec4<f32>(r3.x)) * r3.y)
+  );
+}\n`;
+      return {
+        decls,
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) => {
+          const modeCode = momMode === 'ext_and_main' ? '1u' : momMode === 'ext_only' ? '2u' : '0u';
+          const extOff = momMode === 'main' ? '0u' : `(${hrExpr}) * ${cs}u`;
+          const mainOff = momMode === 'ext_only' ? '0u' : `(row_idx * 2u + sg) * ${cs}u`;
+          let out = `  let ep_ext_off = ${extOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, ${c}u, ep_ext_off, ep_main_off, ${modeCode});
+    if (${writeY8Expr}) {
+      ${storeY(yRowExpr, c, 'qw.x')}
+      ${storeY(yRowExpr, c + 1, 'qw.y')}
+      ${storeY(yRowExpr, c + 2, 'qw.z')}
+      ${storeY(yRowExpr, c + 3, 'qw.w')}
+    }
+  }\n`;
+          }
+          return out;
+        },
+      };
+    }
+
+    if (hasF16) {
+      // 4-channel batch in 12.25 KiB shared memory (<= 16 KiB baseline limit, 12 barriers for 24ch,
+      // native vec2<f16> min/max shared storage with zero pack2x16float/unpack2x16float overhead)
+      const unroll31 = rep(31, (i) => {
+        const k = i + 1;
+        return `    {
+      let s = sh_sq[rb + ${k}u];
+      let m = sh_mm[rb + ${k}u];
+      rs += s.x;
+      rq += s.y;
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`;
+      });
+      const decls = `var<workgroup> sh_sq  : array<vec2<f32>, 1024>;
+var<workgroup> sh_mm  : array<vec2<f16>, 1024>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+fn vec_mm16(a : vec4<f16>) -> vec2<f16> {
+  return vec2<f16>(min(min(a.x, a.y), min(a.z, a.w)), max(max(a.x, a.y), max(a.z, a.w)));
+}
+fn reduce_pack4(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, c_base : u32, ext_off : u32, main_off : u32, mom_mode : u32
+) -> vec4<u32> {
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let f2 = vec4<f32>(a2${sw});
+  let f3 = vec4<f32>(a3${sw});
+  let b0 = (h * 4u) * 32u + slane;
+  sh_sq[b0]       = vec2<f32>(f0.x + f0.y + f0.z + f0.w, dot(f0, f0));
+  sh_sq[b0 + 32u] = vec2<f32>(f1.x + f1.y + f1.z + f1.w, dot(f1, f1));
+  sh_sq[b0 + 64u] = vec2<f32>(f2.x + f2.y + f2.z + f2.w, dot(f2, f2));
+  sh_sq[b0 + 96u] = vec2<f32>(f3.x + f3.y + f3.z + f3.w, dot(f3, f3));
+  sh_mm[b0]       = vec_mm16(a0);
+  sh_mm[b0 + 32u] = vec_mm16(a1);
+  sh_mm[b0 + 64u] = vec_mm16(a2);
+  sh_mm[b0 + 96u] = vec_mm16(a3);
+  workgroupBarrier();
+  if (slane < 4u) {
+    let rb = (h * 4u + slane) * 32u;
+    let s0 = sh_sq[rb];
+    let m0 = sh_mm[rb];
+    var rs : f32 = s0.x;
+    var rq : f32 = s0.y;
+    var rmn : f16 = m0.x;
+    var rmx : f16 = m0.y;
+${unroll31}    let fmn = f32(rmn);
+    let sp = f32(rmx) - fmn;
+    sh_res[h * 4u + slane] = vec2<f32>(fmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(rs, rq, fmn, sp);
+${momSwitchStmt}
+  }
+  workgroupBarrier();
+  let r0 = sh_res[h * 4u + 0u];
+  let r1 = sh_res[h * 4u + 1u];
+  let r2 = sh_res[h * 4u + 2u];
+  let r3 = sh_res[h * 4u + 3u];
+  return vec4<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y),
+    pack4x8unorm((f2 - vec4<f32>(r2.x)) * r2.y),
+    pack4x8unorm((f3 - vec4<f32>(r3.x)) * r3.y)
+  );
+}\n`;
+      return {
+        decls,
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) => {
+          const modeCode = momMode === 'ext_and_main' ? '1u' : momMode === 'ext_only' ? '2u' : '0u';
+          const extOff = momMode === 'main' ? '0u' : `(${hrExpr}) * ${cs}u`;
+          const mainOff = momMode === 'ext_only' ? '0u' : `(row_idx * 2u + sg) * ${cs}u`;
+          let out = `  let ep_ext_off = ${extOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, ${c}u, ep_ext_off, ep_main_off, ${modeCode});
+    if (${writeY8Expr}) {
+      ${storeY(yRowExpr, c, 'qw.x')}
+      ${storeY(yRowExpr, c + 1, 'qw.y')}
+      ${storeY(yRowExpr, c + 2, 'qw.z')}
+      ${storeY(yRowExpr, c + 3, 'qw.w')}
+    }
+  }\n`;
+          }
+          return out;
+        },
+      };
+    }
+
+    // f32 fallback + GroupNorm: 2-channel batch in full f32 (8.125 KiB <= 16 KiB limit)
+    const unroll32 = rep(32, (k) => `    {
+      let s = sh_sq[rb + ${k}u];
+      let m = sh_mm[rb + ${k}u];
+      rs += s.x;
+      rq += s.y;
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`);
+    const decls = `var<workgroup> sh_sq  : array<vec2<f32>, 512>;
+var<workgroup> sh_mm  : array<vec2<f32>, 512>;
+var<workgroup> sh_res : array<vec2<f32>, 16>;
+fn vec_mm(f : vec4<f32>) -> vec2<f32> {
+  return vec2<f32>(min(min(f.x, f.y), min(f.z, f.w)), max(max(f.x, f.y), max(f.z, f.w)));
+}
+fn reduce_pack2(
+  a0 : ${V4}, a1 : ${V4},
+  h : u32, slane : u32, c_base : u32, ext_off : u32, main_off : u32, mom_mode : u32
+) -> vec2<u32> {
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let b0 = (h * 2u) * 32u + slane;
+  sh_sq[b0]       = vec2<f32>(f0.x + f0.y + f0.z + f0.w, dot(f0, f0));
+  sh_sq[b0 + 32u] = vec2<f32>(f1.x + f1.y + f1.z + f1.w, dot(f1, f1));
+  sh_mm[b0]       = vec_mm(f0);
+  sh_mm[b0 + 32u] = vec_mm(f1);
+  workgroupBarrier();
+  if (slane < 2u) {
+    let rb = (h * 2u + slane) * 32u;
+    var rs : f32 = 0.0;
+    var rq : f32 = 0.0;
+    var rmn : f32 = 3.0e38;
+    var rmx : f32 = -3.0e38;
+${unroll32}    let sp = rmx - rmn;
+    sh_res[h * 2u + slane] = vec2<f32>(rmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(rs, rq, rmn, sp);
+${momSwitchStmt}
+  }
+  workgroupBarrier();
+  let r0 = sh_res[h * 2u + 0u];
+  let r1 = sh_res[h * 2u + 1u];
+  return vec2<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y)
+  );
+}\n`;
+    return {
+      decls,
+      localHeader: '  let h = lid.y * 2u + sg;\n',
+      emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) => {
+        const modeCode = momMode === 'ext_and_main' ? '1u' : momMode === 'ext_only' ? '2u' : '0u';
+        const extOff = momMode === 'main' ? '0u' : `(${hrExpr}) * ${cs}u`;
+        const mainOff = momMode === 'ext_only' ? '0u' : `(row_idx * 2u + sg) * ${cs}u`;
+        let out = `  let ep_ext_off = ${extOff};\n  let ep_main_off = ${mainOff};\n`;
+        for (let idx = 0; idx < cEnd - cStart; idx += 2) {
+          const c = cStart + idx;
+          out += `  {
+    let qw = reduce_pack2(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, h, slane, ${c}u, ep_ext_off, ep_main_off, ${modeCode});
+    if (${writeY8Expr}) {
+      ${storeY(yRowExpr, c, 'qw.x')}
+      ${storeY(yRowExpr, c + 1, 'qw.y')}
+    }
+  }\n`;
+        }
+        return out;
+      },
+    };
+  };
 
   // --- 0. INIT_ACT8 SHADER ---
   const initActWgsl = () => `
@@ -2315,6 +2669,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
   const d0 = dilations[0];
   const conv0Wgsl = () => {
     const halfPass0 = !hasF16 && splitHalves;
+    const ep0 = buildStdEpilogue(false);
     const fmaRange = (cStart, cEnd) => {
       const gStart = cStart / 4;
       const gEnd = cEnd / 4;
@@ -2377,34 +2732,25 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
         let vp = ${V4}(vP.w, vR.xyz);`;
     }
 
-    const emitConv0Entry = (fnName, cStart, cEnd, isBgEntry) => {
-      const accInit = rep(cEnd - cStart, (i) => {
+    const emitConv0Compute = (fnName, structName, cStart, cEnd) => {
+      const nCh = cEnd - cStart;
+      const fields = rep(nCh, (i) => `  v_${i} : ${V4},\n`);
+      const accInit = rep(nCh, (i) => {
         const c = cStart + i;
         return norm === 'none'
           ? `  var a_${c} = ${V4}(${T}(qmeta[${3 * cs + c}u]));\n`
           : `  var a_${c} = ${V4}(0.0${suf});\n`;
       });
-      const coords = isBgEntry
-        ? '  let y = i32(p0.bg_y0 + lid.y);\n  let z = i32(p0.bg_z0);'
-        : `  var y : i32;\n  var z : i32;\n  if (p0.is_full != 0u) {\n    y = i32(wid.y * 4u + lid.y);\n    z = i32(wid.z);\n  } else {\n    let pk = strips0[wid.z];\n    y = i32((pk & 255u) * 4u + lid.y);\n    z = i32(pk >> 8u);\n  }`;
-      const hrExpr = isBgEntry ? 'lid.y * 2u + sg' : 'row_idx * 2u + sg';
-      const momBind = isBgEntry ? 'mom_ext' : 'mom_main';
-      return `
-@compute @workgroup_size(64, 4, 1)
-fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
-             @builtin(workgroup_id) wid : vec3<u32>) {
-  let sg = lid.x >> 5u;
-  let slane = lid.x & 31u;
-${hasF16 && hasSubgroups32 ? '' : '  let hbase = (lid.y * 2u + sg) * 32u;\n  let tid = hbase + slane;\n  let hslot = (lid.y * 2u + sg) * 2u;\n'}
-  let x_pad = lid.x + ${X4_HALO}u;
-${coords}
-${accInit}
-  var tap_yz : u32 = 0u;
+      const retArgs = Array.from({ length: nCh }, (_, i) => `a_${cStart + i}`).join(', ');
+      return `struct ${structName} {
+${fields}};
+fn ${fnName}(y : i32, z : i32, x_pad : u32) -> ${structName} {
+${accInit}  var tap_yz : u32 = 0u;
   for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
     let sz = z + dz * ${d0};
     for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
       let sy = y + dy * ${d0};
-      if (sz >= 0 && sz < 256 && sy >= 0 && sy < 256) {
+      if ((u32(sz) | u32(sy)) < 256u) {
         let base = (u32(sz) * 256u + u32(sy)) * ${X4_PAD}u + x_pad;
 ${loadInp0}
         let wb = tap_yz * ${3 * oc4}u;
@@ -2413,25 +2759,46 @@ ${fmaRange(cStart, cEnd)}
       tap_yz = tap_yz + 1u;
     }
   }
+  return ${structName}(${retArgs});
+}\n`;
+    };
+
+    const emitConv0Entry = (fnName, computeFn, cStart, cEnd, isBgEntry) => {
+      const coords = isBgEntry
+        ? '  let y = i32(p0.bg_y0 + lid.y);\n  let z = i32(p0.bg_z0);'
+        : `  var y : i32;\n  var z : i32;\n  if (p0.is_full != 0u) {\n    y = i32(wid.y * 4u + lid.y);\n    z = i32(wid.z);\n  } else {\n    let pk = strips0[wid.z];\n    y = i32((pk & 255u) * 4u + lid.y);\n    z = i32(pk >> 8u);\n  }`;
+      const hrExpr = isBgEntry ? 'lid.y * 2u + sg' : 'row_idx * 2u + sg';
+      return `
+@compute @workgroup_size(64, 4, 1)
+fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
+             @builtin(workgroup_id) wid : vec3<u32>) {
+  let sg = lid.x >> 5u;
+  let slane = lid.x & 31u;
+${ep0.localHeader}  let x_pad = lid.x + ${X4_HALO}u;
+${coords}
+  let acc = ${computeFn}(y, z, x_pad);
   let row_idx = u32(z) * 256u + u32(y);
   let y_row_base = row_idx * ${rowStrideY}u + lid.x;
-${emitEpilogue({
+${ep0.emit({
+  accVar: 'acc',
   cStart,
   cEnd,
   hrExpr,
   yRowExpr: 'y_row_base',
-  isPermuted: false,
-  momBinding: momBind,
+  momMode: isBgEntry ? 'ext_only' : 'main',
 })}}`;
     };
 
-    const entries = halfPass0
-      ? emitConv0Entry('main_lo', 0, csHalf, false) +
-        emitConv0Entry('main_hi', csHalf, cs, false) +
-        emitConv0Entry('main_bg_lo', 0, csHalf, true) +
-        emitConv0Entry('main_bg_hi', csHalf, cs, true)
-      : emitConv0Entry('main', 0, cs, false) +
-        emitConv0Entry('main_bg', 0, cs, true);
+    const helpersAndEntries = halfPass0
+      ? emitConv0Compute('run_conv0_lo', 'Conv0AccLo', 0, csHalf) +
+        emitConv0Compute('run_conv0_hi', 'Conv0AccHi', csHalf, cs) +
+        emitConv0Entry('main_lo', 'run_conv0_lo', 0, csHalf, false) +
+        emitConv0Entry('main_hi', 'run_conv0_hi', csHalf, cs, false) +
+        emitConv0Entry('main_bg_lo', 'run_conv0_lo', 0, csHalf, true) +
+        emitConv0Entry('main_bg_hi', 'run_conv0_hi', csHalf, cs, true)
+      : emitConv0Compute('run_conv0', 'Conv0Acc', 0, cs) +
+        emitConv0Entry('main', 'run_conv0', 0, cs, false) +
+        emitConv0Entry('main_bg', 'run_conv0', 0, cs, true);
 
     return `${f16Enable}${sgEnable}
 struct Params0 {
@@ -2449,7 +2816,7 @@ struct Params0 {
 @group(0) @binding(6) var<storage, read_write> mom_ext : array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> strips0 : array<u32>;
 @group(0) @binding(8) var<uniform> p0 : Params0;
-${sharedReductionDecls}${entries}`;
+${ep0.decls}${helpersAndEntries}`;
   };
 
   // --- 2. MOMENTS_FINISH + PREP_WEFF SHADER ---
@@ -2478,29 +2845,27 @@ struct PrepParams {
 @group(0) @binding(6) var<storage, read> main_strips : array<u32>;
 @group(0) @binding(7) var<uniform> pp : PrepParams;
 
-var<workgroup> fin_s  : array<f32, 256>;
+${norm === 'gn' ? `var<workgroup> fin_s  : array<f32, 256>;
 var<workgroup> fin_q  : array<f32, 256>;
 var<workgroup> fin_es : array<f32, 256>;
 var<workgroup> fin_eq : array<f32, 256>;
-var<workgroup> fin_mn : array<f32, 256>;
+` : ''}var<workgroup> fin_mn : array<f32, 256>;
 var<workgroup> fin_mx : array<f32, 256>;
 
 @compute @workgroup_size(256, 1, 1)
 fn moments_finish(@builtin(local_invocation_index) lid : u32,
                   @builtin(workgroup_id) wid : vec3<u32>) {
   let c = wid.x;
-  var s : f32 = 0.0;
+${norm === 'gn' ? `  var s : f32 = 0.0;
   var q : f32 = 0.0;
   var es : f32 = 0.0;
   var eq : f32 = 0.0;
-  var mn : f32 = 3.0e38;
+` : ''}  var mn : f32 = 3.0e38;
   var mx : f32 = -3.0e38;
   if (pp.is_full != 0u) {
     for (var hr : u32 = lid; hr < ${TOTAL_HALF_ROWS}u; hr = hr + 256u) {
       let v = mom_main[hr * ${cs}u + c];
-      s  += v.x;
-      q  += v.y;
-      mn  = min(mn, v.z);
+${norm === 'gn' ? '      s  += v.x;\n      q  += v.y;\n' : ''}      mn  = min(mn, v.z);
       mx  = max(mx, v.z + v.w);
     }
   } else {
@@ -2509,9 +2874,7 @@ fn moments_finish(@builtin(local_invocation_index) lid : u32,
       let base_hr = ((pk >> 8u) * 256u + (pk & 255u) * 4u) * 2u;
       for (var h : u32 = 0u; h < 8u; h = h + 1u) {
         let v = mom_main[(base_hr + h) * ${cs}u + c];
-        s  += v.x;
-        q  += v.y;
-        mn  = min(mn, v.z);
+${norm === 'gn' ? '        s  += v.x;\n        q  += v.y;\n' : ''}        mn  = min(mn, v.z);
         mx  = max(mx, v.z + v.w);
       }
     }
@@ -2521,27 +2884,25 @@ fn moments_finish(@builtin(local_invocation_index) lid : u32,
     } else if (pp.n_ext_hr > 0u) {
       for (var e : u32 = lid; e < pp.n_ext_hr; e = e + 256u) {
         let v = mom_ext[e * ${cs}u + c];
-        es += v.x;
-        eq += v.y;
-        mn  = min(mn, v.z);
+${norm === 'gn' ? '        es += v.x;\n        eq += v.y;\n' : ''}        mn  = min(mn, v.z);
         mx  = max(mx, v.z + v.w);
       }
     }
   }
-  fin_s[lid]  = s;
+${norm === 'gn' ? `  fin_s[lid]  = s;
   fin_q[lid]  = q;
   fin_es[lid] = es;
   fin_eq[lid] = eq;
-  fin_mn[lid] = mn;
+` : ''}  fin_mn[lid] = mn;
   fin_mx[lid] = mx;
   workgroupBarrier();
   for (var stride : u32 = 128u; stride > 0u; stride = stride >> 1u) {
     if (lid < stride) {
-      fin_s[lid]  += fin_s[lid + stride];
+${norm === 'gn' ? `      fin_s[lid]  += fin_s[lid + stride];
       fin_q[lid]  += fin_q[lid + stride];
       fin_es[lid] += fin_es[lid + stride];
       fin_eq[lid] += fin_eq[lid + stride];
-      fin_mn[lid]  = min(fin_mn[lid], fin_mn[lid + stride]);
+` : ''}      fin_mn[lid]  = min(fin_mn[lid], fin_mn[lid + stride]);
       fin_mx[lid]  = max(fin_mx[lid], fin_mx[lid + stride]);
     }
     workgroupBarrier();
@@ -2553,12 +2914,14 @@ fn moments_finish(@builtin(local_invocation_index) lid : u32,
     let eps_base = qmeta[mbase + ${2 * cs}u + c];
     let q_prev = select(mom_stats[${cs * 2}u].x, 1.0, pp.is_first != 0u);
     let eff_eps = eps_base / (q_prev * q_prev);
-    let total_s = fin_s[0] + pp.ext_weight * fin_es[0];
+${norm === 'gn' ? `    let total_s = fin_s[0] + pp.ext_weight * fin_es[0];
     let total_q = fin_q[0] + pp.ext_weight * fin_eq[0];
-    let mean = ${norm === 'gn' ? 'total_s / 16777216.0' : '0.0'};
-    let varr = ${norm === 'gn' ? 'max(total_q / 16777216.0 - mean * mean, 0.0)' : '1.0'};
-    let inv_std = ${norm === 'gn' ? 'inverseSqrt(varr + eff_eps)' : '1.0'};
-    let scale = inv_std * gamma;
+    let mean = total_s / 16777216.0;
+    let varr = max(total_q / 16777216.0 - mean * mean, 0.0);
+    let inv_std = inverseSqrt(varr + eff_eps);
+` : `    let mean : f32 = 0.0;
+    let inv_std : f32 = 1.0;
+`}    let scale = inv_std * gamma;
     let shift = beta - mean * scale;
     let u_lo = fin_mn[0] * scale + shift;
     let u_hi = fin_mx[0] * scale + shift;
@@ -2717,12 +3080,13 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
   }` : ''}
 }`;
 
-  // --- 4. CONV_INT8 DILATION-SPECIALIZED SHADERS (@workgroup_size(64, 4, 1)) ---
-  const buildConvForDilation = (D) => {
-    const qStep = Math.floor(D / 4);
-    const rBytes = D % 4;
-    const rBits = rBytes * 8;
+  // --- 4. CONV_INT8 UNIFIED DILATION SHADER (@workgroup_size(64, 4, 1)) ---
+  // Single shader module for all hidden dilations (encoded in cp.d_pack), with
+  // shared run_conv() and epilogue helpers so Naga/DXC/Metal compile 1 compact
+  // module instead of 7 duplicated dilation-specialized modules.
+  const convWgsl = () => {
     const halfPass = !hasF16 && splitHalves;
+    const epC = buildStdEpilogue(hasF16);
 
     const emitUnpack = (vName, uExpr) => {
       if (hasF16) {
@@ -2733,40 +3097,17 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
           let ${vName} = unpack4x8unorm(${uExpr}) - vec4<f32>(${qConst.uZeroFloat});`;
     };
 
-    const emitLoads = (arrName) => {
-      if (rBits === 0) {
-        return `
-          let u_neg = ${arrName}[base - ${qStep}u];
-          let uC    = ${arrName}[base];
-          let u_pos = ${arrName}[base + ${qStep}u];` +
-          emitUnpack('vn', 'u_neg') +
-          emitUnpack('vc', 'uC') +
-          emitUnpack('vp', 'u_pos');
-      }
-      const loShift = 32 - rBits;
-      if (qStep === 0) {
-        return `
-          let uL = ${arrName}[base - 1u];
+    const emitLoads = (arrName) => `
+          let uL = ${arrName}[base - off0];
+          let uN = ${arrName}[base - off1];
           let uC = ${arrName}[base];
-          let uR = ${arrName}[base + 1u];
-          let u_neg = (uL >> ${loShift}u) | (uC << ${rBits}u);
-          let u_pos = (uC >> ${rBits}u) | (uR << ${loShift}u);` +
-          emitUnpack('vn', 'u_neg') +
-          emitUnpack('vc', 'uC') +
-          emitUnpack('vp', 'u_pos');
-      }
-      return `
-          let uL = ${arrName}[base - ${qStep + 1}u];
-          let uN = ${arrName}[base - ${qStep}u];
-          let uC = ${arrName}[base];
-          let uP = ${arrName}[base + ${qStep}u];
-          let uR = ${arrName}[base + ${qStep + 1}u];
-          let u_neg = (uL >> ${loShift}u) | (uN << ${rBits}u);
-          let u_pos = (uP >> ${rBits}u) | (uR << ${loShift}u);` +
-        emitUnpack('vn', 'u_neg') +
-        emitUnpack('vc', 'uC') +
-        emitUnpack('vp', 'u_pos');
-    };
+          let uP = ${arrName}[base + off1];
+          let uR = ${arrName}[base + off0];
+          let u_neg = (uL >> sh_l) | (uN << sh_r);
+          let u_pos = (uP >> sh_r) | (uR << sh_l);` +
+      emitUnpack('vn', 'u_neg') +
+      emitUnpack('vc', 'uC') +
+      emitUnpack('vp', 'u_pos');
 
     const emitFmas = (cStart, cEnd) => {
       const gStart = cStart / 4;
@@ -2815,8 +3156,10 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
       });
     };
 
-    const emitConvEntry = (fnName, cStart, cEnd, isExtEntry) => {
-      const accInit = rep(cEnd - cStart, (i) => {
+    const emitConvCompute = (fnName, structName, cStart, cEnd) => {
+      const nCh = cEnd - cStart;
+      const fields = rep(nCh, (i) => `  v_${i} : ${V4},\n`);
+      const accInit = rep(nCh, (i) => {
         const c = cStart + i;
         if (norm === 'none') {
           const g = c >>> 2;
@@ -2830,7 +3173,65 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
         }
         return `  var a_${c} = ${V4}(0.0${suf});\n`;
       });
+      // Keep `ic` loop runtime-opaque (`+ cp.pad0`, where `cp.pad0 == 0u`) when
+      // `csHalf <= 8` so Apple Metal's compiler does not fully unroll 9x8 inner
+      // loops and thrash the instruction cache on 16ch / 15ch / 5ch models.
+      const icLim = csHalf <= 8 ? `(${csHalf}u + cp.pad0)` : `${csHalf}u`;
+      const wLoopLo = useUniformWeff
+        ? `        let wbu_tap = tap_yz * ${(cs * 3 * oc4) / 2}u;
+        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
+          let base = row_off + ic * ${X4_PAD}u;
+${emitLoads('act8_0')}
+          let wbu = wbu_tap + ic * ${(3 * oc4) / 2}u;
+${emitFmas(cStart, cEnd)}
+        }`
+        : `        let wb_tap = tap_yz * ${cs * 3 * oc4}u;
+        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
+          let base = row_off + ic * ${X4_PAD}u;
+${emitLoads('act8_0')}
+          let wb = wb_tap + ic * ${3 * oc4}u;
+${emitFmas(cStart, cEnd)}
+        }`;
+      const wLoopHi = useUniformWeff
+        ? `        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
+          let base = row_off + ic * ${X4_PAD}u;
+${emitLoads('act8_1')}
+          let wbu = wbu_tap + (${csHalf}u + ic) * ${(3 * oc4) / 2}u;
+${emitFmas(cStart, cEnd)}
+        }`
+        : `        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
+          let base = row_off + ic * ${X4_PAD}u;
+${emitLoads('act8_1')}
+          let wb = wb_tap + (${csHalf}u + ic) * ${3 * oc4}u;
+${emitFmas(cStart, cEnd)}
+        }`;
+      const retArgs = Array.from({ length: nCh }, (_, i) => `a_${cStart + i}`).join(', ');
+      return `struct ${structName} {
+${fields}};
+fn ${fnName}(y : i32, z : i32, x_pad : u32, dp : u32) -> ${structName} {
+${accInit}  let d_step = i32(dp & 63u);
+  let off0 = (dp >> 6u) & 15u;
+  let off1 = (dp >> 10u) & 15u;
+  let sh_r = (dp >> 14u) & 31u;
+  let sh_l = (dp >> 19u) & 31u;
+  var tap_yz : u32 = 0u;
+  for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
+    let sz = z + dz * d_step;
+    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
+      let sy = y + dy * d_step;
+      if ((u32(sz) | u32(sy)) < 256u) {
+        let row_off = (u32(sz) * 256u + u32(sy)) * ${rowStrideAct}u + x_pad;
+${wLoopLo}
+        ${splitHalves ? wLoopHi : ''}
+      }
+      tap_yz = tap_yz + 1u;
+    }
+  }
+  return ${structName}(${retArgs});
+}\n`;
+    };
 
+    const emitConvEntry = (fnName, computeFn, cStart, cEnd, isExtEntry) => {
       const coords = isExtEntry
         ? (chunkableStd
           ? `
@@ -2869,41 +3270,7 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
       const hrExpr = isExtEntry
         ? (chunkableStd ? 'ext_i * 8u + lid.y * 2u + sg' : 'wid.z * 8u + lid.y * 2u + sg')
         : 'row_idx * 2u + sg';
-      const momBind = isExtEntry ? 'mom_ext' : 'mom_main';
-      const writeY8Expr = isExtEntry ? '(cp.write_ext_y8 != 0u)' : 'true';
-      // Keep `ic` loop runtime-opaque (`+ cp.pad0`, where `cp.pad0 == 0u`) when
-      // `csHalf <= 8` so Apple Metal's compiler does not fully unroll 9x8 inner
-      // loops and thrash the instruction cache on 16ch / 15ch / 5ch models.
-      const icLim = csHalf <= 8 ? `(${csHalf}u + cp.pad0)` : `${csHalf}u`;
-      const wLoopLo = useUniformWeff
-        ? `        let wbu_tap = tap_yz * ${(cs * 3 * oc4) / 2}u;
-        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
-          let base = row_off + ic * ${X4_PAD}u;
-${emitLoads('act8_0')}
-          let wbu = wbu_tap + ic * ${(3 * oc4) / 2}u;
-${emitFmas(cStart, cEnd)}
-        }`
-        : `        let wb_tap = tap_yz * ${cs * 3 * oc4}u;
-        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
-          let base = row_off + ic * ${X4_PAD}u;
-${emitLoads('act8_0')}
-          let wb = wb_tap + ic * ${3 * oc4}u;
-${emitFmas(cStart, cEnd)}
-        }`;
-      const wLoopHi = useUniformWeff
-        ? `        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
-          let base = row_off + ic * ${X4_PAD}u;
-${emitLoads('act8_1')}
-          let wbu = wbu_tap + (${csHalf}u + ic) * ${(3 * oc4) / 2}u;
-${emitFmas(cStart, cEnd)}
-        }`
-        : `        for (var ic : u32 = 0u; ic < ${icLim}; ic = ic + 1u) {
-          let base = row_off + ic * ${X4_PAD}u;
-${emitLoads('act8_1')}
-          let wb = wb_tap + (${csHalf}u + ic) * ${3 * oc4}u;
-${emitFmas(cStart, cEnd)}
-        }`;
-
+      const writeY8Expr = isExtEntry ? '(((dp >> 24u) & 1u) != 0u)' : 'true';
       return `
 @compute @workgroup_size(64, 4, 1)
 fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
@@ -2911,44 +3278,33 @@ fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
   let x4 = lid.x;
   let sg = x4 >> 5u;
   let slane = x4 & 31u;
-${hasF16 && hasSubgroups32 ? '' : '  let hbase = (lid.y * 2u + sg) * 32u;\n  let tid = hbase + slane;\n  let hslot = (lid.y * 2u + sg) * 2u;\n'}
-  let x_pad = x4 + ${X4_HALO}u;
+${epC.localHeader}  let x_pad = x4 + ${X4_HALO}u;
 ${coords}
-${accInit}
-  var tap_yz : u32 = 0u;
-  for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
-    let sz = z + dz * ${D};
-    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
-      let sy = y + dy * ${D};
-      if (sz >= 0 && sz < 256 && sy >= 0 && sy < 256) {
-        let row_off = (u32(sz) * 256u + u32(sy)) * ${rowStrideAct}u + x_pad;
-${wLoopLo}
-        ${splitHalves ? wLoopHi : ''}
-      }
-      tap_yz = tap_yz + 1u;
-    }
-  }
+  let dp = cp.d_pack;
+  let acc = ${computeFn}(y, z, x_pad, dp);
   let row_idx = u32(z) * 256u + u32(y);
   let y_row_base = row_idx * ${rowStrideY}u + x4;
-${emitEpilogue({
+${epC.emit({
+  accVar: 'acc',
   cStart,
   cEnd,
   hrExpr,
   yRowExpr: 'y_row_base',
-  isPermuted: hasF16,
-  momBinding: momBind,
-  alsoWriteMomMain: isExtEntry,
+  momMode: isExtEntry ? 'ext_and_main' : 'main',
   writeY8Expr,
 })}}`;
     };
 
-    const entries = halfPass
-      ? emitConvEntry('main_lo', 0, csHalf, false) +
-        emitConvEntry('main_hi', csHalf, cs, false) +
-        emitConvEntry('main_ext_lo', 0, csHalf, true) +
-        emitConvEntry('main_ext_hi', csHalf, cs, true)
-      : emitConvEntry('main', 0, cs, false) +
-        emitConvEntry('main_ext', 0, cs, true);
+    const helpersAndEntries = halfPass
+      ? emitConvCompute('run_conv_lo', 'ConvAccLo', 0, csHalf) +
+        emitConvCompute('run_conv_hi', 'ConvAccHi', csHalf, cs) +
+        emitConvEntry('main_lo', 'run_conv_lo', 0, csHalf, false) +
+        emitConvEntry('main_hi', 'run_conv_hi', csHalf, cs, false) +
+        emitConvEntry('main_ext_lo', 'run_conv_lo', 0, csHalf, true) +
+        emitConvEntry('main_ext_hi', 'run_conv_hi', csHalf, cs, true)
+      : emitConvCompute('run_conv', 'ConvAcc', 0, cs) +
+        emitConvEntry('main', 'run_conv', 0, cs, false) +
+        emitConvEntry('main_ext', 'run_conv', 0, cs, true);
 
     // Pack paired vec4<f16> weights as vec4<u32> (never mat2x4<f16>): Naga's HLSL
     // backend emits `cbuffer { row_major half2x4 w_eff_u[N]; }` without decomposing
@@ -2968,7 +3324,7 @@ fn u4_hi(u : vec4<u32>) -> vec4<f16> {
       ? `struct ConvParams {
   is_full : u32,
   ext_off : u32,
-  write_ext_y8 : u32,
+  d_pack : u32,
   pad0 : u32,
   main_off : u32,
   ext_base : u32,
@@ -2978,7 +3334,7 @@ fn u4_hi(u : vec4<u32>) -> vec4<f16> {
       : `struct ConvParams {
   is_full : u32,
   ext_off : u32,
-  write_ext_y8 : u32,
+  d_pack : u32,
   pad0 : u32,
 };`;
 
@@ -2993,7 +3349,7 @@ ${convParamsDecl}
 ${wEffDecl}
 @group(0) @binding(7) var<storage, read> strips : array<u32>;
 @group(0) @binding(8) var<uniform> cp : ConvParams;
-${sharedReductionDecls}${entries}`;
+${epC.decls}${helpersAndEntries}`;
   };
 
   // --- 5. CLASSIFY_V4 SHADER ---
@@ -3076,7 +3432,7 @@ ${buildClassifierLoopsWgsl({
     conv0Wgsl,
     prepWgsl,
     normWgsl,
-    getConvWgsl: buildConvForDilation,
+    convWgsl,
     clsWgsl,
     totalWEffVec4s,
     useUniformWeff,
@@ -3126,21 +3482,9 @@ function buildShadersLowMem128(cfg) {
   const V4 = `vec4<${T}>`;
   const byteScale = hasF16 ? 256.0 : 255.0;
 
-  const sharedReductionDecls = hasF16 && hasSubgroups32
-    ? ''
-    : `var<workgroup> sh_s       : array<vec2<f32>, 256>;
-var<workgroup> sh_q       : array<vec2<f32>, 256>;
-var<workgroup> sh_mn      : array<vec2<f32>, 256>;
-var<workgroup> sh_mx      : array<vec2<f32>, 256>;
-var<workgroup> sh_res_mn  : array<f32, 16>;
-var<workgroup> sh_res_inv : array<f32, 16>;\n`;
-
-  const emitEpilogue128 = ({
-    cStart, cEnd, hrExpr, storeMode, isPermuted,
-    momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true',
-  }) => {
+  const build128Epilogue = (isPermuted) => {
     const sw = isPermuted ? '.xzyw' : '';
-    const storeY = (c, wordExpr) => {
+    const storeY = (storeMode, c, wordExpr) => {
       if (storeMode === 'stage_bg') {
         return `stage[s_bg_base + ${c * X4_VALID}u] = ${wordExpr};`;
       }
@@ -3153,10 +3497,31 @@ var<workgroup> sh_res_inv : array<f32, 16>;\n`;
     };
 
     if (hasF16 && hasSubgroups32) {
-      return rep(cEnd - cStart, (idx) => {
-        const c = cStart + idx;
-        return `  {
-    let f = vec4<f32>(a_${c}${sw});
+      return {
+        decls: '',
+        localHeader: '',
+        emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) =>
+          rep(cEnd - cStart, (idx) => {
+            const c = cStart + idx;
+            if (norm === 'none') {
+              return `  {
+    let f = vec4<f32>(${accVar}.v_${idx}${sw});
+    let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
+    let lmx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+    let sp = lmx - lmn;
+    let inv = select(0.0, 1.0 / sp, sp > 1e-7);
+    if (${writeY8Expr}) {
+      ${storeY(storeMode, c, 'pack4x8unorm((f - vec4<f32>(lmn)) * inv)')}
+    }
+    if (slane == 0u) {
+      let mv = vec4<f32>(0.0, 0.0, lmn, sp);
+      mom[${momOffExpr} + (${hrExpr}) * ${cs}u + ${c}u] = mv;
+      ${alsoWriteMomMain ? `mom[${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u + ${c}u] = mv;` : ''}
+    }
+  }\n`;
+            }
+            return `  {
+    let f = vec4<f32>(${accVar}.v_${idx}${sw});
     let ls = subgroupAdd(f.x + f.y + f.z + f.w);
     let lq = subgroupAdd(dot(f, f));
     let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
@@ -3164,7 +3529,7 @@ var<workgroup> sh_res_inv : array<f32, 16>;\n`;
     let sp = lmx - lmn;
     let inv = select(0.0, 1.0 / sp, sp > 1e-7);
     if (${writeY8Expr}) {
-      ${storeY(c, 'pack4x8unorm((f - vec4<f32>(lmn)) * inv)')}
+      ${storeY(storeMode, c, 'pack4x8unorm((f - vec4<f32>(lmn)) * inv)')}
     }
     if (slane == 0u) {
       let mv = vec4<f32>(ls, lq, lmn, sp);
@@ -3172,67 +3537,313 @@ var<workgroup> sh_res_inv : array<f32, 16>;\n`;
       ${alsoWriteMomMain ? `mom[${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u + ${c}u] = mv;` : ''}
     }
   }\n`;
-      });
+          }),
+      };
     }
 
-    let out = '';
-    for (let c = cStart; c < cEnd; c += 2) {
-      const c0 = c;
-      const c1 = c + 1;
-      out += `  {
-    let f0 = vec4<f32>(a_${c0}${sw});
-    let f1 = vec4<f32>(a_${c1}${sw});
-    sh_s[tid]  = vec2<f32>(f0.x + f0.y + f0.z + f0.w, f1.x + f1.y + f1.z + f1.w);
-    sh_q[tid]  = vec2<f32>(dot(f0, f0), dot(f1, f1));
-    sh_mn[tid] = vec2<f32>(min(min(f0.x, f0.y), min(f0.z, f0.w)), min(min(f1.x, f1.y), min(f1.z, f1.w)));
-    sh_mx[tid] = vec2<f32>(max(max(f0.x, f0.y), max(f0.z, f0.w)), max(max(f1.x, f1.y), max(f1.z, f1.w)));
-    workgroupBarrier();
-    if (slane < 2u) {
-      var rs : f32 = 0.0;
-      var rq : f32 = 0.0;
-      var rmn : f32 = 3.0e38;
-      var rmx : f32 = -3.0e38;
-      if (slane == 0u) {
-        for (var k : u32 = 0u; k < 32u; k = k + 1u) {
-          rs  += sh_s[hbase + k].x;
-          rq  += sh_q[hbase + k].x;
-          rmn  = min(rmn, sh_mn[hbase + k].x);
-          rmx  = max(rmx, sh_mx[hbase + k].x);
-        }
-        let sp = rmx - rmn;
-        sh_res_mn[hslot]  = rmn;
-        sh_res_inv[hslot] = select(0.0, 1.0 / sp, sp > 1e-7);
-        let mv0 = vec4<f32>(rs, rq, rmn, sp);
-        mom[${momOffExpr} + (${hrExpr}) * ${cs}u + ${c0}u] = mv0;
-        ${alsoWriteMomMain ? `mom[${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u + ${c0}u] = mv0;` : ''}
-      } else {
-        for (var k : u32 = 0u; k < 32u; k = k + 1u) {
-          rs  += sh_s[hbase + k].y;
-          rq  += sh_q[hbase + k].y;
-          rmn  = min(rmn, sh_mn[hbase + k].y);
-          rmx  = max(rmx, sh_mx[hbase + k].y);
-        }
-        let sp = rmx - rmn;
-        sh_res_mn[hslot + 1u]  = rmn;
-        sh_res_inv[hslot + 1u] = select(0.0, 1.0 / sp, sp > 1e-7);
-        let mv1 = vec4<f32>(rs, rq, rmn, sp);
-        mom[${momOffExpr} + (${hrExpr}) * ${cs}u + ${c1}u] = mv1;
-        ${alsoWriteMomMain ? `mom[${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u + ${c1}u] = mv1;` : ''}
-      }
-    }
-    workgroupBarrier();
-    let p_mn0  = sh_res_mn[hslot];
-    let p_inv0 = sh_res_inv[hslot];
-    let p_mn1  = sh_res_mn[hslot + 1u];
-    let p_inv1 = sh_res_inv[hslot + 1u];
+    const momWriteStmt = `    let c_out = c_base + slane;
+    mom[mom_off + c_out] = mv;
+    if (also_main) {
+      mom[main_off + c_out] = mv;
+    }`;
+
+    if (norm === 'none' && hasF16) {
+      const unroll31 = rep(31, (i) => {
+        const k = i + 1;
+        return `    {
+      let m = sh_mm[rb + ${k}u];
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`;
+      });
+      const decls = `var<workgroup> sh_mm  : array<vec2<f16>, 1024>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+fn vec_mm16(a : vec4<f16>) -> vec2<f16> {
+  return vec2<f16>(min(min(a.x, a.y), min(a.z, a.w)), max(max(a.x, a.y), max(a.z, a.w)));
+}
+fn reduce_pack4(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, c_base : u32, mom_off : u32, main_off : u32, also_main : bool
+) -> vec4<u32> {
+  let b0 = (h * 4u) * 32u + slane;
+  sh_mm[b0]       = vec_mm16(a0);
+  sh_mm[b0 + 32u] = vec_mm16(a1);
+  sh_mm[b0 + 64u] = vec_mm16(a2);
+  sh_mm[b0 + 96u] = vec_mm16(a3);
+  workgroupBarrier();
+  if (slane < 4u) {
+    let rb = (h * 4u + slane) * 32u;
+    let m0 = sh_mm[rb];
+    var rmn : f16 = m0.x;
+    var rmx : f16 = m0.y;
+${unroll31}    let fmn = f32(rmn);
+    let sp = f32(rmx) - fmn;
+    sh_res[h * 4u + slane] = vec2<f32>(fmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(0.0, 0.0, fmn, sp);
+${momWriteStmt}
+  }
+  workgroupBarrier();
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let f2 = vec4<f32>(a2${sw});
+  let f3 = vec4<f32>(a3${sw});
+  let r0 = sh_res[h * 4u + 0u];
+  let r1 = sh_res[h * 4u + 1u];
+  let r2 = sh_res[h * 4u + 2u];
+  let r3 = sh_res[h * 4u + 3u];
+  return vec4<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y),
+    pack4x8unorm((f2 - vec4<f32>(r2.x)) * r2.y),
+    pack4x8unorm((f3 - vec4<f32>(r3.x)) * r3.y)
+  );
+}\n`;
+      return {
+        decls,
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) => {
+          const momOff = `${momOffExpr} + (${hrExpr}) * ${cs}u`;
+          const mainOff = alsoWriteMomMain ? `${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u` : '0u';
+          let out = `  let ep_mom_off = ${momOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, ${c}u, ep_mom_off, ep_main_off, ${alsoWriteMomMain});
     if (${writeY8Expr}) {
-      ${storeY(c0, 'pack4x8unorm((f0 - vec4<f32>(p_mn0)) * p_inv0)')}
-      ${storeY(c1, 'pack4x8unorm((f1 - vec4<f32>(p_mn1)) * p_inv1)')}
+      ${storeY(storeMode, c, 'qw.x')}
+      ${storeY(storeMode, c + 1, 'qw.y')}
+      ${storeY(storeMode, c + 2, 'qw.z')}
+      ${storeY(storeMode, c + 3, 'qw.w')}
     }
-    workgroupBarrier();
   }\n`;
+          }
+          return out;
+        },
+      };
     }
-    return out;
+
+    if (norm === 'none') {
+      const unroll32 = rep(32, (k) => `    {
+      let m = sh_mm[rb + ${k}u];
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`);
+      const decls = `var<workgroup> sh_mm  : array<vec2<f32>, 1024>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+fn vec_mm(f : vec4<f32>) -> vec2<f32> {
+  return vec2<f32>(min(min(f.x, f.y), min(f.z, f.w)), max(max(f.x, f.y), max(f.z, f.w)));
+}
+fn reduce_pack4(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, c_base : u32, mom_off : u32, main_off : u32, also_main : bool
+) -> vec4<u32> {
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let f2 = vec4<f32>(a2${sw});
+  let f3 = vec4<f32>(a3${sw});
+  let b0 = (h * 4u) * 32u + slane;
+  sh_mm[b0]       = vec_mm(f0);
+  sh_mm[b0 + 32u] = vec_mm(f1);
+  sh_mm[b0 + 64u] = vec_mm(f2);
+  sh_mm[b0 + 96u] = vec_mm(f3);
+  workgroupBarrier();
+  if (slane < 4u) {
+    let rb = (h * 4u + slane) * 32u;
+    var rmn : f32 = 3.0e38;
+    var rmx : f32 = -3.0e38;
+${unroll32}    let sp = rmx - rmn;
+    sh_res[h * 4u + slane] = vec2<f32>(rmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(0.0, 0.0, rmn, sp);
+${momWriteStmt}
+  }
+  workgroupBarrier();
+  let r0 = sh_res[h * 4u + 0u];
+  let r1 = sh_res[h * 4u + 1u];
+  let r2 = sh_res[h * 4u + 2u];
+  let r3 = sh_res[h * 4u + 3u];
+  return vec4<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y),
+    pack4x8unorm((f2 - vec4<f32>(r2.x)) * r2.y),
+    pack4x8unorm((f3 - vec4<f32>(r3.x)) * r3.y)
+  );
+}\n`;
+      return {
+        decls,
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) => {
+          const momOff = `${momOffExpr} + (${hrExpr}) * ${cs}u`;
+          const mainOff = alsoWriteMomMain ? `${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u` : '0u';
+          let out = `  let ep_mom_off = ${momOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, ${c}u, ep_mom_off, ep_main_off, ${alsoWriteMomMain});
+    if (${writeY8Expr}) {
+      ${storeY(storeMode, c, 'qw.x')}
+      ${storeY(storeMode, c + 1, 'qw.y')}
+      ${storeY(storeMode, c + 2, 'qw.z')}
+      ${storeY(storeMode, c + 3, 'qw.w')}
+    }
+  }\n`;
+          }
+          return out;
+        },
+      };
+    }
+
+    if (hasF16) {
+      const unroll31 = rep(31, (i) => {
+        const k = i + 1;
+        return `    {
+      let s = sh_sq[rb + ${k}u];
+      let m = sh_mm[rb + ${k}u];
+      rs += s.x;
+      rq += s.y;
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`;
+      });
+      const decls = `var<workgroup> sh_sq  : array<vec2<f32>, 1024>;
+var<workgroup> sh_mm  : array<vec2<f16>, 1024>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+fn vec_mm16(a : vec4<f16>) -> vec2<f16> {
+  return vec2<f16>(min(min(a.x, a.y), min(a.z, a.w)), max(max(a.x, a.y), max(a.z, a.w)));
+}
+fn reduce_pack4(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, c_base : u32, mom_off : u32, main_off : u32, also_main : bool
+) -> vec4<u32> {
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let f2 = vec4<f32>(a2${sw});
+  let f3 = vec4<f32>(a3${sw});
+  let b0 = (h * 4u) * 32u + slane;
+  sh_sq[b0]       = vec2<f32>(f0.x + f0.y + f0.z + f0.w, dot(f0, f0));
+  sh_sq[b0 + 32u] = vec2<f32>(f1.x + f1.y + f1.z + f1.w, dot(f1, f1));
+  sh_sq[b0 + 64u] = vec2<f32>(f2.x + f2.y + f2.z + f2.w, dot(f2, f2));
+  sh_sq[b0 + 96u] = vec2<f32>(f3.x + f3.y + f3.z + f3.w, dot(f3, f3));
+  sh_mm[b0]       = vec_mm16(a0);
+  sh_mm[b0 + 32u] = vec_mm16(a1);
+  sh_mm[b0 + 64u] = vec_mm16(a2);
+  sh_mm[b0 + 96u] = vec_mm16(a3);
+  workgroupBarrier();
+  if (slane < 4u) {
+    let rb = (h * 4u + slane) * 32u;
+    let s0 = sh_sq[rb];
+    let m0 = sh_mm[rb];
+    var rs : f32 = s0.x;
+    var rq : f32 = s0.y;
+    var rmn : f16 = m0.x;
+    var rmx : f16 = m0.y;
+${unroll31}    let fmn = f32(rmn);
+    let sp = f32(rmx) - fmn;
+    sh_res[h * 4u + slane] = vec2<f32>(fmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(rs, rq, fmn, sp);
+${momWriteStmt}
+  }
+  workgroupBarrier();
+  let r0 = sh_res[h * 4u + 0u];
+  let r1 = sh_res[h * 4u + 1u];
+  let r2 = sh_res[h * 4u + 2u];
+  let r3 = sh_res[h * 4u + 3u];
+  return vec4<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y),
+    pack4x8unorm((f2 - vec4<f32>(r2.x)) * r2.y),
+    pack4x8unorm((f3 - vec4<f32>(r3.x)) * r3.y)
+  );
+}\n`;
+      return {
+        decls,
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) => {
+          const momOff = `${momOffExpr} + (${hrExpr}) * ${cs}u`;
+          const mainOff = alsoWriteMomMain ? `${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u` : '0u';
+          let out = `  let ep_mom_off = ${momOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, ${c}u, ep_mom_off, ep_main_off, ${alsoWriteMomMain});
+    if (${writeY8Expr}) {
+      ${storeY(storeMode, c, 'qw.x')}
+      ${storeY(storeMode, c + 1, 'qw.y')}
+      ${storeY(storeMode, c + 2, 'qw.z')}
+      ${storeY(storeMode, c + 3, 'qw.w')}
+    }
+  }\n`;
+          }
+          return out;
+        },
+      };
+    }
+
+    // f32 fallback + GroupNorm: 2-channel batch in full f32 (8.125 KiB <= 16 KiB limit)
+    const unroll32 = rep(32, (k) => `    {
+      let s = sh_sq[rb + ${k}u];
+      let m = sh_mm[rb + ${k}u];
+      rs += s.x;
+      rq += s.y;
+      rmn = min(rmn, m.x);
+      rmx = max(rmx, m.y);
+    }\n`);
+    const decls = `var<workgroup> sh_sq  : array<vec2<f32>, 512>;
+var<workgroup> sh_mm  : array<vec2<f32>, 512>;
+var<workgroup> sh_res : array<vec2<f32>, 16>;
+fn vec_mm(f : vec4<f32>) -> vec2<f32> {
+  return vec2<f32>(min(min(f.x, f.y), min(f.z, f.w)), max(max(f.x, f.y), max(f.z, f.w)));
+}
+fn reduce_pack2(
+  a0 : ${V4}, a1 : ${V4},
+  h : u32, slane : u32, c_base : u32, mom_off : u32, main_off : u32, also_main : bool
+) -> vec2<u32> {
+  let f0 = vec4<f32>(a0${sw});
+  let f1 = vec4<f32>(a1${sw});
+  let b0 = (h * 2u) * 32u + slane;
+  sh_sq[b0]       = vec2<f32>(f0.x + f0.y + f0.z + f0.w, dot(f0, f0));
+  sh_sq[b0 + 32u] = vec2<f32>(f1.x + f1.y + f1.z + f1.w, dot(f1, f1));
+  sh_mm[b0]       = vec_mm(f0);
+  sh_mm[b0 + 32u] = vec_mm(f1);
+  workgroupBarrier();
+  if (slane < 2u) {
+    let rb = (h * 2u + slane) * 32u;
+    var rs : f32 = 0.0;
+    var rq : f32 = 0.0;
+    var rmn : f32 = 3.0e38;
+    var rmx : f32 = -3.0e38;
+${unroll32}    let sp = rmx - rmn;
+    sh_res[h * 2u + slane] = vec2<f32>(rmn, select(0.0, 1.0 / sp, sp > 1e-7));
+    let mv = vec4<f32>(rs, rq, rmn, sp);
+${momWriteStmt}
+  }
+  workgroupBarrier();
+  let r0 = sh_res[h * 2u + 0u];
+  let r1 = sh_res[h * 2u + 1u];
+  return vec2<u32>(
+    pack4x8unorm((f0 - vec4<f32>(r0.x)) * r0.y),
+    pack4x8unorm((f1 - vec4<f32>(r1.x)) * r1.y)
+  );
+}\n`;
+    return {
+      decls,
+      localHeader: '  let h = lid.y * 2u + sg;\n',
+      emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) => {
+        const momOff = `${momOffExpr} + (${hrExpr}) * ${cs}u`;
+        const mainOff = alsoWriteMomMain ? `${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u` : '0u';
+        let out = `  let ep_mom_off = ${momOff};\n  let ep_main_off = ${mainOff};\n`;
+        for (let idx = 0; idx < cEnd - cStart; idx += 2) {
+          const c = cStart + idx;
+          out += `  {
+    let qw = reduce_pack2(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, h, slane, ${c}u, ep_mom_off, ep_main_off, ${alsoWriteMomMain});
+    if (${writeY8Expr}) {
+      ${storeY(storeMode, c, 'qw.x')}
+      ${storeY(storeMode, c + 1, 'qw.y')}
+    }
+  }\n`;
+        }
+        return out;
+      },
+    };
   };
 
   // --- 0. INIT_ACT8 (4 storage bindings) ---
@@ -3259,6 +3870,7 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
   const d0 = dilations[0];
   const halfPass0 = !hasF16 && cs >= 16;
   const conv0Wgsl = () => {
+    const ep0 = build128Epilogue(false);
     const fmaRange = (cStart, cEnd) => {
       const gStart = cStart / 4;
       const gEnd = cEnd / 4;
@@ -3321,8 +3933,10 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
         let vp = ${V4}(vP.w, vR.xyz);`;
     }
 
-    const emitConv0Entry = (fnName, cStart, cEnd, isBgEntry) => {
-      const accInit = rep(cEnd - cStart, (i) => {
+    const emitConv0Compute = (fnName, structName, cStart, cEnd) => {
+      const nCh = cEnd - cStart;
+      const fields = rep(nCh, (i) => `  v_${i} : ${V4},\n`);
+      const accInit = rep(nCh, (i) => {
         const c = cStart + i;
         if (norm === 'none') {
           const qi = 3 * cs + c;
@@ -3330,6 +3944,29 @@ fn main(@builtin(local_invocation_id) lid : vec3<u32>,
         }
         return `  var a_${c} = ${V4}(0.0${suf});\n`;
       });
+      const retArgs = Array.from({ length: nCh }, (_, i) => `a_${cStart + i}`).join(', ');
+      return `struct ${structName} {
+${fields}};
+fn ${fnName}(y : i32, z : i32, x_pad : u32) -> ${structName} {
+${accInit}  var tap_yz : u32 = 0u;
+  for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
+    let sz = z + dz * ${d0};
+    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
+      let sy = y + dy * ${d0};
+      if ((u32(sz) | u32(sy)) < 256u) {
+        let base = (u32(sz) * 256u + u32(sy)) * ${X4_PAD}u + x_pad;
+${loadInp0}
+        let wb = tap_yz * ${3 * oc4}u;
+${fmaRange(cStart, cEnd)}
+      }
+      tap_yz = tap_yz + 1u;
+    }
+  }
+  return ${structName}(${retArgs});
+}\n`;
+    };
+
+    const emitConv0Entry = (fnName, computeFn, cStart, cEnd, isBgEntry) => {
       const coords = isBgEntry
         ? '  let y = i32(p0.bg_y0 + lid.y);\n  let z = i32(p0.bg_z0);'
         : `  var y : i32;\n  var z : i32;\n  if (p0.is_full != 0u) {\n    y = i32(wid.y * 4u + lid.y);\n    z = i32(wid.z);\n  } else {\n    let pk = strips0_u[wid.z >> 2u][wid.z & 3u];\n    y = i32((pk & 255u) * 4u + lid.y);\n    z = i32(pk >> 8u);\n  }`;
@@ -3347,42 +3984,30 @@ fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
              @builtin(workgroup_id) wid : vec3<u32>) {
   let sg = lid.x >> 5u;
   let slane = lid.x & 31u;
-${hasF16 && hasSubgroups32 ? '' : '  let hbase = (lid.y * 2u + sg) * 32u;\n  let tid = hbase + slane;\n  let hslot = (lid.y * 2u + sg) * 2u;\n'}
-  let x_pad = lid.x + ${X4_HALO}u;
+${ep0.localHeader}  let x_pad = lid.x + ${X4_HALO}u;
 ${coords}
-${accInit}
-  var tap_yz : u32 = 0u;
-  for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
-    let sz = z + dz * ${d0};
-    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
-      let sy = y + dy * ${d0};
-      if (sz >= 0 && sz < 256 && sy >= 0 && sy < 256) {
-        let base = (u32(sz) * 256u + u32(sy)) * ${X4_PAD}u + x_pad;
-${loadInp0}
-        let wb = tap_yz * ${3 * oc4}u;
-${fmaRange(cStart, cEnd)}
-      }
-      tap_yz = tap_yz + 1u;
-    }
-  }
+  let acc = ${computeFn}(y, z, x_pad);
 ${rowLocals}
-${emitEpilogue128({
+${ep0.emit({
+  accVar: 'acc',
   cStart,
   cEnd,
   hrExpr,
   storeMode: isBgEntry ? 'stage_bg' : 'conv0_split',
-  isPermuted: false,
   momOffExpr,
 })}}`;
     };
 
-    const entries = halfPass0
-      ? emitConv0Entry('main_lo', 0, csHalf, false) +
-        emitConv0Entry('main_hi', csHalf, cs, false) +
-        emitConv0Entry('main_bg_lo', 0, csHalf, true) +
-        emitConv0Entry('main_bg_hi', csHalf, cs, true)
-      : emitConv0Entry('main', 0, cs, false) +
-        emitConv0Entry('main_bg', 0, cs, true);
+    const helpersAndEntries = halfPass0
+      ? emitConv0Compute('run_conv0_lo', 'Conv0AccLo', 0, csHalf) +
+        emitConv0Compute('run_conv0_hi', 'Conv0AccHi', csHalf, cs) +
+        emitConv0Entry('main_lo', 'run_conv0_lo', 0, csHalf, false) +
+        emitConv0Entry('main_hi', 'run_conv0_hi', csHalf, cs, false) +
+        emitConv0Entry('main_bg_lo', 'run_conv0_lo', 0, csHalf, true) +
+        emitConv0Entry('main_bg_hi', 'run_conv0_hi', csHalf, cs, true)
+      : emitConv0Compute('run_conv0', 'Conv0Acc', 0, cs) +
+        emitConv0Entry('main', 'run_conv0', 0, cs, false) +
+        emitConv0Entry('main_bg', 'run_conv0', 0, cs, true);
 
     return `${f16Enable}${sgEnable}
 struct Params0 {
@@ -3402,7 +4027,7 @@ struct Params0 {
 @group(0) @binding(8) var<uniform> qmeta_u : array<vec4<f32>, ${cs}>;
 @group(0) @binding(9) var<uniform> strips0_u : array<vec4<u32>, 4096>;
 @group(0) @binding(10) var<uniform> p0 : Params0;
-${sharedReductionDecls}${entries}`;
+${ep0.decls}${helpersAndEntries}`;
   };
 
   // --- 2. MOMENTS_FINISH + PREP_WEFF (5 storage + 1 uniform) ---
@@ -3429,29 +4054,27 @@ struct PrepParams {
 @group(0) @binding(4) var<storage, read> main_strips : array<u32>;
 @group(0) @binding(5) var<uniform> pp : PrepParams;
 
-var<workgroup> fin_s  : array<f32, 256>;
+${norm === 'gn' ? `var<workgroup> fin_s  : array<f32, 256>;
 var<workgroup> fin_q  : array<f32, 256>;
 var<workgroup> fin_es : array<f32, 256>;
 var<workgroup> fin_eq : array<f32, 256>;
-var<workgroup> fin_mn : array<f32, 256>;
+` : ''}var<workgroup> fin_mn : array<f32, 256>;
 var<workgroup> fin_mx : array<f32, 256>;
 
 @compute @workgroup_size(256, 1, 1)
 fn moments_finish(@builtin(local_invocation_index) lid : u32,
                   @builtin(workgroup_id) wid : vec3<u32>) {
   let c = wid.x;
-  var s : f32 = 0.0;
+${norm === 'gn' ? `  var s : f32 = 0.0;
   var q : f32 = 0.0;
   var es : f32 = 0.0;
   var eq : f32 = 0.0;
-  var mn : f32 = 3.0e38;
+` : ''}  var mn : f32 = 3.0e38;
   var mx : f32 = -3.0e38;
   if (pp.is_full != 0u) {
     for (var hr : u32 = lid; hr < ${TOTAL_HALF_ROWS}u; hr = hr + 256u) {
       let v = mom[${MOM_MAIN_OFF}u + hr * ${cs}u + c];
-      s  += v.x;
-      q  += v.y;
-      mn  = min(mn, v.z);
+${norm === 'gn' ? '      s  += v.x;\n      q  += v.y;\n' : ''}      mn  = min(mn, v.z);
       mx  = max(mx, v.z + v.w);
     }
   } else {
@@ -3460,9 +4083,7 @@ fn moments_finish(@builtin(local_invocation_index) lid : u32,
       let base_hr = ((pk >> 8u) * 256u + (pk & 255u) * 4u) * 2u;
       for (var h : u32 = 0u; h < 8u; h = h + 1u) {
         let v = mom[${MOM_MAIN_OFF}u + (base_hr + h) * ${cs}u + c];
-        s  += v.x;
-        q  += v.y;
-        mn  = min(mn, v.z);
+${norm === 'gn' ? '        s  += v.x;\n        q  += v.y;\n' : ''}        mn  = min(mn, v.z);
         mx  = max(mx, v.z + v.w);
       }
     }
@@ -3472,27 +4093,25 @@ fn moments_finish(@builtin(local_invocation_index) lid : u32,
     } else if (pp.n_ext_hr > 0u) {
       for (var e : u32 = lid; e < pp.n_ext_hr; e = e + 256u) {
         let v = mom[${MOM_EXT_OFF}u + e * ${cs}u + c];
-        es += v.x;
-        eq += v.y;
-        mn  = min(mn, v.z);
+${norm === 'gn' ? '        es += v.x;\n        eq += v.y;\n' : ''}        mn  = min(mn, v.z);
         mx  = max(mx, v.z + v.w);
       }
     }
   }
-  fin_s[lid]  = s;
+${norm === 'gn' ? `  fin_s[lid]  = s;
   fin_q[lid]  = q;
   fin_es[lid] = es;
   fin_eq[lid] = eq;
-  fin_mn[lid] = mn;
+` : ''}  fin_mn[lid] = mn;
   fin_mx[lid] = mx;
   workgroupBarrier();
   for (var stride : u32 = 128u; stride > 0u; stride = stride >> 1u) {
     if (lid < stride) {
-      fin_s[lid]  += fin_s[lid + stride];
+${norm === 'gn' ? `      fin_s[lid]  += fin_s[lid + stride];
       fin_q[lid]  += fin_q[lid + stride];
       fin_es[lid] += fin_es[lid + stride];
       fin_eq[lid] += fin_eq[lid + stride];
-      fin_mn[lid]  = min(fin_mn[lid], fin_mn[lid + stride]);
+` : ''}      fin_mn[lid]  = min(fin_mn[lid], fin_mn[lid + stride]);
       fin_mx[lid]  = max(fin_mx[lid], fin_mx[lid + stride]);
     }
     workgroupBarrier();
@@ -3504,12 +4123,14 @@ fn moments_finish(@builtin(local_invocation_index) lid : u32,
     let eps_base = qmeta[mbase + ${2 * cs}u + c];
     let q_prev = select(mom[${cs * 2}u].x, 1.0, pp.is_first != 0u);
     let eff_eps = eps_base / (q_prev * q_prev);
-    let total_s = fin_s[0] + pp.ext_weight * fin_es[0];
+${norm === 'gn' ? `    let total_s = fin_s[0] + pp.ext_weight * fin_es[0];
     let total_q = fin_q[0] + pp.ext_weight * fin_eq[0];
-    let mean = ${norm === 'gn' ? 'total_s / 16777216.0' : '0.0'};
-    let varr = ${norm === 'gn' ? 'max(total_q / 16777216.0 - mean * mean, 0.0)' : '1.0'};
-    let inv_std = ${norm === 'gn' ? 'inverseSqrt(varr + eff_eps)' : '1.0'};
-    let scale = inv_std * gamma;
+    let mean = total_s / 16777216.0;
+    let varr = max(total_q / 16777216.0 - mean * mean, 0.0);
+    let inv_std = inverseSqrt(varr + eff_eps);
+` : `    let mean : f32 = 0.0;
+    let inv_std : f32 = 1.0;
+`}    let scale = inv_std * gamma;
     let shift = beta - mean * scale;
     let u_lo = fin_mn[0] * scale + shift;
     let u_hi = fin_mx[0] * scale + shift;
@@ -3679,12 +4300,10 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
 ${rep(4, (q) => emitNormQuarter(q, true))}
 }`;
 
-  // --- 5. CONV_INT8 DILATION-SPECIALIZED SHADERS (7/8 storage + dynamic uniform) ---
-  const buildConvForDilation = (D) => {
-    const qStep = Math.floor(D / 4);
-    const rBytes = D % 4;
-    const rBits = rBytes * 8;
+  // --- 5. CONV_INT8 UNIFIED DILATION SHADER (7/8 storage + dynamic uniform) ---
+  const convWgsl = () => {
     const halfPass = !hasF16 && cs >= 16;
+    const epC = build128Epilogue(hasF16);
 
     const emitUnpack = (vName, uExpr) => {
       if (hasF16) {
@@ -3695,40 +4314,17 @@ ${rep(4, (q) => emitNormQuarter(q, true))}
           let ${vName} = unpack4x8unorm(${uExpr}) - vec4<f32>(${qConst.uZeroFloat});`;
     };
 
-    const emitLoads = (arrName) => {
-      if (rBits === 0) {
-        return `
-          let u_neg = ${arrName}[base - ${qStep}u];
-          let uC    = ${arrName}[base];
-          let u_pos = ${arrName}[base + ${qStep}u];` +
-          emitUnpack('vn', 'u_neg') +
-          emitUnpack('vc', 'uC') +
-          emitUnpack('vp', 'u_pos');
-      }
-      const loShift = 32 - rBits;
-      if (qStep === 0) {
-        return `
-          let uL = ${arrName}[base - 1u];
+    const emitLoads = (arrName) => `
+          let uL = ${arrName}[base - off0];
+          let uN = ${arrName}[base - off1];
           let uC = ${arrName}[base];
-          let uR = ${arrName}[base + 1u];
-          let u_neg = (uL >> ${loShift}u) | (uC << ${rBits}u);
-          let u_pos = (uC >> ${rBits}u) | (uR << ${loShift}u);` +
-          emitUnpack('vn', 'u_neg') +
-          emitUnpack('vc', 'uC') +
-          emitUnpack('vp', 'u_pos');
-      }
-      return `
-          let uL = ${arrName}[base - ${qStep + 1}u];
-          let uN = ${arrName}[base - ${qStep}u];
-          let uC = ${arrName}[base];
-          let uP = ${arrName}[base + ${qStep}u];
-          let uR = ${arrName}[base + ${qStep + 1}u];
-          let u_neg = (uL >> ${loShift}u) | (uN << ${rBits}u);
-          let u_pos = (uP >> ${rBits}u) | (uR << ${loShift}u);` +
-        emitUnpack('vn', 'u_neg') +
-        emitUnpack('vc', 'uC') +
-        emitUnpack('vp', 'u_pos');
-    };
+          let uP = ${arrName}[base + off1];
+          let uR = ${arrName}[base + off0];
+          let u_neg = (uL >> sh_l) | (uN << sh_r);
+          let u_pos = (uP >> sh_r) | (uR << sh_l);` +
+      emitUnpack('vn', 'u_neg') +
+      emitUnpack('vc', 'uC') +
+      emitUnpack('vp', 'u_pos');
 
     const emitFmas = (cStart, cEnd) => {
       const gStart = cStart / 4;
@@ -3796,8 +4392,10 @@ ${emitFmas(cStart, cEnd)}
         }\n`;
     };
 
-    const emitConvEntry = (fnName, cStart, cEnd, entryKind) => {
-      const accInit = rep(cEnd - cStart, (i) => {
+    const emitConvCompute = (fnName, structName, cStart, cEnd) => {
+      const nCh = cEnd - cStart;
+      const fields = rep(nCh, (i) => `  v_${i} : ${V4},\n`);
+      const accInit = rep(nCh, (i) => {
         const c = cStart + i;
         if (norm === 'none') {
           const g = c >>> 2;
@@ -3811,7 +4409,34 @@ ${emitFmas(cStart, cEnd)}
         }
         return `  var a_${c} = ${V4}(0.0${suf});\n`;
       });
+      const tapHeader = useUniformWeff
+        ? `        let wbu_tap = tap_yz * ${(cs * 3 * oc4) / 2}u;\n`
+        : `        let wb_tap = tap_yz * ${cs * 3 * oc4}u;\n`;
+      const retArgs = Array.from({ length: nCh }, (_, i) => `a_${cStart + i}`).join(', ');
+      return `struct ${structName} {
+${fields}};
+fn ${fnName}(y : i32, z : i32, x_pad : u32, dp : u32) -> ${structName} {
+${accInit}  let d_step = i32(dp & 63u);
+  let off0 = (dp >> 6u) & 15u;
+  let off1 = (dp >> 10u) & 15u;
+  let sh_r = (dp >> 14u) & 31u;
+  let sh_l = (dp >> 19u) & 31u;
+  var tap_yz : u32 = 0u;
+  for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
+    let sz = z + dz * d_step;
+    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
+      let sy = y + dy * d_step;
+      if ((u32(sz) | u32(sy)) < 256u) {
+        let row_off = (u32(sz) * 256u + u32(sy)) * ${rowStrideAct}u + x_pad;
+${tapHeader}${rep(4, (q) => emitQuarterLoop(q, cStart, cEnd))}      }
+      tap_yz = tap_yz + 1u;
+    }
+  }
+  return ${structName}(${retArgs});
+}\n`;
+    };
 
+    const emitConvEntry = (fnName, computeFn, cStart, cEnd, entryKind) => {
       let coords = '';
       if (entryKind === 'bg') {
         coords = `
@@ -3845,16 +4470,12 @@ ${emitFmas(cStart, cEnd)}
           : 'row_idx * 2u + sg';
       const momOffExpr = entryKind === 'main' ? `${MOM_MAIN_OFF}u` : `${MOM_EXT_OFF}u`;
       const storeMode = entryKind === 'bg' ? 'stage_bg' : 'stage';
-      const writeY8Expr = entryKind === 'main' ? 'true' : '(cp.write_ext_y8 != 0u)';
+      const writeY8Expr = entryKind === 'main' ? 'true' : '(((dp >> 24u) & 1u) != 0u)';
       const rowLocals = entryKind === 'bg'
         ? `  let row_idx = u32(z) * 256u + u32(y);
   let s_bg_base = (${STAGE_BG_ROW}u + lid.y) * ${rowStrideStage}u + x4;`
         : `  let row_idx = u32(z) * 256u + u32(y);
   let s_row_base = ((u32(z) & 63u) * 256u + u32(y)) * ${rowStrideStage}u + x4;`;
-
-      const tapHeader = useUniformWeff
-        ? `        let wbu_tap = tap_yz * ${(cs * 3 * oc4) / 2}u;\n`
-        : `        let wb_tap = tap_yz * ${cs * 3 * oc4}u;\n`;
 
       return `
 @compute @workgroup_size(64, 4, 1)
@@ -3863,45 +4484,36 @@ fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
   let x4 = lid.x;
   let sg = x4 >> 5u;
   let slane = x4 & 31u;
-${hasF16 && hasSubgroups32 ? '' : '  let hbase = (lid.y * 2u + sg) * 32u;\n  let tid = hbase + slane;\n  let hslot = (lid.y * 2u + sg) * 2u;\n'}
-  let x_pad = x4 + ${X4_HALO}u;
+${epC.localHeader}  let x_pad = x4 + ${X4_HALO}u;
 ${coords}
-${accInit}
-  var tap_yz : u32 = 0u;
-  for (var dz : i32 = -1; dz <= 1; dz = dz + 1) {
-    let sz = z + dz * ${D};
-    for (var dy : i32 = -1; dy <= 1; dy = dy + 1) {
-      let sy = y + dy * ${D};
-      if (sz >= 0 && sz < 256 && sy >= 0 && sy < 256) {
-        let row_off = (u32(sz) * 256u + u32(sy)) * ${rowStrideAct}u + x_pad;
-${tapHeader}${rep(4, (q) => emitQuarterLoop(q, cStart, cEnd))}
-      }
-      tap_yz = tap_yz + 1u;
-    }
-  }
+  let dp = cp.d_pack;
+  let acc = ${computeFn}(y, z, x_pad, dp);
 ${rowLocals}
-${emitEpilogue128({
+${epC.emit({
+  accVar: 'acc',
   cStart,
   cEnd,
   hrExpr,
   storeMode,
-  isPermuted: hasF16,
   momOffExpr,
   alsoWriteMomMain: entryKind !== 'main',
   writeY8Expr,
 })}}`;
     };
 
-    const entries = halfPass
-      ? emitConvEntry('main_lo', 0, csHalf, 'main') +
-        emitConvEntry('main_hi', csHalf, cs, 'main') +
-        emitConvEntry('main_ext_lo', 0, csHalf, 'ext') +
-        emitConvEntry('main_ext_hi', csHalf, cs, 'ext') +
-        emitConvEntry('main_bg_lo', 0, csHalf, 'bg') +
-        emitConvEntry('main_bg_hi', csHalf, cs, 'bg')
-      : emitConvEntry('main', 0, cs, 'main') +
-        emitConvEntry('main_ext', 0, cs, 'ext') +
-        emitConvEntry('main_bg', 0, cs, 'bg');
+    const helpersAndEntries = halfPass
+      ? emitConvCompute('run_conv_lo', 'ConvAccLo', 0, csHalf) +
+        emitConvCompute('run_conv_hi', 'ConvAccHi', csHalf, cs) +
+        emitConvEntry('main_lo', 'run_conv_lo', 0, csHalf, 'main') +
+        emitConvEntry('main_hi', 'run_conv_hi', csHalf, cs, 'main') +
+        emitConvEntry('main_ext_lo', 'run_conv_lo', 0, csHalf, 'ext') +
+        emitConvEntry('main_ext_hi', 'run_conv_hi', csHalf, cs, 'ext') +
+        emitConvEntry('main_bg_lo', 'run_conv_lo', 0, csHalf, 'bg') +
+        emitConvEntry('main_bg_hi', 'run_conv_hi', csHalf, cs, 'bg')
+      : emitConvCompute('run_conv', 'ConvAcc', 0, cs) +
+        emitConvEntry('main', 'run_conv', 0, cs, 'main') +
+        emitConvEntry('main_ext', 'run_conv', 0, cs, 'ext') +
+        emitConvEntry('main_bg', 'run_conv', 0, cs, 'bg');
 
     // Pack paired vec4<f16> weights as vec4<u32> (never mat2x4<f16>): Naga's HLSL
     // backend emits `cbuffer { row_major half2x4 w_eff_u[N]; }` without decomposing
@@ -3923,7 +4535,7 @@ struct BandConvParams {
   z_start : u32,
   strip_off : u32,
   ext_off : u32,
-  write_ext_y8 : u32,
+  d_pack : u32,
   bg_y0 : u32,
   bg_z0 : u32,
   pad0 : u32,
@@ -3937,7 +4549,7 @@ struct BandConvParams {
 ${wEffDecl}
 @group(0) @binding(7) var<storage, read> strips : array<u32>;
 @group(0) @binding(8) var<uniform> cp : BandConvParams;
-${sharedReductionDecls}${entries}`;
+${epC.decls}${helpersAndEntries}`;
   };
 
   // --- 6. CLASSIFY_V4 SHADER (8 storage + 3 uniform) ---
@@ -4026,7 +4638,7 @@ ${buildClassifierLoopsWgsl({
     prepWgsl,
     flushWgsl,
     normWgsl,
-    getConvWgsl: buildConvForDilation,
+    convWgsl,
     clsWgsl,
     qmetaVec4Len,
     numConvs,
@@ -4147,7 +4759,6 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
   device.queue.writeBuffer(wRawBuf, 0, hasF16 ? packed.wF16 : packed.wF32);
   device.queue.writeBuffer(qmetaBuf, 0, packed.qmetaF32);
 
-  const dilKeys = Array.from(new Set(d.dilations.slice(1)));
   let pipes;
   try {
     pipes = await getNetPipes128(
@@ -4157,8 +4768,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       hasF16,
       hasSubgroups32,
       probCfg,
-      shaders,
-      dilKeys
+      shaders
     );
   } catch (err) {
     for (const b of ownedBuffers) b.destroy();
@@ -4171,7 +4781,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
     }
     throw err;
   }
-  const { pInit, pMomFin, pPrepW, pFlush, pNorm, pNormHalo, pCls, pConv0, convPipes } = pipes;
+  const { pInit, pMomFin, pPrepW, pFlush, pNorm, pNormHalo, pCls, pConv0, pConv } = pipes;
 
   const mkBg = (bgl, resources) => device.createBindGroup({
     layout: bgl,
@@ -4255,12 +4865,10 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
   const flushBgs = Array.from({ length: numConvs }, (_, li) =>
     li === 0 ? null : mkBg(pFlush.bgl, [act8_0, act8_1, act8_2, act8_3, stageBuf, stripsBufs[li], bandDynRes])
   );
-  const convBgs = Array.from({ length: numConvs }, (_, li) => {
-    if (li === 0) return null;
-    const dil = d.dilations[li];
-    const pObj = shaders.halfPassConv ? convPipes[dil].lo : convPipes[dil].main;
-    return mkBg(pObj.bgl, [act8_0, act8_1, act8_2, act8_3, stageBuf, momBuf, wEffBuf, stripsBufs[li], bandDynRes]);
-  });
+  const convP0 = shaders.halfPassConv ? pConv.lo : pConv.main;
+  const convBgs = Array.from({ length: numConvs }, (_, li) =>
+    li === 0 ? null : mkBg(convP0.bgl, [act8_0, act8_1, act8_2, act8_3, stageBuf, momBuf, wEffBuf, stripsBufs[li], bandDynRes])
+  );
 
   const padInputHost = hasF16 ? new Uint16Array(paddedVox) : new Float32Array(paddedVox);
   const headRowHost = new Uint8Array(DIM * DIM);
@@ -4270,13 +4878,13 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
   const prepTmpF32 = new Float32Array(prepTmpU32.buffer);
   const u4Tmp = new Uint32Array(4);
 
-  const setBandSlot = (slotIdx, isFull, zStart, stripOff, extOff, writeExtY8, bgY0, bgZ0) => {
+  const setBandSlot = (slotIdx, isFull, zStart, stripOff, extOff, dPack, bgY0, bgZ0) => {
     const o = slotIdx * uboAlignU32;
     bandUboHost[o] = isFull ? 1 : 0;
     bandUboHost[o + 1] = zStart;
     bandUboHost[o + 2] = stripOff;
     bandUboHost[o + 3] = extOff;
-    bandUboHost[o + 4] = writeExtY8 ? 1 : 0;
+    bandUboHost[o + 4] = dPack;
     bandUboHost[o + 5] = bgY0;
     bandUboHost[o + 6] = bgZ0;
     bandUboHost[o + 7] = 0;
@@ -4354,15 +4962,16 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       }
 
       const writeExtY8 = (L.mode === 'rpure' && nHalo > 0) || (L.mode === 'bwd' && li + 1 < numConvs);
+      const dPack = packConvDilFlags(d.dilations[li], writeExtY8);
       const layerBaseSlot = (li - 1) * SLOTS_PER_LAYER;
       const bgY0 = L.bgStrip ? L.bgStrip.yWg * 4 : 0;
       const bgZ0 = L.bgStrip ? L.bgStrip.z : 0;
       for (let b = 0; b < 8; b++) {
-        setBandSlot(layerBaseSlot + b, L.isFull, b * 32, mainStart[b], extStart[b], writeExtY8, bgY0, bgZ0);
+        setBandSlot(layerBaseSlot + b, L.isFull, b * 32, mainStart[b], extStart[b], dPack, bgY0, bgZ0);
       }
       for (let fb = 0; fb < 6; fb++) {
-        setBandSlot(layerBaseSlot + 8 + fb, L.isFull, fb * 32, mainStart[fb], 0, false, 0, 0);
-        setBandSlot(layerBaseSlot + 14 + fb, false, fb * 32, extStart[fb], 0, false, 0, 0);
+        setBandSlot(layerBaseSlot + 8 + fb, L.isFull, fb * 32, mainStart[fb], 0, 0, 0, 0);
+        setBandSlot(layerBaseSlot + 14 + fb, false, fb * 32, extStart[fb], 0, 0, 0, 0);
       }
       bandPlans[li] = { L, nMain, nExt, nHalo, mainCount, extCount, layerBaseSlot };
     }
@@ -4430,8 +5039,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
             passCategories.push('conv0');
           }
         } else {
-          const dil = d.dilations[li];
-          const pipes = convPipes[dil];
+          const pipes = pConv;
           const bgC = convBgs[li];
           const bgF = flushBgs[li];
           const { mainCount, extCount, layerBaseSlot } = bp;
@@ -4576,11 +5184,11 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
     }
 
     // Pipelined (Linux / fast discrete Windows) or Paced/Calibrating (Windows TDR-safe Z-bands)
+    const plat = detectV4Platform(device);
     const onProgress = typeof ioOpts?.onProgress === 'function' ? ioOpts.onProgress : null;
     const totalWork = estimateScheduleTotalWork(schedule, numConvs);
     let doneWork = 0;
     let lastLayerReported = -1;
-    let msPerStrip = device.__v4MsPerStrip || 0.12;
     const emitProgress = (li) => {
       if (!onProgress) return;
       const frac = Math.min(0.99, doneWork / totalWork);
@@ -4591,6 +5199,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       }
       onProgress(frac, msg);
     };
+    const pacer = createPacedQueueController(device, device.__v4MsPerStrip || 0.12, emitProgress);
 
     let enc = device.createCommandEncoder();
     prepRes.runPrePasses(enc, passCategories);
@@ -4648,9 +5257,15 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
           pass.end();
           passCategories.push('conv0');
         }
+        if (execMode === 'calibrate') {
+          device.queue.submit([enc.finish()]);
+          enc = device.createCommandEncoder();
+        } else if (execMode === 'paced') {
+          doneWork += lw.convWork;
+          enc = await pacer.submitChunk(enc, lw.convWork, 0, { forceUiYield: true });
+        }
       } else {
-        const dil = d.dilations[li];
-        const pipes = convPipes[dil];
+        const pipes = pConv;
         const bgC = convBgs[li];
         const bgF = flushBgs[li];
         const { mainCount, extCount, layerBaseSlot } = bp;
@@ -4735,37 +5350,30 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
             enc = device.createCommandEncoder();
             doneWork += pendingStrips;
             if (pendingStrips >= 512) {
-              msPerStrip = dt / pendingStrips;
+              const msPerStrip = dt / pendingStrips;
               const estFullLayerMs = msPerStrip * TOTAL_STRIPS;
               device.__v4WinCalibrated = true;
-              device.__v4MsPerStrip = msPerStrip;
-              if (estFullLayerMs < WINDOWS_FAST_LAYER_MAX_MS) {
+              pacer.setMsPerStrip(msPerStrip);
+              if (!plat.isWindowsSharedIgpu && estFullLayerMs < WINDOWS_FAST_LAYER_MAX_MS) {
                 device.__v4WinFast = true;
                 execMode = 'pipelined';
                 console.log(`[WebGPU-V4-128M] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> unthrottled pipelined mode`);
               } else {
                 device.__v4WinFast = false;
                 execMode = 'paced';
-                console.log(`[WebGPU-V4-128M] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> TDR-safe paced mode`);
+                console.log(`[WebGPU-V4-128M] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> TDR-safe 2-in-flight paced mode`);
                 emitProgress(li);
-                await yieldAfterPacedChunk();
               }
             }
             pendingStrips = 0;
-          } else if (execMode === 'paced' && pendingStrips > 0 && (pendingStrips * msPerStrip >= PACED_TARGET_CHUNK_MS * 0.75 || b === 7)) {
-            const tSub = performance.now();
-            device.queue.submit([enc.finish()]);
-            await device.queue.onSubmittedWorkDone();
-            const dt = performance.now() - tSub;
-            enc = device.createCommandEncoder();
-            if (pendingStrips >= 256 && dt > 0.2) {
-              msPerStrip = 0.7 * msPerStrip + 0.3 * (dt / pendingStrips);
-              device.__v4MsPerStrip = msPerStrip;
-            }
+          } else if (
+            execMode === 'paced' &&
+            pendingStrips > 0 &&
+            (pendingStrips * pacer.getMsPerStrip() >= PACED_TARGET_CHUNK_MS * 0.75 || b === 7)
+          ) {
             doneWork += pendingStrips;
+            enc = await pacer.submitChunk(enc, pendingStrips, li);
             pendingStrips = 0;
-            emitProgress(li);
-            await yieldAfterPacedChunk();
           }
         }
       }
@@ -4836,26 +5444,25 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       if (execMode === 'pipelined') {
         device.queue.submit([enc.finish()]);
         enc = device.createCommandEncoder();
-      } else {
-        const tLayerEnd = performance.now();
+      } else if (execMode === 'calibrate') {
+        // Flush Layer 0 residency page-in cleanly so Layer 1 calibrates steady-state GPU speed
         device.queue.submit([enc.finish()]);
         await device.queue.onSubmittedWorkDone();
-        const dtEnd = performance.now() - tLayerEnd;
         enc = device.createCommandEncoder();
         doneWork += (li === 0 ? lw.convWork : 0) + lw.normWork;
-        if (li === 0 && execMode === 'calibrate' && dtEnd >= 90) {
+        if (li === numConvs - 1 && !device.__v4WinCalibrated) {
           device.__v4WinCalibrated = true;
-          device.__v4WinFast = false;
-          execMode = 'paced';
-          console.log(`[WebGPU-V4-128M] Windows GPU calibration (conv0=${dtEnd.toFixed(1)}ms) -> TDR-safe paced mode`);
+          device.__v4WinFast = !plat.isWindowsSharedIgpu;
         }
-        if (execMode === 'paced') {
-          emitProgress(li);
-          if (li === 0 || dtEnd >= 30) await yieldAfterPacedChunk();
-        }
+      } else {
+        doneWork += lw.normWork;
+        enc = await pacer.submitChunk(enc, lw.normWork, li);
       }
     }
 
+    if (execMode === 'paced') {
+      await pacer.waitBeforeFinalSubmit();
+    }
     execute.__passCategories = passCategories;
     return ioCtl.finishAndReadback({
       enc,
@@ -4894,6 +5501,15 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
 export const supportsF32Fallback = true;
 
 export async function setupNet(device, safetensorBytes, callbackUI, modelEntry = {}) {
+  activeUserSetups++;
+  try {
+    return await setupNetInner(device, safetensorBytes, callbackUI, modelEntry);
+  } finally {
+    activeUserSetups--;
+  }
+}
+
+async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {}) {
   const bytes = safetensorBytes instanceof Uint8Array ? safetensorBytes : new Uint8Array(safetensorBytes);
   const parsed = parseSafetensors(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   const desc = describeSafetensors(parsed);
@@ -5033,7 +5649,6 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
   device.queue.writeBuffer(qmetaBuf, 0, packed.qmetaF32);
 
   // Compile/cache shader modules and pipelines per kernel group per device
-  const dilKeys = Array.from(new Set(d.dilations.slice(1)));
   let pipes;
   try {
     pipes = await getNetPipesStd(
@@ -5044,8 +5659,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
       hasSubgroups32,
       splitHalves,
       probCfg,
-      shaders,
-      dilKeys
+      shaders
     );
   } catch (err) {
     for (const b of ownedBuffers) b.destroy();
@@ -5058,7 +5672,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     }
     throw err;
   }
-  const { pInit, pMomFin, pPrepW, pNorm, pNormHalo, pCls, pConv0, convPipes } = pipes;
+  const { pInit, pMomFin, pPrepW, pNorm, pNormHalo, pCls, pConv0, pConv } = pipes;
 
   const mkBg = (bgl, bufs) => device.createBindGroup({
     layout: bgl,
@@ -5128,21 +5742,21 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     mkBg(pNorm.bgl, [act8_0, act8_1, y8_0, y8_1, momMainBuf, momExtBuf, momStatsBuf, normAuxBufs[li], ubo])
   );
   const stdDynRes = shaders.chunkableStd ? { buffer: stdChunkUboBuf, offset: 0, size: 32 } : null;
-  const convBgs = Array.from({ length: numConvs }, (_, li) => {
-    if (li === 0) return null;
-    const dil = d.dilations[li];
-    const pObj = shaders.halfPassConv ? convPipes[dil].lo : convPipes[dil].main;
-    return mkBg(pObj.bgl, [
-      act8_0, act8_1, y8_0, y8_1, momMainBuf, momExtBuf, wEffBuf, stripsBufs[li],
-      shaders.chunkableStd ? stdDynRes : convUbos[li],
-    ]);
-  });
+  const convP0 = shaders.halfPassConv ? pConv.lo : pConv.main;
+  const convBgs = Array.from({ length: numConvs }, (_, li) =>
+    li === 0
+      ? null
+      : mkBg(convP0.bgl, [
+          act8_0, act8_1, y8_0, y8_1, momMainBuf, momExtBuf, wEffBuf, stripsBufs[li],
+          shaders.chunkableStd ? stdDynRes : convUbos[li],
+        ])
+  );
 
-  const setStdSlot = (slotIdx, isFull, nMain, writeExtY8, mainOff, extBase) => {
+  const setStdSlot = (slotIdx, isFull, nMain, dPack, mainOff, extBase) => {
     const o = slotIdx * uboAlignU32;
     stdChunkUboHost[o] = isFull ? 1 : 0;
     stdChunkUboHost[o + 1] = nMain;
-    stdChunkUboHost[o + 2] = writeExtY8 ? 1 : 0;
+    stdChunkUboHost[o + 2] = dPack;
     stdChunkUboHost[o + 3] = 0; // Must remain 0u for icLim unroll barrier
     stdChunkUboHost[o + 4] = mainOff;
     stdChunkUboHost[o + 5] = extBase;
@@ -5307,17 +5921,16 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
           }
         } else {
           const dil = d.dilations[li];
-          const pipes = convPipes[dil];
           const bg = convBgs[li];
           const mainY = L.isFull ? 64 : 1;
           const mainZ = L.isFull ? DIM : nMain;
           const writeExtY8 = (L.mode === 'rpure' && nHalo > 0) || (L.mode === 'bwd' && li + 1 < numConvs);
           u4Tmp[0] = L.isFull ? 1 : 0;
           u4Tmp[1] = nMain;
-          u4Tmp[2] = writeExtY8 ? 1 : 0;
+          u4Tmp[2] = packConvDilFlags(dil, writeExtY8);
           u4Tmp[3] = 0;
           device.queue.writeBuffer(convUbos[li], 0, u4Tmp);
-          dispatchStdConv(enc, pipes, bg, null, mainY, mainZ, nExt, passCategories);
+          dispatchStdConv(enc, pConv, bg, null, mainY, mainZ, nExt, passCategories);
         }
 
         // Upload prepUbo
@@ -5391,11 +6004,11 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     }
 
     // Pipelined (Linux / calibrated fast Windows GPUs) or Paced/Calibrating (Windows TDR-safe Z-chunks)
+    const plat = detectV4Platform(device);
     const onProgress = typeof ioOpts?.onProgress === 'function' ? ioOpts.onProgress : null;
     const totalWork = estimateScheduleTotalWork(schedule, numConvs);
     let doneWork = 0;
     let lastLayerReported = -1;
-    let msPerStrip = device.__v4MsPerStrip || 0.12;
     const emitProgress = (li) => {
       if (!onProgress) return;
       const frac = Math.min(0.99, doneWork / totalWork);
@@ -5406,6 +6019,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
       }
       onProgress(frac, msg);
     };
+    const pacer = createPacedQueueController(device, device.__v4MsPerStrip || 0.12, emitProgress);
 
     let enc = device.createCommandEncoder();
     prepRes.runPrePasses(enc, passCategories);
@@ -5485,35 +6099,42 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
           pass.end();
           passCategories.push('conv0');
         }
+        if (execMode === 'calibrate') {
+          device.queue.submit([enc.finish()]);
+          enc = device.createCommandEncoder();
+        } else if (execMode === 'paced') {
+          doneWork += lw.convWork;
+          enc = await pacer.submitChunk(enc, lw.convWork, 0, { forceUiYield: true });
+        }
       } else {
         const dil = d.dilations[li];
-        const pipes = convPipes[dil];
         const bg = convBgs[li];
         const mainY = L.isFull ? 64 : 1;
         const mainZ = L.isFull ? DIM : nMain;
         const writeExtY8 = (L.mode === 'rpure' && nHalo > 0) || (L.mode === 'bwd' && li + 1 < numConvs);
+        const dPack = packConvDilFlags(dil, writeExtY8);
 
         if (!shaders.chunkableStd) {
           u4Tmp[0] = L.isFull ? 1 : 0;
           u4Tmp[1] = nMain;
-          u4Tmp[2] = writeExtY8 ? 1 : 0;
+          u4Tmp[2] = dPack;
           u4Tmp[3] = 0;
           device.queue.writeBuffer(convUbos[li], 0, u4Tmp);
-          dispatchStdConv(enc, pipes, bg, null, mainY, mainZ, nExt, passCategories);
+          dispatchStdConv(enc, pConv, bg, null, mainY, mainZ, nExt, passCategories);
         } else if (execMode === 'pipelined' || execMode === 'single') {
           const slot = (li - 1) * STD_SLOTS_PER_LAYER;
-          setStdSlot(slot, L.isFull, nMain, writeExtY8, 0, 0);
+          setStdSlot(slot, L.isFull, nMain, dPack, 0, 0);
           device.queue.writeBuffer(
             stdChunkUboBuf,
             slot * uboAlign,
             stdChunkUboHost.subarray(slot * uboAlignU32, (slot + 1) * uboAlignU32)
           );
-          dispatchStdConv(enc, pipes, bg, [slot * uboAlign], mainY, mainZ, nExt, passCategories);
+          dispatchStdConv(enc, pConv, bg, [slot * uboAlign], mainY, mainZ, nExt, passCategories);
         } else {
           const layerSlotBase = (li - 1) * STD_SLOTS_PER_LAYER;
           const maxStrips = execMode === 'calibrate'
             ? 1024
-            : Math.max(256, Math.min(4096, Math.round(PACED_TARGET_CHUNK_MS / Math.max(0.005, msPerStrip))));
+            : Math.max(256, Math.min(4096, Math.round(PACED_TARGET_CHUNK_MS / Math.max(0.005, pacer.getMsPerStrip()))));
           const chunks = [];
           let slotCursor = 0;
           if (L.isFull) {
@@ -5521,7 +6142,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
             for (let z0 = 0; z0 < DIM; z0 += zStep) {
               const zCnt = Math.min(zStep, DIM - z0);
               const sIdx = layerSlotBase + slotCursor++;
-              setStdSlot(sIdx, true, nMain, writeExtY8, z0, 0);
+              setStdSlot(sIdx, true, nMain, dPack, z0, 0);
               chunks.push({ slotIdx: sIdx, mainY: 64, mainCountZ: zCnt, extCountZ: 0, strips: zCnt * 64 });
             }
           } else {
@@ -5529,14 +6150,14 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
             for (let m0 = 0; m0 < nMain; m0 += mainStep) {
               const mCnt = Math.min(mainStep, nMain - m0);
               const sIdx = layerSlotBase + slotCursor++;
-              setStdSlot(sIdx, false, nMain, writeExtY8, m0, 0);
+              setStdSlot(sIdx, false, nMain, dPack, m0, 0);
               chunks.push({ slotIdx: sIdx, mainY: 1, mainCountZ: mCnt, extCountZ: 0, strips: mCnt });
             }
             const extStep = Math.max(256, maxStrips);
             for (let e0 = 0; e0 < nExt; e0 += extStep) {
               const eCnt = Math.min(extStep, nExt - e0);
               const sIdx = layerSlotBase + slotCursor++;
-              setStdSlot(sIdx, false, nMain, writeExtY8, 0, e0);
+              setStdSlot(sIdx, false, nMain, dPack, 0, e0);
               chunks.push({ slotIdx: sIdx, mainY: 1, mainCountZ: 0, extCountZ: eCnt, strips: eCnt });
             }
           }
@@ -5551,7 +6172,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
           let pendingStrips = 0;
           for (let ci = 0; ci < chunks.length; ci++) {
             const ch = chunks[ci];
-            dispatchStdConv(enc, pipes, bg, [ch.slotIdx * uboAlign], ch.mainY, ch.mainCountZ, ch.extCountZ, passCategories);
+            dispatchStdConv(enc, pConv, bg, [ch.slotIdx * uboAlign], ch.mainY, ch.mainCountZ, ch.extCountZ, passCategories);
             if (execMode === 'pipelined') continue;
 
             pendingStrips += ch.strips;
@@ -5564,37 +6185,26 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
               enc = device.createCommandEncoder();
               doneWork += pendingStrips;
               if (pendingStrips >= 512) {
-                msPerStrip = dt / pendingStrips;
+                const msPerStrip = dt / pendingStrips;
                 const estFullLayerMs = msPerStrip * TOTAL_STRIPS;
                 device.__v4WinCalibrated = true;
-                device.__v4MsPerStrip = msPerStrip;
-                if (estFullLayerMs < WINDOWS_FAST_LAYER_MAX_MS) {
+                pacer.setMsPerStrip(msPerStrip);
+                if (!plat.isWindowsSharedIgpu && estFullLayerMs < WINDOWS_FAST_LAYER_MAX_MS) {
                   device.__v4WinFast = true;
                   execMode = 'pipelined';
                   console.log(`[WebGPU-V4] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> unthrottled pipelined mode`);
                 } else {
                   device.__v4WinFast = false;
                   execMode = 'paced';
-                  console.log(`[WebGPU-V4] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> TDR-safe paced mode`);
+                  console.log(`[WebGPU-V4] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> TDR-safe 2-in-flight paced mode`);
                   emitProgress(li);
-                  await yieldAfterPacedChunk();
                 }
               }
               pendingStrips = 0;
             } else if (execMode === 'paced') {
-              const tSub = performance.now();
-              device.queue.submit([enc.finish()]);
-              await device.queue.onSubmittedWorkDone();
-              const dt = performance.now() - tSub;
-              enc = device.createCommandEncoder();
-              if (pendingStrips >= 256 && dt > 0.2) {
-                msPerStrip = 0.7 * msPerStrip + 0.3 * (dt / pendingStrips);
-                device.__v4MsPerStrip = msPerStrip;
-              }
               doneWork += pendingStrips;
+              enc = await pacer.submitChunk(enc, pendingStrips, li);
               pendingStrips = 0;
-              emitProgress(li);
-              await yieldAfterPacedChunk();
             }
           }
         }
@@ -5668,26 +6278,26 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
       if (execMode === 'pipelined') {
         device.queue.submit([enc.finish()]);
         enc = device.createCommandEncoder();
-      } else if (execMode !== 'single') {
-        const tLayerEnd = performance.now();
+      } else if (execMode === 'calibrate') {
+        // Flush Layer 0 residency page-in cleanly so Layer 1 calibrates steady-state GPU speed
         device.queue.submit([enc.finish()]);
         await device.queue.onSubmittedWorkDone();
-        const dtEnd = performance.now() - tLayerEnd;
         enc = device.createCommandEncoder();
         doneWork += (li === 0 || !shaders.chunkableStd ? lw.convWork : 0) + lw.normWork;
-        if (li === 0 && execMode === 'calibrate' && dtEnd >= 90) {
+        if (li === numConvs - 1 && !device.__v4WinCalibrated) {
           device.__v4WinCalibrated = true;
-          device.__v4WinFast = false;
-          execMode = 'paced';
-          console.log(`[WebGPU-V4] Windows GPU calibration (conv0=${dtEnd.toFixed(1)}ms) -> TDR-safe paced mode`);
+          device.__v4WinFast = !plat.isWindowsSharedIgpu;
         }
-        if (execMode === 'paced') {
-          emitProgress(li);
-          if (li === 0 || !shaders.chunkableStd || dtEnd >= 30) await yieldAfterPacedChunk();
-        }
+      } else if (execMode !== 'single') {
+        const tailWork = (!shaders.chunkableStd && li > 0 ? lw.convWork : 0) + lw.normWork;
+        doneWork += tailWork;
+        enc = await pacer.submitChunk(enc, tailWork, li);
       }
     }
 
+    if (execMode === 'paced') {
+      await pacer.waitBeforeFinalSubmit();
+    }
     execute.__passCategories = passCategories;
     return ioCtl.finishAndReadback({
       enc,
@@ -5725,6 +6335,9 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
 
 export async function warmupV4CorePipelines(device) {
   if (!device) return;
+  const shouldAbort = () => activeUserSetups > 0 || !!device.__isLost;
+  if (shouldAbort()) return;
+
   const hasF16 = !!device.features?.has?.('shader-f16');
   const adInfo = device.__adapterInfo || device.adapterInfo || {};
   const hasSubgroups32 = !!device.features?.has?.('subgroups') &&
@@ -5732,20 +6345,27 @@ export async function warmupV4CorePipelines(device) {
   const lim = device.limits || {};
   const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
 
+  await getIoPipe(device, hasF16 ? 'prep_in_u8_f16' : 'prep_in_u8_f32', () => buildPrepInWgsl(true, hasF16), 'main', ['read-only-storage', 'storage', 'uniform']);
+  if (shouldAbort()) return;
+  await getIoPipe(device, 'transpose_u8_v4', buildTransposeU8Wgsl, 'main', ['read-only-storage', 'storage']);
+  if (shouldAbort()) return;
+
+  // Incrementally warm all 3 GroupNorm+GELU backbones used across all 7 UI models:
+  //   - 24ch DEEP13 (models 4, 5, 14, 21, 23)
+  //   - 15ch MindGrab skull stripping (model 2)
+  //   - 16ch DEEP13 fast subcortical+tissue (model 3; shares init/norm/flush with 15ch)
+  // Yields/aborts immediately if the user selects a model so setupNet never contends.
   const warmSpecs = [
     { chan: 24, cs: 24, nclass: 0, dilations: DEEP13, activation: 'gelu_tanh', norm: 'gn' },
-    { chan: 16, cs: 16, nclass: 0, dilations: [16, 8, 4, 2, 1], activation: 'gelu_tanh', norm: 'gn' },
-  ];
-  const tasks = [
-    getIoPipe(device, hasF16 ? 'prep_in_u8_f16' : 'prep_in_u8_f32', () => buildPrepInWgsl(true, hasF16), 'main', ['read-only-storage', 'storage', 'uniform']),
-    getIoPipe(device, 'transpose_u8_v4', buildTransposeU8Wgsl, 'main', ['read-only-storage', 'storage']),
+    { chan: 15, cs: 16, nclass: 0, dilations: [16, 8, 4, 2, 1], activation: 'gelu_tanh', norm: 'gn' },
+    { chan: 16, cs: 16, nclass: 0, dilations: DEEP13, activation: 'gelu_tanh', norm: 'gn' },
   ];
   for (const d of warmSpecs) {
+    if (shouldAbort()) return;
     const splitHalves = d.cs >= 16;
     const csHalf = splitHalves ? d.cs / 2 : d.cs;
     const actBytes = DIM * DIM * csHalf * X4_PAD * 4;
     const use128 = actBytes > maxAllowed || shouldPreferLowMem128OnWindows(device, d, null);
-    const dilKeys = Array.from(new Set(d.dilations.slice(1)));
     if (use128) {
       const shaders = buildShadersLowMem128({
         cs: d.cs,
@@ -5760,7 +6380,11 @@ export async function warmupV4CorePipelines(device) {
         numConvs: d.dilations.length,
         probCfg: null,
       });
-      tasks.push(getNetPipes128(device, d, null, hasF16, hasSubgroups32, null, shaders, dilKeys, { includeCls: false }));
+      await getNetPipes128(device, d, null, hasF16, hasSubgroups32, null, shaders, {
+        includeCls: false,
+        sequential: true,
+        shouldAbort,
+      });
     } else {
       const chunkableStd = shouldUseStdChunking(device, null);
       const shaders = buildShaders({
@@ -5777,10 +6401,13 @@ export async function warmupV4CorePipelines(device) {
         probCfg: null,
         chunkableStd,
       });
-      tasks.push(getNetPipesStd(device, d, null, hasF16, hasSubgroups32, splitHalves, null, shaders, dilKeys, { includeCls: false }));
+      await getNetPipesStd(device, d, null, hasF16, hasSubgroups32, splitHalves, null, shaders, {
+        includeCls: false,
+        sequential: true,
+        shouldAbort,
+      });
     }
   }
-  await Promise.all(tasks);
 }
 
 const load = async (device, weightPath) => {
