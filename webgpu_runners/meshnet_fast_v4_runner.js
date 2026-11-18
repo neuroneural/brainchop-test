@@ -46,6 +46,111 @@ const MAX_EXT_HALF_ROWS = MAX_EXT_STRIPS * 8;
 const DEEP13 = [1, 3, 5, 7, 13, 19, 31, 19, 13, 7, 5, 3, 1];
 const rep = (n, f) => Array.from({ length: n }, (_, i) => f(i)).join('');
 
+// Windows WDDM enforces a hard 2.0s TDR per GPU execution quantum, and shared-RAM
+// integrated GPUs (e.g. Intel UHD 630) share all EUs + DDR4 bandwidth with dwm.exe.
+// Apple Silicon stays on the untouched single-encoder fast path; Linux & discrete
+// Windows GPUs run unthrottled pipelined per-layer queue.submit; slow Windows GPUs
+// self-calibrate into ~180ms Z-chunked submissions with live progress updates.
+const WINDOWS_FAST_LAYER_MAX_MS = 280;
+const PACED_TARGET_CHUNK_MS = 180;
+const STD_SLOTS_PER_LAYER = 112; // <=64 main chunks (down to 256 strips) + <=48 ext chunks
+
+function getV4ExecOverride(modelEntry) {
+  if (modelEntry?.webgpuExecMode) return String(modelEntry.webgpuExecMode).toLowerCase();
+  try {
+    const q = new URLSearchParams(globalThis.location?.search || '').get('webgpuExec');
+    if (q) return q.toLowerCase();
+  } catch { /* worker or non-DOM context */ }
+  return '';
+}
+
+function detectV4Platform(device) {
+  const adInfo = device?.__adapterInfo || device?.adapterInfo || {};
+  const vendor = String(adInfo.vendor || '').toLowerCase();
+  const arch = String(adInfo.architecture || '').toLowerCase();
+  const desc = `${adInfo.device || ''} ${adInfo.description || ''}`;
+  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+  const plat = (typeof navigator !== 'undefined' && (navigator.userAgentData?.platform || navigator.platform || '')) || '';
+  const isApple = vendor === 'apple' ||
+    (/Mac|iPhone|iPad|iPod/i.test(`${plat} ${ua}`) && !['intel', 'amd', 'nvidia', 'microsoft'].includes(vendor));
+  const isWindows = !isApple && (/Win/i.test(plat) || /Windows/i.test(ua));
+  const isWindowsSharedIgpu = isWindows && (
+    vendor === 'microsoft' ||
+    (vendor === 'intel' && (/^gen-(9|11|12lp)/i.test(arch) || /UHD Graphics|HD Graphics|Iris\(R\)\s*(Plus|Xe)|Pentium|Celeron/i.test(desc)))
+  );
+  return { vendor, arch, desc, isApple, isWindows, isWindowsSharedIgpu };
+}
+
+function resolveV4InitialExecMode(device, modelEntry) {
+  const ov = getV4ExecOverride(modelEntry);
+  if (ov === 'single' || ov === 'pipelined' || ov === 'paced' || ov === 'calibrate') return ov;
+  if (ov === 'chunked') return 'paced';
+  const plat = detectV4Platform(device);
+  if (plat.isApple) return 'single';
+  if (plat.isWindows) {
+    if (device?.__v4WinCalibrated) {
+      return device.__v4WinFast ? 'pipelined' : 'paced';
+    }
+    return 'calibrate';
+  }
+  return 'pipelined';
+}
+
+function shouldUseStdChunking(device, modelEntry) {
+  const ov = getV4ExecOverride(modelEntry);
+  if (ov === 'single') return false;
+  if (ov === 'paced' || ov === 'chunked' || ov === 'calibrate') return true;
+  if (ov === 'pipelined') return false;
+  return detectV4Platform(device).isWindows;
+}
+
+function shouldPreferLowMem128OnWindows(device, d, modelEntry) {
+  if (modelEntry?.forceLowMem128 === false) return false;
+  const plat = detectV4Platform(device);
+  return plat.isWindowsSharedIgpu && d.cs >= 24 && d.cs % 4 === 0;
+}
+
+function yieldAfterPacedChunk() {
+  if (typeof requestAnimationFrame !== 'function') {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const timer = setTimeout(finish, 16);
+    requestAnimationFrame(() => {
+      clearTimeout(timer);
+      setTimeout(finish, 0);
+    });
+  });
+}
+
+function estimateScheduleLayerWork(L, li, numConvs) {
+  const nMain = L.isFull ? TOTAL_STRIPS : L.mainStrips.length;
+  const nExt = L.isFull || !L.extStrips ? 0 : L.extStrips.length;
+  const nNorm = li + 1 < numConvs ? (L.isFull ? TOTAL_STRIPS : (L.normStrips ? L.normStrips.length : 0)) : 0;
+  const normWork = Math.max(16, Math.round(nNorm * 0.12));
+  if (li === 0) {
+    return { convWork: Math.max(64, Math.round(nMain * 0.12)), normWork };
+  }
+  return { convWork: nMain + nExt, normWork };
+}
+
+function estimateScheduleTotalWork(schedule, numConvs) {
+  let total = 0;
+  for (let li = 0; li < numConvs; li++) {
+    const w = estimateScheduleLayerWork(schedule.layers[li], li, numConvs);
+    total += w.convWork + w.normWork;
+  }
+  const nCls = schedule.clsSkipped ? schedule.clsStrips.length : TOTAL_STRIPS;
+  total += Math.max(64, Math.round(nCls * 0.2));
+  return Math.max(1, total);
+}
+
 const _f32 = new Float32Array(1);
 const _u32 = new Uint32Array(_f32.buffer);
 function f32ToF16Bits(val) {
@@ -657,13 +762,24 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
   const sgTag = hasSubgroups32 ? 1 : 0;
   const splitTag = splitHalves ? 1 : 0;
   const uWeffTag = shaders.useUniformWeff ? 1 : 0;
+  const chunkTag = shaders.chunkableStd ? 1 : 0;
   const mk = (label, mod, ep, types) => createLayoutAndPipe(device, label, mod, ep, types);
 
   const initTypes = ['storage', 'storage'];
   const conv0Types = ['read-only-storage', 'storage', 'storage', 'read-only-storage', 'read-only-storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
   const prepTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'storage', 'storage', 'read-only-storage', 'uniform'];
   const normTypes = ['storage', 'storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'uniform'];
-  const convTypes = ['read-only-storage', 'read-only-storage', 'storage', 'storage', 'storage', 'storage', shaders.useUniformWeff ? 'uniform' : 'read-only-storage', 'read-only-storage', 'uniform'];
+  const convTypes = [
+    'read-only-storage',
+    'read-only-storage',
+    'storage',
+    'storage',
+    'storage',
+    'storage',
+    shaders.useUniformWeff ? 'uniform' : 'read-only-storage',
+    'read-only-storage',
+    shaders.chunkableStd ? { type: 'uniform', hasDynamicOffset: true, minBindingSize: 32 } : 'uniform',
+  ];
   const clsTypes = ['read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'read-only-storage', 'storage', 'read-only-storage', 'uniform'];
 
   const initKey = `std|init|${d.cs}|${d.activation}|${f16Tag}|${splitTag}`;
@@ -720,7 +836,7 @@ async function getNetPipesStd(device, d, packed, hasF16, hasSubgroups32, splitHa
   const pConvPs = dilKeys.map((dil) =>
     getCachedKernelGroup(
       cache,
-      `std|conv|${d.chan}|${d.cs}|${dil}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}|${splitTag}`,
+      `std|conv|${d.chan}|${d.cs}|${dil}|${d.activation}|${d.norm}|${uWeffTag}|${f16Tag}|${sgTag}|${splitTag}${chunkTag ? '|chk1' : ''}`,
       async () => {
         const mod = createShaderModuleFast(device, `conv_d${dil}`, shaders.getConvWgsl(dil));
         if (shaders.halfPassConv) {
@@ -1763,7 +1879,7 @@ function createGpuIoController({
     };
   }
 
-  async function finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts }) {
+  async function finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts, paced = false, onProgress = null }) {
     const nCls = schedule.clsSkipped ? schedule.clsStrips.length : DIM;
     if (!probCfg) {
       u4Tmp[0] = packed.clsVec4Off;
@@ -1795,6 +1911,7 @@ function createGpuIoController({
         await readbackBuf.mapAsync(GPUMapMode.READ);
         const out = new Uint8Array(readbackBuf.getMappedRange()).slice();
         readbackBuf.unmap();
+        if (paced && onProgress) onProgress(1.0, '');
         return [out];
       }
 
@@ -1805,6 +1922,7 @@ function createGpuIoController({
       const out = new Float32Array(nvox);
       for (let i = 0; i < nvox; i++) out[i] = u8[i];
       readbackBuf.unmap();
+      if (paced && onProgress) onProgress(1.0, '');
       return [out];
     }
 
@@ -1886,6 +2004,14 @@ function createGpuIoController({
         passCategories.push('postprocess');
       }
 
+      if (paced) {
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        if (onProgress) onProgress(0.992, '');
+        await yieldAfterPacedChunk();
+        enc = device.createCommandEncoder();
+      }
+
       const nativeOut = !!ioOpts?.gpuNativeOutput;
       for (let ti = 0; ti < 3; ti++) {
         const ts = ps.tissues[ti];
@@ -1944,6 +2070,7 @@ function createGpuIoController({
       };
       const wm = await readOne(resBufs[1]);
       const csf = await readOne(resBufs[2]);
+      if (paced && onProgress) onProgress(1.0, '');
       return [gm, wm, csf];
     }
 
@@ -2010,7 +2137,7 @@ function createGpuIoController({
 function buildShaders(cfg) {
   const {
     cs, chan, nclass, clsK4, dilations, activation, norm,
-    hasF16, hasSubgroups32, splitHalves, probCfg,
+    hasF16, hasSubgroups32, splitHalves, probCfg, chunkableStd = false,
   } = cfg;
   const oc4 = cs / 4;
   const csHalf = splitHalves ? cs / 2 : cs;
@@ -2671,11 +2798,29 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
       });
 
       const coords = isExtEntry
-        ? `
-  let pk = strips[cp.ext_off + wid.z];
+        ? (chunkableStd
+          ? `
+  let ext_i = cp.ext_base + wid.z;
+  let pk = strips[cp.ext_off + ext_i];
   let y = i32((pk & 255u) * 4u + lid.y);
   let z = i32(pk >> 8u);`
-        : `
+          : `
+  let pk = strips[cp.ext_off + wid.z];
+  let y = i32((pk & 255u) * 4u + lid.y);
+  let z = i32(pk >> 8u);`)
+        : (chunkableStd
+          ? `
+  var y : i32;
+  var z : i32;
+  if (cp.is_full != 0u) {
+    y = i32(wid.y * 4u + lid.y);
+    z = i32(cp.main_off + wid.z);
+  } else {
+    let pk = strips[cp.main_off + wid.z];
+    y = i32((pk & 255u) * 4u + lid.y);
+    z = i32(pk >> 8u);
+  }`
+          : `
   var y : i32;
   var z : i32;
   if (cp.is_full != 0u) {
@@ -2685,9 +2830,11 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
     let pk = strips[wid.z];
     y = i32((pk & 255u) * 4u + lid.y);
     z = i32(pk >> 8u);
-  }`;
+  }`);
 
-      const hrExpr = isExtEntry ? 'wid.z * 8u + lid.y * 2u + sg' : 'row_idx * 2u + sg';
+      const hrExpr = isExtEntry
+        ? (chunkableStd ? 'ext_i * 8u + lid.y * 2u + sg' : 'wid.z * 8u + lid.y * 2u + sg')
+        : 'row_idx * 2u + sg';
       const momBind = isExtEntry ? 'mom_ext' : 'mom_main';
       const writeY8Expr = isExtEntry ? '(cp.write_ext_y8 != 0u)' : 'true';
       // Keep `ic` loop runtime-opaque (`+ cp.pad0`, where `cp.pad0 == 0u`) when
@@ -2773,13 +2920,26 @@ ${emitEpilogue({
       ? `@group(0) @binding(6) var<uniform> w_eff_u : array<mat2x4<f16>, ${Math.ceil(totalWEffVec4s / 2)}>;`
       : `@group(0) @binding(6) var<storage, read> w_eff : array<${V4}>;`;
 
-    return `${f16Enable}${sgEnable}
-struct ConvParams {
+    const convParamsDecl = chunkableStd
+      ? `struct ConvParams {
   is_full : u32,
   ext_off : u32,
   write_ext_y8 : u32,
   pad0 : u32,
-};
+  main_off : u32,
+  ext_base : u32,
+  pad1 : u32,
+  pad2 : u32,
+};`
+      : `struct ConvParams {
+  is_full : u32,
+  ext_off : u32,
+  write_ext_y8 : u32,
+  pad0 : u32,
+};`;
+
+    return `${f16Enable}${sgEnable}
+${convParamsDecl}
 @group(0) @binding(0) var<storage, read> act8_0 : array<u32>;
 @group(0) @binding(1) var<storage, read> act8_1 : array<u32>;
 @group(0) @binding(2) var<storage, read_write> y8_0 : array<u32>;
@@ -2877,6 +3037,7 @@ ${buildClassifierLoopsWgsl({
     totalWEffVec4s,
     useUniformWeff,
     csHalf,
+    chunkableStd,
     halfPass0: !hasF16 && splitHalves,
     halfPassConv: !hasF16 && splitHalves,
   };
@@ -4155,8 +4316,229 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       device.queue.writeBuffer(bandUboBuf, 0, bandUboHost);
     }
 
-    const enc = device.createCommandEncoder();
+    let execMode = resolveV4InitialExecMode(device, modelEntry);
     const passCategories = [];
+
+    if (execMode === 'single') {
+      const enc = device.createCommandEncoder();
+      prepRes.runPrePasses(enc, passCategories);
+
+      if (schedule.clsSkipped) {
+        enc.clearBuffer(labels8Buf, 0, outBufBytes);
+        if (schedule.clsStrips.length > 0) {
+          device.queue.writeBuffer(clsStripsUbo, 0, schedule.clsStrips);
+        }
+      }
+
+      for (let li = 0; li < numConvs; li++) {
+        const bp = bandPlans[li];
+        const { L, nMain, nHalo } = bp;
+        const nMomExt = L.nMomExt || 0;
+        const nNorm = L.isFull ? TOTAL_STRIPS : (L.normStrips ? L.normStrips.length : 0);
+
+        if (li === 0) {
+          const mainY = L.isFull ? 64 : 1;
+          const mainZ = L.isFull ? DIM : nMain;
+          const runBg = !!(L.bgStrip && nHalo > 0);
+          u4Tmp[0] = L.isFull ? 1 : 0;
+          u4Tmp[1] = L.bgStrip ? L.bgStrip.yWg * 4 : 0;
+          u4Tmp[2] = L.bgStrip ? L.bgStrip.z : 0;
+          u4Tmp[3] = 0;
+          device.queue.writeBuffer(conv0Ubo, 0, u4Tmp);
+
+          if (shaders.halfPass0) {
+            for (const [pM, pB] of [[pConv0.lo, pConv0.bgLo], [pConv0.hi, pConv0.bgHi]]) {
+              const pass = enc.beginComputePass();
+              pass.setBindGroup(0, bgConv0);
+              if (mainZ > 0) {
+                pass.setPipeline(pM.pipe);
+                pass.dispatchWorkgroups(1, mainY, mainZ);
+              }
+              if (runBg) {
+                pass.setPipeline(pB.pipe);
+                pass.dispatchWorkgroups(1, 1, 1);
+              }
+              pass.end();
+              passCategories.push('conv0');
+            }
+          } else {
+            const pass = enc.beginComputePass();
+            pass.setBindGroup(0, bgConv0);
+            if (mainZ > 0) {
+              pass.setPipeline(pConv0.main.pipe);
+              pass.dispatchWorkgroups(1, mainY, mainZ);
+            }
+            if (runBg) {
+              pass.setPipeline(pConv0.bg.pipe);
+              pass.dispatchWorkgroups(1, 1, 1);
+            }
+            pass.end();
+            passCategories.push('conv0');
+          }
+        } else {
+          const dil = d.dilations[li];
+          const pipes = convPipes[dil];
+          const bgC = convBgs[li];
+          const bgF = flushBgs[li];
+          const { mainCount, extCount, layerBaseSlot } = bp;
+          const runBg = L.mode === 'rpure' && !!L.bgStrip;
+
+          for (let b = 0; b < 8; b++) {
+            if (b >= 2) {
+              const fb = b - 2;
+              const doFlushMain = L.isFull || mainCount[fb] > 0;
+              const doFlushExt = !L.isFull && L.mode === 'bwd' && extCount[fb] > 0;
+              if (doFlushMain || doFlushExt) {
+                const fPass = enc.beginComputePass();
+                fPass.setPipeline(pFlush.pipe);
+                if (doFlushMain) {
+                  fPass.setBindGroup(0, bgF, [(layerBaseSlot + 8 + fb) * uboAlign]);
+                  fPass.dispatchWorkgroups(1, L.isFull ? 64 : 1, L.isFull ? 32 : mainCount[fb]);
+                }
+                if (doFlushExt) {
+                  fPass.setBindGroup(0, bgF, [(layerBaseSlot + 14 + fb) * uboAlign]);
+                  fPass.dispatchWorkgroups(1, 1, extCount[fb]);
+                }
+                fPass.end();
+                passCategories.push('flushStage');
+              }
+            }
+
+            const doMain = L.isFull || mainCount[b] > 0;
+            const doExt = !L.isFull && L.mode === 'bwd' && extCount[b] > 0;
+            const doBg = b === 0 && runBg;
+            if (!doMain && !doExt && !doBg) continue;
+
+            const cDyn = [(layerBaseSlot + b) * uboAlign];
+            const mainY = L.isFull ? 64 : 1;
+            const mainZ = L.isFull ? 32 : mainCount[b];
+
+            if (shaders.halfPassConv) {
+              for (const [pM, pE, pB] of [[pipes.lo, pipes.extLo, pipes.bgLo], [pipes.hi, pipes.extHi, pipes.bgHi]]) {
+                const pass = enc.beginComputePass();
+                pass.setBindGroup(0, bgC, cDyn);
+                if (doMain) {
+                  pass.setPipeline(pM.pipe);
+                  pass.dispatchWorkgroups(1, mainY, mainZ);
+                }
+                if (doExt) {
+                  pass.setPipeline(pE.pipe);
+                  pass.dispatchWorkgroups(1, 1, extCount[b]);
+                }
+                if (doBg) {
+                  pass.setPipeline(pB.pipe);
+                  pass.dispatchWorkgroups(1, 1, 1);
+                }
+                pass.end();
+                passCategories.push('convHidden');
+              }
+            } else {
+              const pass = enc.beginComputePass();
+              pass.setBindGroup(0, bgC, cDyn);
+              if (doMain) {
+                pass.setPipeline(pipes.main.pipe);
+                pass.dispatchWorkgroups(1, mainY, mainZ);
+              }
+              if (doExt) {
+                pass.setPipeline(pipes.ext.pipe);
+                pass.dispatchWorkgroups(1, 1, extCount[b]);
+              }
+              if (doBg) {
+                pass.setPipeline(pipes.bg.pipe);
+                pass.dispatchWorkgroups(1, 1, 1);
+              }
+              pass.end();
+              passCategories.push('convHidden');
+            }
+          }
+        }
+
+        const nextWOff = li + 1 < numConvs ? packed.w0Vec4s + li * packed.hiddenVec4PerLayer : 0;
+        prepTmpU32[0] = li * packed.metaStride;
+        prepTmpU32[1] = nextWOff;
+        prepTmpU32[2] = (li + 1) * packed.metaStride;
+        prepTmpU32[3] = li + 1 < numConvs ? 1 : 0;
+        prepTmpU32[4] = li === 0 ? 1 : 0;
+        prepTmpU32[5] = L.isFull ? 1 : 0;
+        prepTmpU32[6] = nMain;
+        prepTmpU32[7] = nMomExt * 8;
+        prepTmpF32[8] = L.extWeight || 0.0;
+        prepTmpU32[9] = 0;
+        prepTmpU32[10] = 0;
+        prepTmpU32[11] = 0;
+        device.queue.writeBuffer(prepUbos[li], 0, prepTmpU32);
+
+        {
+          const pass = enc.beginComputePass();
+          pass.setBindGroup(0, prepBgs[li]);
+          pass.setPipeline(pMomFin.pipe);
+          pass.dispatchWorkgroups(d.cs, 1, 1);
+          pass.end();
+          passCategories.push('momentsPrep');
+        }
+
+        if (li + 1 < numConvs) {
+          {
+            const pass = enc.beginComputePass();
+            pass.setBindGroup(0, prepBgs[li]);
+            pass.setPipeline(pPrepW.pipe);
+            pass.dispatchWorkgroups(1, 1, 1);
+            pass.end();
+            passCategories.push('momentsPrep');
+          }
+
+          const uploadNorm = !L.isFull ? nNorm : 0;
+          if (uploadNorm > 0 || nHalo > 0) {
+            if (uploadNorm > 0) normAuxHost.set(L.normStrips, 0);
+            if (nHalo > 0) normAuxHost.set(L.haloRows, uploadNorm);
+            device.queue.writeBuffer(normAuxBufs[li], 0, normAuxHost.subarray(0, uploadNorm + nHalo));
+          }
+
+          u4Tmp[0] = L.isFull ? 1 : 0;
+          u4Tmp[1] = L.bgStrip ? L.bgStrip.z * DIM + L.bgStrip.yWg * 4 : 0;
+          u4Tmp[2] = uploadNorm;
+          u4Tmp[3] = nHalo;
+          device.queue.writeBuffer(normUbos[li], 0, u4Tmp);
+
+          if (L.isFull || nNorm > 0 || nHalo > 0) {
+            const pass = enc.beginComputePass();
+            pass.setBindGroup(0, normBgs[li]);
+            if (L.isFull || nNorm > 0) {
+              pass.setPipeline(pNorm.pipe);
+              pass.dispatchWorkgroups(1, L.isFull ? 64 : 1, L.isFull ? DIM : nNorm);
+            }
+            if (nHalo > 0) {
+              pass.setPipeline(pNormHalo.pipe);
+              pass.dispatchWorkgroups(1, Math.ceil(nHalo / 4), 1);
+            }
+            pass.end();
+            passCategories.push('normHalo');
+          }
+        }
+      }
+
+      execute.__passCategories = passCategories;
+      return ioCtl.finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts });
+    }
+
+    // Pipelined (Linux / fast discrete Windows) or Paced/Calibrating (Windows TDR-safe Z-bands)
+    const onProgress = typeof ioOpts?.onProgress === 'function' ? ioOpts.onProgress : null;
+    const totalWork = estimateScheduleTotalWork(schedule, numConvs);
+    let doneWork = 0;
+    let lastLayerReported = -1;
+    let msPerStrip = device.__v4MsPerStrip || 0.12;
+    const emitProgress = (li) => {
+      if (!onProgress) return;
+      const frac = Math.min(0.99, doneWork / totalWork);
+      let msg = '';
+      if (li >= 0 && li !== lastLayerReported) {
+        lastLayerReported = li;
+        msg = `Layer ${li + 1}/${numConvs}`;
+      }
+      onProgress(frac, msg);
+    };
+
+    let enc = device.createCommandEncoder();
     prepRes.runPrePasses(enc, passCategories);
 
     if (schedule.clsSkipped) {
@@ -4171,6 +4553,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       const { L, nMain, nHalo } = bp;
       const nMomExt = L.nMomExt || 0;
       const nNorm = L.isFull ? TOTAL_STRIPS : (L.normStrips ? L.normStrips.length : 0);
+      const lw = estimateScheduleLayerWork(L, li, numConvs);
 
       if (li === 0) {
         const mainY = L.isFull ? 64 : 1;
@@ -4218,6 +4601,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
         const bgF = flushBgs[li];
         const { mainCount, extCount, layerBaseSlot } = bp;
         const runBg = L.mode === 'rpure' && !!L.bgStrip;
+        let pendingStrips = 0;
 
         for (let b = 0; b < 8; b++) {
           if (b >= 2) {
@@ -4243,48 +4627,91 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
           const doMain = L.isFull || mainCount[b] > 0;
           const doExt = !L.isFull && L.mode === 'bwd' && extCount[b] > 0;
           const doBg = b === 0 && runBg;
-          if (!doMain && !doExt && !doBg) continue;
+          if (doMain || doExt || doBg) {
+            const cDyn = [(layerBaseSlot + b) * uboAlign];
+            const mainY = L.isFull ? 64 : 1;
+            const mainZ = L.isFull ? 32 : mainCount[b];
 
-          const cDyn = [(layerBaseSlot + b) * uboAlign];
-          const mainY = L.isFull ? 64 : 1;
-          const mainZ = L.isFull ? 32 : mainCount[b];
-
-          if (shaders.halfPassConv) {
-            for (const [pM, pE, pB] of [[pipes.lo, pipes.extLo, pipes.bgLo], [pipes.hi, pipes.extHi, pipes.bgHi]]) {
+            if (shaders.halfPassConv) {
+              for (const [pM, pE, pB] of [[pipes.lo, pipes.extLo, pipes.bgLo], [pipes.hi, pipes.extHi, pipes.bgHi]]) {
+                const pass = enc.beginComputePass();
+                pass.setBindGroup(0, bgC, cDyn);
+                if (doMain) {
+                  pass.setPipeline(pM.pipe);
+                  pass.dispatchWorkgroups(1, mainY, mainZ);
+                }
+                if (doExt) {
+                  pass.setPipeline(pE.pipe);
+                  pass.dispatchWorkgroups(1, 1, extCount[b]);
+                }
+                if (doBg) {
+                  pass.setPipeline(pB.pipe);
+                  pass.dispatchWorkgroups(1, 1, 1);
+                }
+                pass.end();
+                passCategories.push('convHidden');
+              }
+            } else {
               const pass = enc.beginComputePass();
               pass.setBindGroup(0, bgC, cDyn);
               if (doMain) {
-                pass.setPipeline(pM.pipe);
+                pass.setPipeline(pipes.main.pipe);
                 pass.dispatchWorkgroups(1, mainY, mainZ);
               }
               if (doExt) {
-                pass.setPipeline(pE.pipe);
+                pass.setPipeline(pipes.ext.pipe);
                 pass.dispatchWorkgroups(1, 1, extCount[b]);
               }
               if (doBg) {
-                pass.setPipeline(pB.pipe);
+                pass.setPipeline(pipes.bg.pipe);
                 pass.dispatchWorkgroups(1, 1, 1);
               }
               pass.end();
               passCategories.push('convHidden');
             }
-          } else {
-            const pass = enc.beginComputePass();
-            pass.setBindGroup(0, bgC, cDyn);
-            if (doMain) {
-              pass.setPipeline(pipes.main.pipe);
-              pass.dispatchWorkgroups(1, mainY, mainZ);
+
+            pendingStrips += (doMain ? (L.isFull ? 2048 : mainCount[b]) : 0) + (doExt ? extCount[b] : 0);
+          }
+
+          if (execMode === 'calibrate' && (pendingStrips >= 512 || (b === 7 && pendingStrips > 0))) {
+            const tSub = performance.now();
+            device.queue.submit([enc.finish()]);
+            await device.queue.onSubmittedWorkDone();
+            const dt = performance.now() - tSub;
+            enc = device.createCommandEncoder();
+            doneWork += pendingStrips;
+            if (pendingStrips >= 512) {
+              msPerStrip = dt / pendingStrips;
+              const estFullLayerMs = msPerStrip * TOTAL_STRIPS;
+              device.__v4WinCalibrated = true;
+              device.__v4MsPerStrip = msPerStrip;
+              if (estFullLayerMs < WINDOWS_FAST_LAYER_MAX_MS) {
+                device.__v4WinFast = true;
+                execMode = 'pipelined';
+                console.log(`[WebGPU-V4-128M] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> unthrottled pipelined mode`);
+              } else {
+                device.__v4WinFast = false;
+                execMode = 'paced';
+                console.log(`[WebGPU-V4-128M] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> TDR-safe paced mode`);
+                emitProgress(li);
+                await yieldAfterPacedChunk();
+              }
             }
-            if (doExt) {
-              pass.setPipeline(pipes.ext.pipe);
-              pass.dispatchWorkgroups(1, 1, extCount[b]);
+            pendingStrips = 0;
+          } else if (execMode === 'paced' && pendingStrips > 0 && (pendingStrips * msPerStrip >= PACED_TARGET_CHUNK_MS * 0.75 || b === 7)) {
+            const tSub = performance.now();
+            device.queue.submit([enc.finish()]);
+            await device.queue.onSubmittedWorkDone();
+            const dt = performance.now() - tSub;
+            enc = device.createCommandEncoder();
+            if (pendingStrips >= 256 && dt > 0.2) {
+              msPerStrip = 0.7 * msPerStrip + 0.3 * (dt / pendingStrips);
+              device.__v4MsPerStrip = msPerStrip;
             }
-            if (doBg) {
-              pass.setPipeline(pipes.bg.pipe);
-              pass.dispatchWorkgroups(1, 1, 1);
-            }
-            pass.end();
-            passCategories.push('convHidden');
+            doneWork += pendingStrips;
+            pendingStrips = 0;
+            emitProgress(li);
+            await yieldAfterPacedChunk();
           }
         }
       }
@@ -4351,10 +4778,40 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
           passCategories.push('normHalo');
         }
       }
+
+      if (execMode === 'pipelined') {
+        device.queue.submit([enc.finish()]);
+        enc = device.createCommandEncoder();
+      } else {
+        const tLayerEnd = performance.now();
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        const dtEnd = performance.now() - tLayerEnd;
+        enc = device.createCommandEncoder();
+        doneWork += (li === 0 ? lw.convWork : 0) + lw.normWork;
+        if (li === 0 && execMode === 'calibrate' && dtEnd >= 90) {
+          device.__v4WinCalibrated = true;
+          device.__v4WinFast = false;
+          execMode = 'paced';
+          console.log(`[WebGPU-V4-128M] Windows GPU calibration (conv0=${dtEnd.toFixed(1)}ms) -> TDR-safe paced mode`);
+        }
+        if (execMode === 'paced') {
+          emitProgress(li);
+          if (li === 0 || dtEnd >= 30) await yieldAfterPacedChunk();
+        }
+      }
     }
 
     execute.__passCategories = passCategories;
-    return ioCtl.finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts });
+    return ioCtl.finishAndReadback({
+      enc,
+      schedule,
+      passCategories,
+      u4Tmp,
+      ioOpts,
+      paced: execMode === 'paced',
+      onProgress,
+    });
   }
 
   ioCtl.warmupIoPipelines();
@@ -4418,7 +4875,8 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
 
   const lim = device.limits || {};
   const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
-  if ((modelEntry?.forceLowMem128 || actBytes > maxAllowed || outBufBytes > maxAllowed) && d.cs >= 8 && d.cs % 4 === 0) {
+  const preferWin128 = shouldPreferLowMem128OnWindows(device, d, modelEntry);
+  if ((modelEntry?.forceLowMem128 || preferWin128 || actBytes > maxAllowed || outBufBytes > maxAllowed) && d.cs >= 8 && d.cs % 4 === 0) {
     return setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, modelEntry, probCfg);
   }
   if (actBytes > maxAllowed || outBufBytes > maxAllowed) {
@@ -4426,6 +4884,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     throw new Error(`meshnet_fast_v4: buffer (${needMiB} MiB) exceeds device limit (${maxAllowed >>> 20} MiB)`);
   }
 
+  const chunkableStd = shouldUseStdChunking(device, modelEntry);
   const shaders = buildShaders({
     cs: d.cs,
     chan: d.chan,
@@ -4438,6 +4897,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     hasSubgroups32,
     splitHalves,
     probCfg,
+    chunkableStd,
   });
 
   console.log(
@@ -4507,7 +4967,13 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
   const clsUbo = mkBuf(16, GPUBufferUsage.UNIFORM | CD);
   const prepUbos = Array.from({ length: numConvs }, () => mkBuf(48, GPUBufferUsage.UNIFORM | CD));
   const normUbos = Array.from({ length: numConvs - 1 }, () => mkBuf(16, GPUBufferUsage.UNIFORM | CD));
-  const convUbos = Array.from({ length: numConvs }, () => mkBuf(16, GPUBufferUsage.UNIFORM | CD));
+
+  const uboAlign = Math.max(256, lim.minUniformBufferOffsetAlignment || 256);
+  const uboAlignU32 = uboAlign >>> 2;
+  const totalStdSlots = shaders.chunkableStd ? Math.max(1, (numConvs - 1) * STD_SLOTS_PER_LAYER) : 0;
+  const stdChunkUboBuf = shaders.chunkableStd ? mkBuf(totalStdSlots * uboAlign, GPUBufferUsage.UNIFORM | CD) : null;
+  const stdChunkUboHost = shaders.chunkableStd ? new Uint32Array(totalStdSlots * uboAlignU32) : null;
+  const convUbos = shaders.chunkableStd ? null : Array.from({ length: numConvs }, () => mkBuf(16, GPUBufferUsage.UNIFORM | CD));
 
   device.queue.writeBuffer(wRawBuf, 0, hasF16 ? packed.wF16 : packed.wF32);
   device.queue.writeBuffer(qmetaBuf, 0, packed.qmetaF32);
@@ -4542,7 +5008,10 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
 
   const mkBg = (bgl, bufs) => device.createBindGroup({
     layout: bgl,
-    entries: bufs.map((buffer, binding) => ({ binding, resource: { buffer } })),
+    entries: bufs.map((res, binding) => ({
+      binding,
+      resource: res && res.buffer ? res : { buffer: res },
+    })),
   });
 
   const bgInit = mkBg(pInit.bgl, [act8_0, act8_1]);
@@ -4604,14 +5073,78 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
   const normBgs = normUbos.map((ubo, li) =>
     mkBg(pNorm.bgl, [act8_0, act8_1, y8_0, y8_1, momMainBuf, momExtBuf, momStatsBuf, normAuxBufs[li], ubo])
   );
-  const convBgs = convUbos.map((ubo, li) => {
+  const stdDynRes = shaders.chunkableStd ? { buffer: stdChunkUboBuf, offset: 0, size: 32 } : null;
+  const convBgs = Array.from({ length: numConvs }, (_, li) => {
     if (li === 0) return null;
     const dil = d.dilations[li];
     const pObj = shaders.halfPassConv ? convPipes[dil].lo : convPipes[dil].main;
     return mkBg(pObj.bgl, [
-      act8_0, act8_1, y8_0, y8_1, momMainBuf, momExtBuf, wEffBuf, stripsBufs[li], ubo,
+      act8_0, act8_1, y8_0, y8_1, momMainBuf, momExtBuf, wEffBuf, stripsBufs[li],
+      shaders.chunkableStd ? stdDynRes : convUbos[li],
     ]);
   });
+
+  const setStdSlot = (slotIdx, isFull, nMain, writeExtY8, mainOff, extBase) => {
+    const o = slotIdx * uboAlignU32;
+    stdChunkUboHost[o] = isFull ? 1 : 0;
+    stdChunkUboHost[o + 1] = nMain;
+    stdChunkUboHost[o + 2] = writeExtY8 ? 1 : 0;
+    stdChunkUboHost[o + 3] = 0; // Must remain 0u for icLim unroll barrier
+    stdChunkUboHost[o + 4] = mainOff;
+    stdChunkUboHost[o + 5] = extBase;
+    stdChunkUboHost[o + 6] = 0;
+    stdChunkUboHost[o + 7] = 0;
+  };
+
+  const dispatchStdConv = (enc, pipes, bg, dynOffsets, mainY, mainCountZ, extCountZ, passCategories) => {
+    if (mainCountZ <= 0 && extCountZ <= 0) return;
+    if (shaders.halfPassConv) {
+      {
+        const pass = enc.beginComputePass();
+        if (dynOffsets) pass.setBindGroup(0, bg, dynOffsets);
+        else pass.setBindGroup(0, bg);
+        if (mainCountZ > 0) {
+          pass.setPipeline(pipes.lo.pipe);
+          pass.dispatchWorkgroups(1, mainY, mainCountZ);
+        }
+        if (extCountZ > 0) {
+          pass.setPipeline(pipes.extLo.pipe);
+          pass.dispatchWorkgroups(1, 1, extCountZ);
+        }
+        pass.end();
+        passCategories.push('convHidden');
+      }
+      {
+        const pass = enc.beginComputePass();
+        if (dynOffsets) pass.setBindGroup(0, bg, dynOffsets);
+        else pass.setBindGroup(0, bg);
+        if (mainCountZ > 0) {
+          pass.setPipeline(pipes.hi.pipe);
+          pass.dispatchWorkgroups(1, mainY, mainCountZ);
+        }
+        if (extCountZ > 0) {
+          pass.setPipeline(pipes.extHi.pipe);
+          pass.dispatchWorkgroups(1, 1, extCountZ);
+        }
+        pass.end();
+        passCategories.push('convHidden');
+      }
+    } else {
+      const pass = enc.beginComputePass();
+      if (dynOffsets) pass.setBindGroup(0, bg, dynOffsets);
+      else pass.setBindGroup(0, bg);
+      if (mainCountZ > 0) {
+        pass.setPipeline(pipes.main.pipe);
+        pass.dispatchWorkgroups(1, mainY, mainCountZ);
+      }
+      if (extCountZ > 0) {
+        pass.setPipeline(pipes.ext.pipe);
+        pass.dispatchWorkgroups(1, 1, extCountZ);
+      }
+      pass.end();
+      passCategories.push('convHidden');
+    }
+  };
 
   const padInputHost = hasF16 ? new Uint16Array(paddedVox) : new Float32Array(paddedVox);
   const headRowHost = new Uint8Array(DIM * DIM);
@@ -4637,8 +5170,190 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
     const info = prepRes.info;
 
     const schedule = computeConeSchedule(headRowHost, info, d.dilations, useCone);
-    const enc = device.createCommandEncoder();
+    let execMode = resolveV4InitialExecMode(device, modelEntry);
     const passCategories = [];
+
+    if (execMode === 'single' && !shaders.chunkableStd) {
+      const enc = device.createCommandEncoder();
+      prepRes.runPrePasses(enc, passCategories);
+
+      if (schedule.clsSkipped) {
+        enc.clearBuffer(labels8Buf, 0, outBufBytes);
+        if (schedule.clsStrips.length > 0) {
+          device.queue.writeBuffer(clsStripsBuf, 0, schedule.clsStrips);
+        }
+      }
+
+      for (let li = 0; li < numConvs; li++) {
+        const L = schedule.layers[li];
+        const nMain = L.isFull ? TOTAL_STRIPS : L.mainStrips.length;
+        const nExt = L.isFull || !L.extStrips ? 0 : L.extStrips.length;
+        const nMomExt = L.nMomExt || 0;
+        const nHalo = L.haloRows ? L.haloRows.length : 0;
+        const nNorm = L.isFull ? TOTAL_STRIPS : (L.normStrips ? L.normStrips.length : 0);
+
+        if (!L.isFull && (nMain > 0 || nExt > 0)) {
+          if (nMain > 0) stripsHost.set(L.mainStrips, 0);
+          if (nExt > 0) stripsHost.set(L.extStrips, nMain);
+          device.queue.writeBuffer(stripsBufs[li], 0, stripsHost.subarray(0, nMain + nExt));
+        }
+
+        if (li === 0) {
+          const mainY = L.isFull ? 64 : 1;
+          const mainZ = L.isFull ? DIM : nMain;
+          const runBg = !!(L.bgStrip && nHalo > 0);
+          u4Tmp[0] = L.isFull ? 1 : 0;
+          u4Tmp[1] = L.bgStrip ? L.bgStrip.yWg * 4 : 0;
+          u4Tmp[2] = L.bgStrip ? L.bgStrip.z : 0;
+          u4Tmp[3] = 0;
+          device.queue.writeBuffer(conv0Ubo, 0, u4Tmp);
+
+          if (shaders.halfPass0) {
+            {
+              const pass = enc.beginComputePass();
+              pass.setBindGroup(0, bgConv0);
+              if (mainZ > 0) {
+                pass.setPipeline(pConv0.lo.pipe);
+                pass.dispatchWorkgroups(1, mainY, mainZ);
+              }
+              if (runBg) {
+                pass.setPipeline(pConv0.bgLo.pipe);
+                pass.dispatchWorkgroups(1, 1, 1);
+              }
+              pass.end();
+              passCategories.push('conv0');
+            }
+            {
+              const pass = enc.beginComputePass();
+              pass.setBindGroup(0, bgConv0);
+              if (mainZ > 0) {
+                pass.setPipeline(pConv0.hi.pipe);
+                pass.dispatchWorkgroups(1, mainY, mainZ);
+              }
+              if (runBg) {
+                pass.setPipeline(pConv0.bgHi.pipe);
+                pass.dispatchWorkgroups(1, 1, 1);
+              }
+              pass.end();
+              passCategories.push('conv0');
+            }
+          } else {
+            const pass = enc.beginComputePass();
+            pass.setBindGroup(0, bgConv0);
+            if (mainZ > 0) {
+              pass.setPipeline(pConv0.main.pipe);
+              pass.dispatchWorkgroups(1, mainY, mainZ);
+            }
+            if (runBg) {
+              pass.setPipeline(pConv0.bg.pipe);
+              pass.dispatchWorkgroups(1, 1, 1);
+            }
+            pass.end();
+            passCategories.push('conv0');
+          }
+        } else {
+          const dil = d.dilations[li];
+          const pipes = convPipes[dil];
+          const bg = convBgs[li];
+          const mainY = L.isFull ? 64 : 1;
+          const mainZ = L.isFull ? DIM : nMain;
+          const writeExtY8 = (L.mode === 'rpure' && nHalo > 0) || (L.mode === 'bwd' && li + 1 < numConvs);
+          u4Tmp[0] = L.isFull ? 1 : 0;
+          u4Tmp[1] = nMain;
+          u4Tmp[2] = writeExtY8 ? 1 : 0;
+          u4Tmp[3] = 0;
+          device.queue.writeBuffer(convUbos[li], 0, u4Tmp);
+          dispatchStdConv(enc, pipes, bg, null, mainY, mainZ, nExt, passCategories);
+        }
+
+        // Upload prepUbo
+        const nextWOff = li + 1 < numConvs ? packed.w0Vec4s + li * packed.hiddenVec4PerLayer : 0;
+        prepTmpU32[0] = li * packed.metaStride;
+        prepTmpU32[1] = nextWOff;
+        prepTmpU32[2] = (li + 1) * packed.metaStride;
+        prepTmpU32[3] = li + 1 < numConvs ? 1 : 0;
+        prepTmpU32[4] = li === 0 ? 1 : 0;
+        prepTmpU32[5] = L.isFull ? 1 : 0;
+        prepTmpU32[6] = nMain;
+        prepTmpU32[7] = nMomExt * 8;
+        prepTmpF32[8] = L.extWeight || 0.0;
+        prepTmpU32[9] = 0;
+        prepTmpU32[10] = 0;
+        prepTmpU32[11] = 0;
+        device.queue.writeBuffer(prepUbos[li], 0, prepTmpU32);
+
+        // Explicit pass boundary: moments_finish -> prep_weff -> norm_quant8
+        {
+          const pass = enc.beginComputePass();
+          pass.setBindGroup(0, prepBgs[li]);
+          pass.setPipeline(pMomFin.pipe);
+          pass.dispatchWorkgroups(d.cs, 1, 1);
+          pass.end();
+          passCategories.push('momentsPrep');
+        }
+
+        if (li + 1 < numConvs) {
+          {
+            const pass = enc.beginComputePass();
+            pass.setBindGroup(0, prepBgs[li]);
+            pass.setPipeline(pPrepW.pipe);
+            pass.dispatchWorkgroups(1, 1, 1);
+            pass.end();
+            passCategories.push('momentsPrep');
+          }
+
+          const uploadNorm = !L.isFull ? nNorm : 0;
+          if (uploadNorm > 0 || nHalo > 0) {
+            if (uploadNorm > 0) normAuxHost.set(L.normStrips, 0);
+            if (nHalo > 0) normAuxHost.set(L.haloRows, uploadNorm);
+            device.queue.writeBuffer(normAuxBufs[li], 0, normAuxHost.subarray(0, uploadNorm + nHalo));
+          }
+
+          u4Tmp[0] = L.isFull ? 1 : 0;
+          u4Tmp[1] = L.bgStrip ? L.bgStrip.z * DIM + L.bgStrip.yWg * 4 : 0;
+          u4Tmp[2] = uploadNorm;
+          u4Tmp[3] = nHalo;
+          device.queue.writeBuffer(normUbos[li], 0, u4Tmp);
+
+          if (L.isFull || nNorm > 0 || nHalo > 0) {
+            const pass = enc.beginComputePass();
+            pass.setBindGroup(0, normBgs[li]);
+            if (L.isFull || nNorm > 0) {
+              pass.setPipeline(pNorm.pipe);
+              pass.dispatchWorkgroups(1, L.isFull ? 64 : 1, L.isFull ? DIM : nNorm);
+            }
+            if (nHalo > 0) {
+              pass.setPipeline(pNormHalo.pipe);
+              pass.dispatchWorkgroups(1, Math.ceil(nHalo / 4), 1);
+            }
+            pass.end();
+            passCategories.push('normHalo');
+          }
+        }
+      }
+
+      execute.__passCategories = passCategories;
+      return ioCtl.finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts });
+    }
+
+    // Pipelined (Linux / calibrated fast Windows GPUs) or Paced/Calibrating (Windows TDR-safe Z-chunks)
+    const onProgress = typeof ioOpts?.onProgress === 'function' ? ioOpts.onProgress : null;
+    const totalWork = estimateScheduleTotalWork(schedule, numConvs);
+    let doneWork = 0;
+    let lastLayerReported = -1;
+    let msPerStrip = device.__v4MsPerStrip || 0.12;
+    const emitProgress = (li) => {
+      if (!onProgress) return;
+      const frac = Math.min(0.99, doneWork / totalWork);
+      let msg = '';
+      if (li >= 0 && li !== lastLayerReported) {
+        lastLayerReported = li;
+        msg = `Layer ${li + 1}/${numConvs}`;
+      }
+      onProgress(frac, msg);
+    };
+
+    let enc = device.createCommandEncoder();
     prepRes.runPrePasses(enc, passCategories);
 
     if (schedule.clsSkipped) {
@@ -4655,6 +5370,7 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
       const nMomExt = L.nMomExt || 0;
       const nHalo = L.haloRows ? L.haloRows.length : 0;
       const nNorm = L.isFull ? TOTAL_STRIPS : (L.normStrips ? L.normStrips.length : 0);
+      const lw = estimateScheduleLayerWork(L, li, numConvs);
 
       if (!L.isFull && (nMain > 0 || nExt > 0)) {
         if (nMain > 0) stripsHost.set(L.mainStrips, 0);
@@ -4722,54 +5438,111 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
         const mainY = L.isFull ? 64 : 1;
         const mainZ = L.isFull ? DIM : nMain;
         const writeExtY8 = (L.mode === 'rpure' && nHalo > 0) || (L.mode === 'bwd' && li + 1 < numConvs);
-        u4Tmp[0] = L.isFull ? 1 : 0;
-        u4Tmp[1] = nMain;
-        u4Tmp[2] = writeExtY8 ? 1 : 0;
-        u4Tmp[3] = 0;
-        device.queue.writeBuffer(convUbos[li], 0, u4Tmp);
 
-        if (shaders.halfPassConv) {
-          {
-            const pass = enc.beginComputePass();
-            pass.setBindGroup(0, bg);
-            if (mainZ > 0) {
-              pass.setPipeline(pipes.lo.pipe);
-              pass.dispatchWorkgroups(1, mainY, mainZ);
-            }
-            if (nExt > 0) {
-              pass.setPipeline(pipes.extLo.pipe);
-              pass.dispatchWorkgroups(1, 1, nExt);
-            }
-            pass.end();
-            passCategories.push('convHidden');
-          }
-          {
-            const pass = enc.beginComputePass();
-            pass.setBindGroup(0, bg);
-            if (mainZ > 0) {
-              pass.setPipeline(pipes.hi.pipe);
-              pass.dispatchWorkgroups(1, mainY, mainZ);
-            }
-            if (nExt > 0) {
-              pass.setPipeline(pipes.extHi.pipe);
-              pass.dispatchWorkgroups(1, 1, nExt);
-            }
-            pass.end();
-            passCategories.push('convHidden');
-          }
+        if (!shaders.chunkableStd) {
+          u4Tmp[0] = L.isFull ? 1 : 0;
+          u4Tmp[1] = nMain;
+          u4Tmp[2] = writeExtY8 ? 1 : 0;
+          u4Tmp[3] = 0;
+          device.queue.writeBuffer(convUbos[li], 0, u4Tmp);
+          dispatchStdConv(enc, pipes, bg, null, mainY, mainZ, nExt, passCategories);
+        } else if (execMode === 'pipelined' || execMode === 'single') {
+          const slot = (li - 1) * STD_SLOTS_PER_LAYER;
+          setStdSlot(slot, L.isFull, nMain, writeExtY8, 0, 0);
+          device.queue.writeBuffer(
+            stdChunkUboBuf,
+            slot * uboAlign,
+            stdChunkUboHost.subarray(slot * uboAlignU32, (slot + 1) * uboAlignU32)
+          );
+          dispatchStdConv(enc, pipes, bg, [slot * uboAlign], mainY, mainZ, nExt, passCategories);
         } else {
-          const pass = enc.beginComputePass();
-          pass.setBindGroup(0, bg);
-          if (mainZ > 0) {
-            pass.setPipeline(pipes.main.pipe);
-            pass.dispatchWorkgroups(1, mainY, mainZ);
+          const layerSlotBase = (li - 1) * STD_SLOTS_PER_LAYER;
+          const maxStrips = execMode === 'calibrate'
+            ? 1024
+            : Math.max(256, Math.min(4096, Math.round(PACED_TARGET_CHUNK_MS / Math.max(0.005, msPerStrip))));
+          const chunks = [];
+          let slotCursor = 0;
+          if (L.isFull) {
+            const zStep = Math.max(4, Math.min(64, Math.round(maxStrips / 64)));
+            for (let z0 = 0; z0 < DIM; z0 += zStep) {
+              const zCnt = Math.min(zStep, DIM - z0);
+              const sIdx = layerSlotBase + slotCursor++;
+              setStdSlot(sIdx, true, nMain, writeExtY8, z0, 0);
+              chunks.push({ slotIdx: sIdx, mainY: 64, mainCountZ: zCnt, extCountZ: 0, strips: zCnt * 64 });
+            }
+          } else {
+            const mainStep = Math.max(256, maxStrips);
+            for (let m0 = 0; m0 < nMain; m0 += mainStep) {
+              const mCnt = Math.min(mainStep, nMain - m0);
+              const sIdx = layerSlotBase + slotCursor++;
+              setStdSlot(sIdx, false, nMain, writeExtY8, m0, 0);
+              chunks.push({ slotIdx: sIdx, mainY: 1, mainCountZ: mCnt, extCountZ: 0, strips: mCnt });
+            }
+            const extStep = Math.max(256, maxStrips);
+            for (let e0 = 0; e0 < nExt; e0 += extStep) {
+              const eCnt = Math.min(extStep, nExt - e0);
+              const sIdx = layerSlotBase + slotCursor++;
+              setStdSlot(sIdx, false, nMain, writeExtY8, 0, e0);
+              chunks.push({ slotIdx: sIdx, mainY: 1, mainCountZ: 0, extCountZ: eCnt, strips: eCnt });
+            }
           }
-          if (nExt > 0) {
-            pass.setPipeline(pipes.ext.pipe);
-            pass.dispatchWorkgroups(1, 1, nExt);
+          if (slotCursor > 0) {
+            device.queue.writeBuffer(
+              stdChunkUboBuf,
+              layerSlotBase * uboAlign,
+              stdChunkUboHost.subarray(layerSlotBase * uboAlignU32, (layerSlotBase + slotCursor) * uboAlignU32)
+            );
           }
-          pass.end();
-          passCategories.push('convHidden');
+
+          let pendingStrips = 0;
+          for (let ci = 0; ci < chunks.length; ci++) {
+            const ch = chunks[ci];
+            dispatchStdConv(enc, pipes, bg, [ch.slotIdx * uboAlign], ch.mainY, ch.mainCountZ, ch.extCountZ, passCategories);
+            if (execMode === 'pipelined') continue;
+
+            pendingStrips += ch.strips;
+            const isLast = ci === chunks.length - 1;
+            if (execMode === 'calibrate' && (pendingStrips >= 512 || (isLast && pendingStrips > 0))) {
+              const tSub = performance.now();
+              device.queue.submit([enc.finish()]);
+              await device.queue.onSubmittedWorkDone();
+              const dt = performance.now() - tSub;
+              enc = device.createCommandEncoder();
+              doneWork += pendingStrips;
+              if (pendingStrips >= 512) {
+                msPerStrip = dt / pendingStrips;
+                const estFullLayerMs = msPerStrip * TOTAL_STRIPS;
+                device.__v4WinCalibrated = true;
+                device.__v4MsPerStrip = msPerStrip;
+                if (estFullLayerMs < WINDOWS_FAST_LAYER_MAX_MS) {
+                  device.__v4WinFast = true;
+                  execMode = 'pipelined';
+                  console.log(`[WebGPU-V4] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> unthrottled pipelined mode`);
+                } else {
+                  device.__v4WinFast = false;
+                  execMode = 'paced';
+                  console.log(`[WebGPU-V4] Windows GPU calibration: estFullLayer=${estFullLayerMs.toFixed(1)}ms -> TDR-safe paced mode`);
+                  emitProgress(li);
+                  await yieldAfterPacedChunk();
+                }
+              }
+              pendingStrips = 0;
+            } else if (execMode === 'paced') {
+              const tSub = performance.now();
+              device.queue.submit([enc.finish()]);
+              await device.queue.onSubmittedWorkDone();
+              const dt = performance.now() - tSub;
+              enc = device.createCommandEncoder();
+              if (pendingStrips >= 256 && dt > 0.2) {
+                msPerStrip = 0.7 * msPerStrip + 0.3 * (dt / pendingStrips);
+                device.__v4MsPerStrip = msPerStrip;
+              }
+              doneWork += pendingStrips;
+              pendingStrips = 0;
+              emitProgress(li);
+              await yieldAfterPacedChunk();
+            }
+          }
         }
       }
 
@@ -4837,10 +5610,40 @@ export async function setupNet(device, safetensorBytes, callbackUI, modelEntry =
           passCategories.push('normHalo');
         }
       }
+
+      if (execMode === 'pipelined') {
+        device.queue.submit([enc.finish()]);
+        enc = device.createCommandEncoder();
+      } else if (execMode !== 'single') {
+        const tLayerEnd = performance.now();
+        device.queue.submit([enc.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        const dtEnd = performance.now() - tLayerEnd;
+        enc = device.createCommandEncoder();
+        doneWork += (li === 0 || !shaders.chunkableStd ? lw.convWork : 0) + lw.normWork;
+        if (li === 0 && execMode === 'calibrate' && dtEnd >= 90) {
+          device.__v4WinCalibrated = true;
+          device.__v4WinFast = false;
+          execMode = 'paced';
+          console.log(`[WebGPU-V4] Windows GPU calibration (conv0=${dtEnd.toFixed(1)}ms) -> TDR-safe paced mode`);
+        }
+        if (execMode === 'paced') {
+          emitProgress(li);
+          if (li === 0 || !shaders.chunkableStd || dtEnd >= 30) await yieldAfterPacedChunk();
+        }
+      }
     }
 
     execute.__passCategories = passCategories;
-    return ioCtl.finishAndReadback({ enc, schedule, passCategories, u4Tmp, ioOpts });
+    return ioCtl.finishAndReadback({
+      enc,
+      schedule,
+      passCategories,
+      u4Tmp,
+      ioOpts,
+      paced: execMode === 'paced',
+      onProgress,
+    });
   }
 
   ioCtl.warmupIoPipelines();
@@ -4887,7 +5690,7 @@ export async function warmupV4CorePipelines(device) {
     const splitHalves = d.cs >= 16;
     const csHalf = splitHalves ? d.cs / 2 : d.cs;
     const actBytes = DIM * DIM * csHalf * X4_PAD * 4;
-    const use128 = actBytes > maxAllowed;
+    const use128 = actBytes > maxAllowed || shouldPreferLowMem128OnWindows(device, d, null);
     const dilKeys = Array.from(new Set(d.dilations.slice(1)));
     if (use128) {
       const shaders = buildShadersLowMem128({
@@ -4905,6 +5708,7 @@ export async function warmupV4CorePipelines(device) {
       });
       tasks.push(getNetPipes128(device, d, null, hasF16, hasSubgroups32, null, shaders, dilKeys, { includeCls: false }));
     } else {
+      const chunkableStd = shouldUseStdChunking(device, null);
       const shaders = buildShaders({
         cs: d.cs,
         chan: d.chan,
@@ -4917,6 +5721,7 @@ export async function warmupV4CorePipelines(device) {
         hasSubgroups32,
         splitHalves,
         probCfg: null,
+        chunkableStd,
       });
       tasks.push(getNetPipesStd(device, d, null, hasF16, hasSubgroups32, splitHalves, null, shaders, dilKeys, { includeCls: false }));
     }

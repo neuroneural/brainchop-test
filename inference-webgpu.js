@@ -279,6 +279,7 @@ function buildRunnerKey(kernelTier, runnerName, weightsPath, modelEntry) {
         modelEntry.disableSubgroups ?? null,
         modelEntry.disableConeSkip ?? null,
         modelEntry.forceLowMem128 ?? null,
+        modelEntry.webgpuExecMode ?? null,
         modelEntry.softmaxTemperature ?? null,
         modelEntry.brainSupportTemperature ?? null,
         modelEntry.brainSupportPower ?? null,
@@ -652,18 +653,25 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             }
         }
         const Preprocess_t = ((performance.now() - prepStart) / 1000).toFixed(4);
-        callbackUI('Input data prepared (full volume).', 0.4);
+        callbackUI('Input data prepared (full volume).', 0.3);
 
         // --- INFERENCE ---
-        callbackUI('Running inference...', 0.5);
+        callbackUI('Running inference...', 0.3);
         await yieldForPaint();
         const inferStart = performance.now();
-        const ioOpts = (useGpuNativeInput || useGpuNativeOutput)
+        const onInferProgress = activeEntry.supportsGpuNativeIO
+            ? (frac, layerMsg) => {
+                const clamped = Math.max(0, Math.min(1, Number(frac) || 0));
+                callbackUI(layerMsg || '', 0.3 + 0.6 * clamped);
+            }
+            : undefined;
+        const ioOpts = (useGpuNativeInput || useGpuNativeOutput || onInferProgress)
             ? {
                 gpuNativeInput: useGpuNativeInput,
                 gpuNativeOutput: useGpuNativeOutput,
                 normOffset,
                 normRange: safeRange,
+                onProgress: onInferProgress,
             }
             : undefined;
         const execTracked = await runWithBufferTracking(device, () =>

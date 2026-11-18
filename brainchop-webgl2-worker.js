@@ -100,8 +100,9 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   });
 
   // ---- probe before doing any real work --------------------------------
-  let probe = probeWebgl2(d, dims);
-  if (!probe.supported && !d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
+  const canAutoQ8 = !d.quantize8Bit && !!modelEntry.autoQuantize8BitFallback && desc.norm === 'gn';
+  let probe = probeWebgl2(d, dims, null, { deferRgba16fOnLazyD3D11: canAutoQ8 });
+  if (!probe.supported && canAutoQ8) {
     console.warn(`[webgl2-native] RGBA16F probe declined (${probe.reasons.join('; ')}); falling back to RGBA8 quantized activations.`);
     d = deriveDescriptor(desc, {
       nx: dim, ny: dim, nz: dim,
@@ -142,6 +143,13 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   // ---- inference -------------------------------------------------------
   callbackUI('Running inference...', 0.2);
   const t0 = performance.now();
+  const hasAnyNonZero = (arr) => {
+    if (!arr) return false;
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] !== 0) return true;
+    }
+    return false;
+  };
   let out;
   try {
     out = runMeshNetGL({
@@ -154,6 +162,9 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
       onProgress: (frac, msg) => callbackUI(msg, 0.2 + 0.7 * frac),
       onLog: (msg) => console.log(msg),
     });
+    if (!catLite && !hasAnyNonZero(out.labels)) {
+      throw new Error('native WebGL2 produced an all-zero volume');
+    }
   } catch (err) {
     if (!d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
       console.warn('[webgl2-native] RGBA16F execution failed; retrying once with RGBA8 quantized activations.', err);

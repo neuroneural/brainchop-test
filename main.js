@@ -144,6 +144,7 @@ async function downloadVolume(vol, filename) {
 // --- Backend State ---
 let gpuDevice = null;
 let isWebGpuAvailable = false;
+let gpuDeviceLostRecoveries = 0;
 
 // --- Backend fallback chain state -----------------------------------------
 // runSelectedInference() tries WebGPU, then the native WebGL2 runner, then the
@@ -243,8 +244,26 @@ async function initializeBackend() {
         if (hasF16) requiredFeatures.push("shader-f16");
         if (hasSubgroups) requiredFeatures.push("subgroups");
 
-        gpuDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
-        gpuDevice.__adapterInfo = adapter.info || null;
+        const createdDevice = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+        createdDevice.__adapterInfo = adapter.info || null;
+        createdDevice.__isLost = false;
+        if (createdDevice.lost && typeof createdDevice.lost.then === "function") {
+          createdDevice.lost.then((lossInfo) => {
+            createdDevice.__isLost = true;
+            if (lossInfo?.reason === "destroyed") return;
+            console.warn(
+              `[WebGPU] Device was lost (${lossInfo?.reason || "unknown"}): ${lossInfo?.message || ""}`
+            );
+            if (gpuDevice === createdDevice) {
+              gpuDevice = null;
+              isWebGpuAvailable = false;
+              diagnostics.deviceObtained = false;
+              diagnostics.error = lossInfo?.message || "WebGPU device lost";
+              updateBackendStatusUI(false, diagnostics);
+            }
+          });
+        }
+        gpuDevice = createdDevice;
         diagnostics.deviceObtained = true;
 
         isWebGpuAvailable = true;
@@ -848,7 +867,16 @@ async function main() {
     if (skipSafariLegacyWebGpu && isWebGpuAvailable && modelEntry.webgpu_safetensor) {
       console.info('Safari WebGPU legacy gate active for non-V4 model; routing to native WebGL2.');
     }
-    if (isWebGpuAvailable && !skipWebGpu && modelEntry.webgpu_safetensor) {
+    // If a prior GPU reset / sleep-wake lost the WebGPU device, try once to
+    // re-acquire a fresh device before dispatching this run.
+    if (!skipWebGpu && (!gpuDevice || gpuDevice.__isLost) && 'gpu' in navigator && gpuDeviceLostRecoveries < 2) {
+      if (window.webgpuDiagnostics?.adapterObtained) {
+        gpuDeviceLostRecoveries++;
+        console.info(`[WebGPU] Re-initializing device after prior loss (attempt ${gpuDeviceLostRecoveries})...`);
+        await initializeBackend();
+      }
+    }
+    if (isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost && !skipWebGpu && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
 
       const currentModelEntry = { ...modelEntry, enableTTA: false };
