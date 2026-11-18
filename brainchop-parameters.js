@@ -229,31 +229,44 @@ const inferenceModelsList = [
       'Primary 104-region Desikan-Killiany atlas parcellation (cortical + subcortical + 5-part corpus callosum) for research and clinical T1-weighted MRI, running via the 8-bit V4 WebGPU engine (~3.0s on M1, 120 MiB mobile / 240 MiB desktop max buffer) or native WebGL2.'
   },
   {
+    // Primary 50-class bilateral Desikan-Killiany model (MindSnap-50 v3.5):
+    // 24-channel gridding-free MeshNet (GroupNorm + GELU, RF=255) with built-in
+    // full-head skull stripping and lossless 8-bit V4 WebGPU / native WebGL2 support.
     id: 4,
     type: 'Atlas',
-    path: '/models/model30chan50cls/model.json',
-    modelName: '\u{1F52A} Desikan-Killiany 50',
-    colormapPath: './models/model30chan50cls/colormap.json',
-    webgpu_safetensor: './models/model30chan50cls/model.safetensors',
-    webgpu_runner: 'model30chan50cls',
-    webgpuTTArunner: true,
+    path: '/models/model24chan50cls/model.json',
+    modelName: '\u{1FA93}\u{1F52A} Desikan-Killiany 50',
+    colormapPath: './models/model24chan50cls/colormap.json',
+    webgpu_safetensor: './models/model24chan50cls/model.safetensors',
+    webgpu_runner: 'meshnet_fast_v4',
+    forceFP32: false,
+    webgpuStorageSize: 805306368,
+    numClasses: 50,
+    turbo: {
+      webgpu_runner: 'meshnet_fast_v4',
+      quantize8Bit: true,
+      forceFP32: false,
+      webgpuStorageSize: 125829120,
+      warning:
+        'Runs via the 8-bit V4 WebGPU engine (~3.0s on M1 WebGPU, auto-scaling from 240 MiB down to 120 MiB max buffer on mobile) or native WebGL2.'
+    },
     preModelId: null,
     preModelPostProcess: false,
     isBatchOverlapEnable: false,
-    numOverlapBatches: 200,
+    numOverlapBatches: 0,
     enableTranspose: true,
     enableCrop: true,
-    cropPadding: 0,
+    cropPadding: 20,
     autoThreshold: 0,
     enableQuantileNorm: true,
     filterOutWithPreMask: false,
-    enableSeqConv: false,
+    enableSeqConv: true,
     textureSize: 0,
     warning:
-      "This model may need dedicated graphics card.  For more info please check with Browser Resources <i class='fa fa-cogs'></i>.",
+      "Runs via the 8-bit V4 WebGPU engine (120–240 MiB max buffer) or native WebGL2.",
     inferenceDelay: 100,
     description:
-      'A 50-class Desikan-Killiany cortical + subcortical parcellation where left/right cortical homologues are merged into bilateral classes.'
+      'Bilateral 50-region Desikan-Killiany cortical + subcortical + corpus callosum parcellation with built-in skull stripping (MindSnap-50 v3.5), running via the 8-bit V4 WebGPU engine (~3.0s on M1, 120 MiB mobile / 240 MiB desktop max buffer) or native WebGL2.'
   },
   {
     id: 6,

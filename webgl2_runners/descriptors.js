@@ -90,6 +90,12 @@ export const DESCRIPTORS = {
     activation: 'gelu_tanh',
     fullVolume: true,
   },
+  // MindSnap-50 (id: 4): 24-channel 50-class bilateral Desikan-Killiany + full-head skull-stripping.
+  model24chan50cls: {
+    dilations: DEEP13,
+    activation: 'gelu_tanh',
+    fullVolume: true,
+  },
   model32chan18cls: {
     dilations: DEEP13,
     activation: 'gelu_tanh',

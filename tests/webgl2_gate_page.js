@@ -24,6 +24,7 @@ const SHIPPED = [
   { name: 'model24chan18cls_gdice_prio', chan: 24, nclass: 18,  nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'model6chan3cls',          chan: 6,  nclass: 3,   nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'model24chan104cls_synth', chan: 24, nclass: 104, nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
+  { name: 'model24chan50cls',        chan: 24, nclass: 50,  nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'model32chan18cls',        chan: 32, nclass: 18,  nconv: 13, norm: 'gn',   affine: true,  convBias: false, act: 'gelu_tanh' },
   { name: 'mindgrab',                chan: 15, nclass: 2,   nconv: 25, norm: 'gn',   affine: false, convBias: false, act: 'gelu_tanh' },
   { name: 'model5_gw_ae',            chan: 5,  nclass: 3,   nconv: 9,  norm: 'none', affine: false, convBias: true,  act: 'relu' },
