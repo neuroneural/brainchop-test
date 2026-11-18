@@ -1949,7 +1949,9 @@ async function main() {
   // slicer3D (index.html marks that button active).
   nv1.secondaryDragMode = DRAG_MODE.slicer3D;
   nv1.showRender = SHOW_RENDER.ALWAYS;
-  nv1.isYoked3DTo2DZoom = true;
+  // Keep 3D and 2D zoom independent: in NiiVue 1.0 rc.204+, isYoked3DTo2DZoom=true
+  // became bidirectional so scrolling over the 3D render zooms all 2D slices too.
+  nv1.isYoked3DTo2DZoom = false;
   nv1.crosshairGap = 11;
   // Reflect the actual initial drag mode in the segmented control, so the
   // highlight always matches nv.opts.dragMode regardless of the HTML default.
