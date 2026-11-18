@@ -202,21 +202,25 @@ export async function runWindowsPacedSuite() {
       device.__adapterInfo = { vendor: '', architecture: '', device: '', description: '' };
       device.__glRenderer = 'Intel(R) HD Graphics 400, or similar';
 
+      const before24Mods = capturedWgsl.length;
       const exec24FfWin = await v4Runner.setupNet(device, w24, null, {
         ...entry24,
         disableSubgroups: true,
         webgpuExecMode: 'paced',
       });
+      const ffWin24NewModules = capturedWgsl.length - before24Mods;
       const ffWinCone = exec24FfWin.__coneInfo?.() || null;
       const [out24FfWin] = await exec24FfWin(input);
       exec24FfWin.dispose();
 
+      const beforeMgMods = capturedWgsl.length;
       const execMgFfWin = await v4Runner.setupNet(device, wMg, null, {
         ...entryMg,
         disableSubgroups: true,
         forceLowMem128: true,
         webgpuExecMode: 'paced',
       });
+      const ffWinMgNewModules = capturedWgsl.length - beforeMgMods;
       const [outMgFfWin] = await execMgFfWin(input);
       execMgFfWin.dispose();
 
@@ -228,6 +232,8 @@ export async function runWindowsPacedSuite() {
       results.windowsFirefox = {
         compiledShadersChecked: capturedWgsl.length,
         uniformMatShaderCount: uniformMatDecls.length,
+        ffWin24NewModules,
+        ffWinMgNewModules,
         ffWin24Mode: ffWinCone?.mode || 'Std',
         diff24FfWinVsSingle128: countDiffs(out24Single128, out24FfWin),
         mgF16VsF32AgreePct: (mgAgree / outMgFfWin.length) * 100,
