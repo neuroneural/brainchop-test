@@ -1,14 +1,17 @@
 /**
- * Clinical-parity NIfTI volume conforming (256³ isotropic 1 mm LIA uint8).
+ * Clinical-robust NIfTI volume conforming (256³ isotropic 1 mm LIA uint8).
  *
- * Matches brainchopC/src/conform.c (niimath's training-intensity conform):
+ * Combines FreeSurfer mri_convert --conform's 0–99.9% upper clip (preserving
+ * bright white matter and natural display without blowing out highlights) with
+ * brainchopC/src/conform.c's robustness fixes:
  *   1. Decode scalar input with scl_slope / scl_inter and replace NaN/Inf with 0.
- *   2. Rescale intensities using f_low = 0.0, f_high = 0.98 (top 2% of non-zero
- *      voxels clipped via a 1000-bin histogram) and floor rare negative ringing
- *      (< 2% negative voxels) to 0.
+ *   2. Floor rare negative ringing (< 2% negative voxels) to 0 so background air
+ *      stays pure black instead of lifting to gray, and clip extreme top 0.1%
+ *      hot-pixel spikes via a 1000-bin histogram (f_low = 0.0, f_high = 0.999).
  *   3. Reslice to 256³ isotropic 1 mm (FreeSurfer LIA by default, or RAS when
  *      toRAS is true), short-circuiting when already on the target grid.
- *   4. Round and clamp to uint8 [0..255] (or preserve float32 when asFloat32 is true).
+ *   4. Round and clamp directly to uint8 [0..255] (saving 64 MiB peak RAM vs
+ *      an intermediate Float32Array(256³)), or preserve float32 when asFloat32 is true.
  *
  * Pure JS (no Worker/DOM dependency) so both Web Workers and Node tests can run it.
  */
@@ -149,15 +152,17 @@ export function computeConformAffine(nx, ny, nz, inAffine, toRAS = false) {
 }
 
 /**
- * In-place training-intensity rescale matching brainchopC/src/conform.c scale_intensity():
+ * In-place intensity rescale:
  *   - Floors src_min to 0 when < 2% of voxels are negative (suppressing Gibbs/air ringing).
- *   - Clips top 2% of non-zero voxels via a 1000-bin histogram (f_low = 0, f_high = 0.98).
+ *   - Clips the upper tail of non-zero voxels via a 1000-bin histogram (default f_high = 0.999,
+ *     matching FreeSurfer mri_convert --conform so clean scans never saturate white matter).
  *   - Linearly rescales and clamps into [0, 255] in Float32.
  *
  * @param {Float32Array} vol - Finite float32 voxel array modified in place.
+ * @param {number} [fHigh=0.999] - Upper non-zero quantile clip in (0, 1].
  * @returns {{ srcMin: number, srcMax: number, scale: number, flooredNegative: boolean }}
  */
-export function scaleIntensityConform(vol) {
+export function scaleIntensityConform(vol, fHigh = 0.999) {
   const n = vol.length;
   if (n === 0) {
     return { srcMin: 0, srcMax: 0, scale: 1, flooredNegative: false };
@@ -201,7 +206,8 @@ export function scaleIntensityConform(vol) {
     hist[bin]++;
   }
 
-  const nth = n - Math.floor(0.02 * nz);
+  const tailFrac = Math.max(0, Math.min(1, 1 - fHigh));
+  const nth = n - Math.floor(tailFrac * nz);
   let cumulative = 0;
   let idx = 0;
   for (; idx < 999; idx++) {
@@ -233,6 +239,7 @@ export function scaleIntensityConform(vol) {
  * @param {boolean} [params.toRAS=false]
  * @param {boolean} [params.isLinear=true]
  * @param {boolean} [params.asFloat32=false]
+ * @param {number} [params.fHigh=0.999]
  */
 export function conformVolumeData({
   img,
@@ -244,6 +251,7 @@ export function conformVolumeData({
   toRAS = false,
   isLinear = true,
   asFloat32 = false,
+  fHigh = 0.999,
 }) {
   const nx = dims[1] | 0;
   const ny = dims[2] | 0;
@@ -305,8 +313,8 @@ export function conformVolumeData({
     throw new Error('Input volume contains no finite voxel values.');
   }
 
-  // Exact brainchopC/src/conform.c intensity scaling before spatial reslice.
-  scaleIntensityConform(vol);
+  // Rescale intensities (negative-ringing floor + upper clip) before spatial reslice.
+  scaleIntensityConform(vol, fHigh);
 
   const outAffine = computeConformAffine(nx, ny, nz, flatAffine, toRAS);
   const inInv = invertAffine4x4(flatAffine);

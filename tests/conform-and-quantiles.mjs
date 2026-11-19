@@ -62,26 +62,47 @@ function makeNifti1Int16Buffer({ nx, ny, nz, pix = [2, 2, 2], slope = 1, inter =
 function runUnitTests() {
   console.log('--- Part 1: Unit tests (conform-volume.js & tensor-utils.js) ---');
 
-  // 1a. Bright top-2% clinical outlier clipping (0-98% non-zero) vs old 99.9% crushing.
+  // 1a. Default 0-99.9% clip: clips extreme hot-pixel spikes (<0.1%) WITHOUT saturating bright WM.
   {
     const n = 100000;
     const vol = new Float32Array(n);
-    // 50% air (0), 49% brain tissue uniformly in [100..500], 1% bright vessel/fat spikes at 10,000.
-    // Non-zero count = 50,000; top 2% of non-zero = 1,000 voxels (= the bright spikes!).
-    for (let i = 50000; i < 99000; i++) {
-      vol[i] = 100 + ((i - 50000) / 49000) * 400;
+    // 50% air (0), 49.97% brain tissue in [100..500], 0.03% hot-pixel spikes at 10,000.
+    // Non-zero = 50,000; top 0.1% of non-zero = 50 voxels (> 30 hot pixels).
+    for (let i = 50000; i < 99970; i++) {
+      vol[i] = 100 + ((i - 50000) / 49970) * 400;
     }
-    for (let i = 99000; i < 100000; i++) {
+    for (let i = 99970; i < 100000; i++) {
       vol[i] = 10000;
     }
     const info = scaleIntensityConform(vol);
     assert.equal(info.flooredNegative, false);
     assert.equal(info.srcMin, 0);
-    // Brain upper range (500) must map near 255 (under old 99.9% clip it was crushed to ~12!).
-    assert.ok(info.srcMax < 600, `Expected 98% clip below 600, got ${info.srcMax}`);
-    assert.ok(vol[98999] >= 220, `Expected bright brain tissue >= 220/255, got ${vol[98999]}`);
+    assert.ok(info.srcMax < 600, `Expected 99.9% clip below 600, got ${info.srcMax}`);
+    assert.ok(vol[99969] >= 220, `Expected bright brain tissue >= 220/255, got ${vol[99969]}`);
     assert.equal(vol[0], 0, 'Air voxel must remain 0');
-    assert.equal(vol[99999], 255, 'Clipped outlier must clamp to 255');
+    assert.equal(vol[99999], 255, 'Clipped hot pixel must clamp to 255');
+
+    // Clean brain without hot pixels must saturate far fewer bright WM voxels under default 0.999 than 0.98
+    const clean = new Float32Array(n);
+    const clean98 = new Float32Array(n);
+    for (let i = 50000; i < n; i++) clean[i] = clean98[i] = 100 + ((i - 50000) / 50000) * 400;
+    scaleIntensityConform(clean);
+    scaleIntensityConform(clean98, 0.98);
+    let satClean = 0;
+    let satClean98 = 0;
+    for (let i = 50000; i < n; i++) {
+      if (clean[i] >= 254.5) satClean++;
+      if (clean98[i] >= 254.5) satClean98++;
+    }
+    assert.ok(satClean / 50000 < 0.007, `Default 0.999 must barely clip clean WM, got ${(100 * satClean / 50000).toFixed(2)}%`);
+    assert.ok(satClean * 3 < satClean98, `Expected 0.999 (${satClean}) to saturate >3x fewer bright voxels than 0.98 (${satClean98})`);
+
+    // Explicit fHigh = 0.98 option (brainchopC/niimath mode) clips top 2% outliers cleanly
+    const vol98 = new Float32Array(n);
+    for (let i = 50000; i < 99000; i++) vol98[i] = 100 + ((i - 50000) / 49000) * 400;
+    for (let i = 99000; i < 100000; i++) vol98[i] = 10000;
+    const info98 = scaleIntensityConform(vol98, 0.98);
+    assert.ok(info98.srcMax < 600, `Expected optional 98% clip below 600, got ${info98.srcMax}`);
   }
 
   // 1b. Rare negative Gibbs ringing (< 2% negative voxels) floored to 0.
@@ -302,8 +323,8 @@ async function runBrowserTests() {
     // 2b. Verify clinicalConform Web Worker transform + exact determinism directly in real browser context.
     // Build a realistic non-conformed 16-bit 96x128x128 synthetic brain phantom with:
     //   - 0.5% negative Gibbs ringing (-800)
-    //   - bright 1.5% scalp/fat outlier spikes (12000)
-    //   - brain ellipsoid in [200..900]
+    //   - 100 extreme hot-pixel spikes (12000, <0.05% of non-zero voxels)
+    //   - brain ellipsoid in [350..850]
     const nx = 96, ny = 128, nz = 128;
     const voxels = new Int16Array(nx * ny * nz);
     for (let i = 0; i < Math.floor(voxels.length * 0.005); i++) voxels[i] = -800;
@@ -319,12 +340,13 @@ async function runBrowserTests() {
           if (r2 < 1.0) {
             voxels[idx] = Math.round(350 + 500 * (1 - r2)); // GM/WM gradient [350..850]
             brainCount++;
-          } else if (r2 < 1.008) {
-            // 3D shell volume is (1.008^(3/2) - 1) ~= 1.2% of non-zero voxels (< 2% clip threshold)
-            voxels[idx] = 12000;
           }
         }
       }
+    }
+    // Add 100 isolated hot-pixel spikes (~0.04% of brain voxels, clipped by 99.9%)
+    for (let k = 0; k < 100; k++) {
+      voxels[(10 + k) + 10 * nx + 10 * nx * ny] = 12000;
     }
     const niiBuf = makeNifti1Int16Buffer({ nx, ny, nz, pix: [2, 2, 2], voxels });
     const niiBytes = Array.from(new Uint8Array(niiBuf));

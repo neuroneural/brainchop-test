@@ -1921,7 +1921,7 @@ async function main() {
   // patch-niivue-render.mjs instead: a flat gain on the composited render
   // preserves hue AND saturation exactly and cannot reach 2D. Leave neutral.
   nv1.gamma = 1;
-  nv1.registerVolumeTransform(clinicalConform); // clinical 0-98% conform matching brainchopC/src/conform.c
+  nv1.registerVolumeTransform(clinicalConform); // robust conform worker (0-99.9% clip, <2% neg floor, NaN-safe)
   nv1.isLegendVisible = false; // 1.0 defaults it on; it costs ~25% of the canvas width
   nv1.addEventListener("locationChange", (e) => handleLocationChange(e.detail));
   // Alt/Option-click a region to isolate it (see handleIsolateClick).

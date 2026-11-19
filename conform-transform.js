@@ -80,11 +80,11 @@ function buildConformedHeader(hdr, res) {
 }
 
 /**
- * NiiVue VolumeTransform matching brainchopC/src/conform.c (0-98% clip + <2% negative floor).
+ * NiiVue VolumeTransform for robust 256³ conforming (0–99.9% clip + <2% negative floor).
  */
 export const clinicalConform = {
   name: 'conform',
-  description: 'Reslice to 256×256×256 isotropic 1 mm volume with clinical 0–98% intensity scaling',
+  description: 'Reslice to 256×256×256 isotropic 1 mm volume with negative-ringing floor and 0–99.9% intensity scaling',
   options: [
     { name: 'toRAS', type: 'checkbox', label: 'Output RAS orientation', default: false },
     { name: 'isLinear', type: 'checkbox', label: 'Linear interpolation', default: true },
@@ -101,6 +101,7 @@ export const clinicalConform = {
       toRAS: options.toRAS ?? false,
       isLinear: options.isLinear ?? true,
       asFloat32: options.asFloat32 ?? false,
+      fHigh: options.fHigh ?? 0.999,
     };
     const res = await runConformInWorker(payload);
     return {
