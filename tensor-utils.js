@@ -9,8 +9,14 @@ const FORCE_SEGMENTATION_NOISE = false;
 const sharedGuardScratch = { il: null, runs: null, runLen: 0, dirty: false };
 
 /**
- * Sample up to 100,000 voxels (preserving Math.random() order for seeded tests)
- * and return { qmin, qmax } matching the original TF.js quantile bounds.
+ * Compute deterministic volume quantiles { qmin, qmax }.
+ *
+ * For Uint8 volumes (all conformed 256³ inputs), runs an exact single-pass
+ * 256-bin histogram over every voxel (zero sampling jitter, exact rank parity
+ * with brainchopC's mn_quantile).
+ * For non-Uint8 volumes larger than 100,000 voxels, uses a deterministic
+ * golden-ratio low-discrepancy sequence (no Math.random()) to avoid both
+ * run-to-run jitter and 3D grid stride aliasing.
  *
  * @param {ArrayLike<number>} data
  * @param {number} [lowerQuantile=0.05]
@@ -19,25 +25,21 @@ const sharedGuardScratch = { il: null, runs: null, runLen: 0, dirty: false };
  */
 export function computeQuantiles(data, lowerQuantile = 0.05, upperQuantile = 0.95) {
   const totalSize = data.length;
-  const sampleSize = Math.min(100000, totalSize);
-  const lowIndex = Math.floor(sampleSize * lowerQuantile);
-  const highIndex = Math.ceil(sampleSize * upperQuantile) - 1;
+  if (totalSize === 0) return { qmin: 0, qmax: 0 };
 
-  // Fast 256-bin histogram path for Uint8 volumes: skips Float64Array(100k) alloc + JS sort.
+  // Fast exact 256-bin histogram over all voxels for Uint8 volumes (~4-6 ms for 256³).
   if (data instanceof Uint8Array || data instanceof Uint8ClampedArray) {
-    if (sampleSize === 0) return { qmin: 0, qmax: 0 };
+    const lowIndex = Math.max(0, Math.min(totalSize - 1, Math.floor(totalSize * lowerQuantile)));
+    const highIndex = Math.max(0, Math.min(totalSize - 1, Math.ceil(totalSize * upperQuantile) - 1));
     const hist = new Uint32Array(256);
-    if (sampleSize >= totalSize) {
-      for (let i = 0; i < totalSize; i++) hist[data[i]]++;
-    } else {
-      for (let i = 0; i < sampleSize; i++) {
-        hist[data[Math.floor(Math.random() * totalSize)]]++;
-      }
+    for (let i = 0; i < totalSize; i++) {
+      hist[data[i]]++;
     }
     let cum = 0;
     let qmin = 0;
     let qmax = 0;
     let foundLow = false;
+    let foundHigh = false;
     for (let b = 0; b < 256; b++) {
       const c = hist[b];
       if (c === 0) continue;
@@ -46,22 +48,31 @@ export function computeQuantiles(data, lowerQuantile = 0.05, upperQuantile = 0.9
         qmin = b;
         foundLow = true;
       }
-      if (cum > highIndex) {
+      if (!foundHigh && cum > highIndex) {
         qmax = b;
-        break;
+        foundHigh = true;
       }
+      if (foundLow && foundHigh) break;
     }
     return { qmin, qmax };
   }
 
+  const sampleSize = Math.min(100000, totalSize);
+  const lowIndex = Math.max(0, Math.min(sampleSize - 1, Math.floor(sampleSize * lowerQuantile)));
+  const highIndex = Math.max(0, Math.min(sampleSize - 1, Math.ceil(sampleSize * upperQuantile) - 1));
   const sample = new Float64Array(sampleSize);
 
   if (sampleSize >= totalSize) {
     sample.set(data);
   } else {
+    // Deterministic Weyl / golden-ratio sequence covers [0, totalSize) uniformly
+    // with zero aliasing against power-of-2 or arbitrary 3D grid strides.
+    const PHI_INV = 0.6180339887498949;
+    let frac = 0.5;
     for (let i = 0; i < sampleSize; i++) {
-      const randomIndex = Math.floor(Math.random() * totalSize);
-      sample[i] = data[randomIndex];
+      frac += PHI_INV;
+      if (frac >= 1) frac -= 1;
+      sample[i] = data[Math.floor(frac * totalSize)];
     }
   }
 
@@ -133,7 +144,8 @@ export function linearScaleVolume(data, offset, range) {
  */
 export function quantileNormalizeVolumeData(data, lowerQuantile = 0.05, upperQuantile = 0.95) {
   const { qmin, qmax } = computeQuantiles(data, lowerQuantile, upperQuantile);
-  return linearScaleVolume(data, qmin, qmax - qmin);
+  const range = qmax - qmin;
+  return linearScaleVolume(data, qmin, range === 0 ? 1 : range);
 }
 
 /**
@@ -144,7 +156,8 @@ export function quantileNormalizeVolumeData(data, lowerQuantile = 0.05, upperQua
  */
 export function minMaxNormalizeVolumeData(data) {
   const { min, max } = computeMinMax(data);
-  return linearScaleVolume(data, min, max - min);
+  const range = max - min;
+  return linearScaleVolume(data, min, range === 0 ? 1 : range);
 }
 
 function transpose3DCore(data, shape, perm, OutCtor) {

@@ -1,5 +1,5 @@
 import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
-import { conform } from "@niivue/nv-ext-image-processing";
+import { clinicalConform } from "./conform-transform.js";
 import { mat4 } from "gl-matrix";
 import { shiny } from "@niivue/niivue/assets/matcaps";
 import { runInferenceWebGpu, warmupWebGpuRunners, yieldForPaint } from "./inference-webgpu.js";
@@ -649,9 +649,21 @@ async function main() {
 
   async function ensureConformed() {
     const nii = nv1.volumes[0];
+    const pixDims = nii.hdr?.pixDims;
+    const is1mm = !pixDims || (
+      Math.abs(Math.abs(pixDims[1]) - 1) < 1e-3 &&
+      Math.abs(Math.abs(pixDims[2]) - 1) < 1e-3 &&
+      Math.abs(Math.abs(pixDims[3]) - 1) < 1e-3
+    );
+    const slope = nii.hdr?.scl_slope;
+    const inter = nii.hdr?.scl_inter;
+    const isUnscaled =
+      (slope === undefined || slope === 0 || Math.abs(slope - 1) < 1e-6) &&
+      (inter === undefined || Math.abs(inter) < 1e-6);
     let isConformed =
       nii.dims[1] === 256 && nii.dims[2] === 256 && nii.dims[3] === 256
-      && nii.img instanceof Uint8Array && nii.img.length === 256 * 256 * 256;
+      && nii.img instanceof Uint8Array && nii.img.length === 256 * 256 * 256
+      && is1mm && isUnscaled;
     if (
       nii.permRAS[0] !== -1 ||
       nii.permRAS[1] !== 3 ||
@@ -1909,7 +1921,7 @@ async function main() {
   // patch-niivue-render.mjs instead: a flat gain on the composited render
   // preserves hue AND saturation exactly and cannot reach 2D. Leave neutral.
   nv1.gamma = 1;
-  nv1.registerVolumeTransform(conform); // core dropped nv.conform() in 1.0
+  nv1.registerVolumeTransform(clinicalConform); // clinical 0-98% conform matching brainchopC/src/conform.c
   nv1.isLegendVisible = false; // 1.0 defaults it on; it costs ~25% of the canvas width
   nv1.addEventListener("locationChange", (e) => handleLocationChange(e.detail));
   // Alt/Option-click a region to isolate it (see handleIsolateClick).
