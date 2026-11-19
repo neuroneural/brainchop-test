@@ -359,7 +359,7 @@ export function runMeshNetGL(o) {
   let canvas = null, gl = o.gl || null;
   // Declared up front and null until created, so one cleanup path can free
   // everything regardless of where a failure lands.
-  const owned = { textures: [], fbos: [], programs: [] };
+  const owned = { textures: [], fbos: [], programs: [], vao: null };
   const T = (t) => { owned.textures.push(t); return t; };
   const F = (f) => { owned.fbos.push(f); return f; };
   const G = (p) => { owned.programs.push(p); return p; };
@@ -395,7 +395,8 @@ export function runMeshNetGL(o) {
     gl.disable(gl.SCISSOR_TEST);
     // No VAO contents needed: the vertex shader synthesises its triangle from
     // gl_VertexID. A VAO must still be bound in a core profile.
-    gl.bindVertexArray(gl.createVertexArray());
+    const vao = o.vao || (owned.vao = gl.createVertexArray());
+    gl.bindVertexArray(vao);
 
     // ---- textures -------------------------------------------------------
     const src = T(tex3d(gl, nx, ny, nz, gl.R16F));
@@ -481,86 +482,115 @@ export function runMeshNetGL(o) {
     checkGl(gl, 'framebuffer creation');
 
     // ---- programs -------------------------------------------------------
-    const S = buildSources(d, maxDraw);
-    const progs = {};
-    const mk = (key, srcKey, name) => {
-      if (!S[srcKey]) return;
-      progs[key] = G(link(gl, S.vertex, S[srcKey], name));
-    };
-    mk('convFirst', 'convFirst', 'conv_first');
-    mk('convHidden', 'convHidden', 'conv_hidden');
-    if (useVox2) mk('convHidden2', 'convHiddenVox2', 'conv_hidden_vox2');
-    if (d.norm === 'gn') {
-      mk('momentsA', 'momentsA', 'moments_a');
-      mk('momentsB', 'momentsB', 'moments_b');
-      mk('momentsF', 'momentsFinish', 'moments_finish');
-      mk('norm', 'norm', 'norm');
-    }
-    if (d.nclass > 0) mk('classify', 'classify', 'classify');
-    if (o.probability) {
-      if (!S.tissueProbability) throw new Error(`grouped probabilities are unavailable for ${d.nclass} classes`);
-      mk('tissueProbability', 'tissueProbability', 'tissue_probability');
-    }
-    checkGl(gl, 'program link');
-
     const U = (p, n) => gl.getUniformLocation(p, n);
-    const planeNames = Array.from({ length: P }, (_, i) => `s${i}`);
-    gl.useProgram(progs.convFirst);
-    gl.uniform1i(U(progs.convFirst, 'src'), 0);
-    gl.uniform1i(U(progs.convFirst, 'wts'), 1);
-    for (const p of [progs.convHidden, progs.convHidden2].filter(Boolean)) {
-      gl.useProgram(p);
-      planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
-      gl.uniform1i(U(p, 'wts'), P);
-      if (q8) gl.uniform1i(U(p, 'pQScale'), P + 1);
-    }
-    if (progs.norm) {
-      gl.useProgram(progs.norm);
-      planeNames.forEach((n, i) => gl.uniform1i(U(progs.norm, n), i));
-      gl.uniform1i(U(progs.norm, 'pMean'), P);
-      gl.uniform1i(U(progs.norm, 'pInv'), P + 1);
-      gl.uniform1i(U(progs.norm, 'wts'), P + 2);
-      if (q8) gl.uniform1i(U(progs.norm, 'pQScale'), P + 3);
-    }
-    if (progs.momentsA) { gl.useProgram(progs.momentsA); gl.uniform1i(U(progs.momentsA, 'src'), 0); }
-    if (progs.momentsB) {
-      gl.useProgram(progs.momentsB);
-      gl.uniform1i(U(progs.momentsB, 'pSum'), 0);
-      gl.uniform1i(U(progs.momentsB, 'pSq'), 1);
-      if (q8) {
-        gl.uniform1i(U(progs.momentsB, 'pMin'), 2);
-        gl.uniform1i(U(progs.momentsB, 'pMax'), 3);
+    const progCacheKey = o.programCache
+      ? `${d.chan}:${P}:${d.nclass}:${d.norm}:${+d.affine}:${d.activation}:${+q8}:${+useVox2}:${+!!o.probability}:${maxDraw}:${nx}x${ny}x${nz}`
+      : null;
+    let progs = progCacheKey ? o.programCache.get(progCacheKey) : null;
+    const shaderCacheHit = Boolean(progs);
+
+    if (!progs) {
+      const S = buildSources(d, maxDraw);
+      const built = {};
+      const builtList = [];
+      const mk = (key, srcKey, name) => {
+        if (!S[srcKey]) return;
+        const prog = link(gl, S.vertex, S[srcKey], name);
+        built[key] = prog;
+        builtList.push(prog);
+      };
+      try {
+        mk('convFirst', 'convFirst', 'conv_first');
+        mk('convHidden', 'convHidden', 'conv_hidden');
+        if (useVox2) mk('convHidden2', 'convHiddenVox2', 'conv_hidden_vox2');
+        if (d.norm === 'gn') {
+          mk('momentsA', 'momentsA', 'moments_a');
+          mk('momentsB', 'momentsB', 'moments_b');
+          mk('momentsF', 'momentsFinish', 'moments_finish');
+          mk('norm', 'norm', 'norm');
+        }
+        if (d.nclass > 0) mk('classify', 'classify', 'classify');
+        if (o.probability) {
+          if (!S.tissueProbability) throw new Error(`grouped probabilities are unavailable for ${d.nclass} classes`);
+          mk('tissueProbability', 'tissueProbability', 'tissue_probability');
+        }
+        checkGl(gl, 'program link');
+
+        const planeNames = Array.from({ length: P }, (_, i) => `s${i}`);
+        gl.useProgram(built.convFirst);
+        gl.uniform1i(U(built.convFirst, 'src'), 0);
+        gl.uniform1i(U(built.convFirst, 'wts'), 1);
+        for (const p of [built.convHidden, built.convHidden2].filter(Boolean)) {
+          gl.useProgram(p);
+          planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
+          gl.uniform1i(U(p, 'wts'), P);
+          if (q8) gl.uniform1i(U(p, 'pQScale'), P + 1);
+        }
+        if (built.norm) {
+          gl.useProgram(built.norm);
+          planeNames.forEach((n, i) => gl.uniform1i(U(built.norm, n), i));
+          gl.uniform1i(U(built.norm, 'pMean'), P);
+          gl.uniform1i(U(built.norm, 'pInv'), P + 1);
+          gl.uniform1i(U(built.norm, 'wts'), P + 2);
+          if (q8) gl.uniform1i(U(built.norm, 'pQScale'), P + 3);
+        }
+        if (built.momentsA) { gl.useProgram(built.momentsA); gl.uniform1i(U(built.momentsA, 'src'), 0); }
+        if (built.momentsB) {
+          gl.useProgram(built.momentsB);
+          gl.uniform1i(U(built.momentsB, 'pSum'), 0);
+          gl.uniform1i(U(built.momentsB, 'pSq'), 1);
+          if (q8) {
+            gl.uniform1i(U(built.momentsB, 'pMin'), 2);
+            gl.uniform1i(U(built.momentsB, 'pMax'), 3);
+          }
+        }
+        if (built.momentsF) {
+          gl.useProgram(built.momentsF);
+          gl.uniform1i(U(built.momentsF, 'pSum'), 0);
+          gl.uniform1i(U(built.momentsF, 'pSq'), 1);
+          if (q8) {
+            gl.uniform1i(U(built.momentsF, 'pMin'), 2);
+            gl.uniform1i(U(built.momentsF, 'pMax'), 3);
+            gl.uniform1i(U(built.momentsF, 'wts'), 4);
+          }
+        }
+        if (built.classify) {
+          gl.useProgram(built.classify);
+          planeNames.forEach((n, i) => gl.uniform1i(U(built.classify, n), i));
+          gl.uniform1i(U(built.classify, 'wts'), P);
+          if (q8) gl.uniform1i(U(built.classify, 'pQScale'), P + 1);
+        }
+        if (built.tissueProbability) {
+          const p = built.tissueProbability;
+          gl.useProgram(p);
+          planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
+          gl.uniform1i(U(p, 'wts'), P);
+          if (q8) gl.uniform1i(U(p, 'pQScale'), P + 1);
+        }
+        checkGl(gl, 'uniform setup');
+      } catch (err) {
+        for (const p of builtList) gl.deleteProgram(p);
+        throw err;
+      }
+      progs = built;
+      if (progCacheKey) {
+        o.programCache.set(progCacheKey, built);
+      } else {
+        for (const p of builtList) G(p);
       }
     }
-    if (progs.momentsF) {
-      gl.useProgram(progs.momentsF);
-      gl.uniform1i(U(progs.momentsF, 'pSum'), 0);
-      gl.uniform1i(U(progs.momentsF, 'pSq'), 1);
-      if (q8) {
-        gl.uniform1i(U(progs.momentsF, 'pMin'), 2);
-        gl.uniform1i(U(progs.momentsF, 'pMax'), 3);
-        gl.uniform1i(U(progs.momentsF, 'wts'), 4);
-      }
-    }
-    if (progs.classify) {
-      gl.useProgram(progs.classify);
-      planeNames.forEach((n, i) => gl.uniform1i(U(progs.classify, n), i));
-      gl.uniform1i(U(progs.classify, 'wts'), P);
-      if (q8) gl.uniform1i(U(progs.classify, 'pQScale'), P + 1);
-    }
-    if (progs.tissueProbability) {
+
+    // Dynamic per-run grouped-softmax uniforms (must apply even on shader cache hits).
+    if (progs.tissueProbability && o.probability) {
       const p = progs.tissueProbability;
       gl.useProgram(p);
-      planeNames.forEach((n, i) => gl.uniform1i(U(p, n), i));
-      gl.uniform1i(U(p, 'wts'), P);
-      if (q8) gl.uniform1i(U(p, 'pQScale'), P + 1);
       gl.uniform1f(U(p, 'uTemperature'), o.probability.temperature);
       gl.uniform1f(U(p, 'uSupportTemperature'), o.probability.supportTemperature);
       gl.uniform1ui(U(p, 'uGrayMask'), o.probability.grayMask >>> 0);
       gl.uniform1ui(U(p, 'uWhiteMask'), o.probability.whiteMask >>> 0);
       gl.uniform1ui(U(p, 'uCsfMask'), o.probability.csfMask >>> 0);
+      checkGl(gl, 'probability uniforms');
     }
-    checkGl(gl, 'uniform setup');
 
     const bind3d = (unit, t) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, t); };
     const bind2d = (unit, t) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); };
@@ -802,6 +832,7 @@ export function runMeshNetGL(o) {
       tissues,
       support,
       ms,
+      shaderCacheHit,
       path: `webgl2-native P=${P}${useVox2 ? ' vox2' : ''}${o.probability ? ' tissue-probability' : ''} ${nx}x${ny}x${nz}`,
     };
   } finally {
@@ -812,6 +843,8 @@ export function runMeshNetGL(o) {
       for (const f of owned.fbos) gl.deleteFramebuffer(f);
       for (const t of owned.textures) gl.deleteTexture(t);
       for (const p of owned.programs) gl.deleteProgram(p);
+      if (owned.vao) gl.deleteVertexArray(owned.vao);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       if (canvas) {
         // Firefox logs this as "WebGL context was lost." at whatever line calls
         // loseContext, which reads alarmingly like a crash in a console dump. It

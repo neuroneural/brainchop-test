@@ -59,6 +59,90 @@ function callbackComplete(message, statData, timings) {
   self.postMessage({ cmd: 'complete', message, statData: { ...statData }, timings });
 }
 
+// Persistent worker-scoped GL context, compiled GLSL shader cache, probe cache,
+// and single-entry packed-weights cache (~1-2 MB). Activation 3D textures
+// (1.0-1.5 GiB) are still unconditionally freed inside runMeshNetGL()'s finally
+// block on every run, so peak VRAM is unchanged and idle VRAM stays ~0 MiB.
+let sharedCanvas = null;
+let sharedGl = null;
+let sharedVao = null;
+let sharedProgramCache = new Map();
+let probeCache = new Map();
+let cachedWeights = null; // { key, desc, d, packed }
+
+function resetSharedGl() {
+  if (sharedGl) {
+    const lost = sharedGl.isContextLost();
+    if (!lost) {
+      for (const progSet of sharedProgramCache.values()) {
+        for (const p of Object.values(progSet)) {
+          if (p) sharedGl.deleteProgram(p);
+        }
+      }
+      if (sharedVao) sharedGl.deleteVertexArray(sharedVao);
+      sharedGl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+  }
+  sharedCanvas = null;
+  sharedGl = null;
+  sharedVao = null;
+  sharedProgramCache = new Map();
+  probeCache = new Map();
+}
+
+function ensureSharedGl() {
+  if (sharedGl && !sharedGl.isContextLost()) {
+    return sharedGl;
+  }
+  if (sharedGl) resetSharedGl();
+  if (typeof OffscreenCanvas === 'undefined') return null;
+  const canvas = new OffscreenCanvas(1, 1);
+  const gl = canvas.getContext('webgl2', {
+    antialias: false,
+    depth: false,
+    stencil: false,
+    preserveDrawingBuffer: false,
+    powerPreference: 'high-performance',
+  });
+  if (!gl) return null;
+  canvas.addEventListener?.('webglcontextlost', (ev) => {
+    ev.preventDefault?.();
+    console.warn('[webgl2] shared worker context lost; will recreate on next run');
+  });
+  sharedCanvas = canvas;
+  sharedGl = gl;
+  sharedVao = gl.createVertexArray();
+  return gl;
+}
+
+async function loadModelWeightsCached(stUrl, entry, dim, modelEntry) {
+  const biasKey = Array.isArray(modelEntry.classifierBias)
+    ? modelEntry.classifierBias.join(',')
+    : '';
+  const wantQ8 = !!modelEntry.quantize8Bit;
+  const cacheKey = `${stUrl}|${entry.activation}|${dim}|${biasKey}|q8=${+wantQ8}`;
+  if (cachedWeights && cachedWeights.key === cacheKey) {
+    return { desc: cachedWeights.desc, d: cachedWeights.d, packed: cachedWeights.packed, weightCacheHit: true };
+  }
+  const stRes = await fetch(stUrl);
+  if (!stRes.ok) {
+    throw new Error(`could not fetch ${stUrl}: ${stRes.status}`);
+  }
+  const raw = await stRes.arrayBuffer();
+  const tensors = parseSafetensors(raw);
+  const desc = applyClassifierBias(describeSafetensors(tensors), modelEntry.classifierBias);
+  const d = deriveDescriptor(desc, {
+    nx: dim, ny: dim, nz: dim,
+    activation: entry.activation,
+    dilations: entry.dilations,
+    quantize8Bit: wantQ8,
+  });
+  const packed = packWeights(desc, d);
+  // Single-entry cache: switching models immediately releases the previous ~1-2 MB weights.
+  cachedWeights = { key: cacheKey, desc, d, packed };
+  return { desc, d, packed, weightCacheHit: false };
+}
+
 /** A refusal, not a crash: main.js reads this and surfaces failure if no backend succeeded. */
 function refuse(reason) {
   self.postMessage({ cmd: 'unsupported', reason });
@@ -83,41 +167,64 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   const dim = 256;                      // main.js conforms before dispatching
   const dims = [dim, dim, dim];
 
-  // ---- weights & GL setup ----------------------------------------------
+  // ---- weights & shared GL setup ---------------------------------------
   const setupStart = performance.now();
   callbackUI('Loading model\u2026', 0.05);
   const stUrl = `${opts.rootURL}${modelEntry.webgpu_safetensor.replace(/^\.\//, '/')}`;
-  const stRes = await fetch(stUrl);
-  if (!stRes.ok) { refuse(`could not fetch ${stUrl}: ${stRes.status}`); return; }
-  const raw = await stRes.arrayBuffer();
-  const tensors = parseSafetensors(raw);
-  const desc = applyClassifierBias(describeSafetensors(tensors), modelEntry.classifierBias);
-  let d = deriveDescriptor(desc, {
-    nx: dim, ny: dim, nz: dim,
-    activation: entry.activation,
-    dilations: entry.dilations,
-    quantize8Bit: !!modelEntry.quantize8Bit,
-  });
+  let desc, d, packed, weightCacheHit;
+  try {
+    ({ desc, d, packed, weightCacheHit } = await loadModelWeightsCached(stUrl, entry, dim, modelEntry));
+  } catch (err) {
+    refuse(err?.message || String(err));
+    return;
+  }
 
-  // ---- probe before doing any real work --------------------------------
+  const gl = ensureSharedGl();
+  if (!gl) {
+    refuse('no webgl2 context could be created in worker');
+    return;
+  }
+
+  // ---- probe (cached per model/quantization on the shared GL context) --
   const canAutoQ8 = !d.quantize8Bit && !!modelEntry.autoQuantize8BitFallback && desc.norm === 'gn';
-  let probe = probeWebgl2(d, dims, null, { deferRgba16fOnLazyD3D11: canAutoQ8 });
-  if (!probe.supported && canAutoQ8) {
-    console.warn(`[webgl2-native] RGBA16F probe declined (${probe.reasons.join('; ')}); falling back to RGBA8 quantized activations.`);
-    d = deriveDescriptor(desc, {
-      nx: dim, ny: dim, nz: dim,
-      activation: entry.activation,
-      dilations: entry.dilations,
-      quantize8Bit: true,
-    });
-    probe = probeWebgl2(d, dims);
+  const probeKey = `${entry.name}:${dim}:${+!!d.quantize8Bit}:${+!!canAutoQ8}`;
+  let probe = probeCache.get(probeKey);
+  if (probe) {
+    if (probe.useQuantize8Bit && !d.quantize8Bit) {
+      d = deriveDescriptor(desc, {
+        nx: dim, ny: dim, nz: dim,
+        activation: entry.activation,
+        dilations: entry.dilations,
+        quantize8Bit: true,
+      });
+      packed = packWeights(desc, d);
+    }
+  } else {
+    probe = probeWebgl2(d, dims, gl, { deferRgba16fOnLazyD3D11: canAutoQ8 });
+    let useQuantize8Bit = !!d.quantize8Bit;
+    if (!probe.supported && canAutoQ8) {
+      console.warn(`[webgl2-native] RGBA16F probe declined (${probe.reasons.join('; ')}); falling back to RGBA8 quantized activations.`);
+      useQuantize8Bit = true;
+      d = deriveDescriptor(desc, {
+        nx: dim, ny: dim, nz: dim,
+        activation: entry.activation,
+        dilations: entry.dilations,
+        quantize8Bit: true,
+      });
+      packed = packWeights(desc, d);
+      probe = probeWebgl2(d, dims, gl);
+    }
+    if (probe.supported) {
+      probe = { ...probe, useQuantize8Bit };
+      probeCache.set(probeKey, probe);
+    }
   }
   console.log(`[webgl2-native] ${entry.name}: ${d.chan}ch P=${d.planes} ${d.nclass}cls ` +
     `norm=${d.norm} affine=${d.affine} act=${d.activation} q8=${!!d.quantize8Bit} | ` +
-    `${Math.round(probe.activationBytes / 1048576)} MB activations | ${probe.renderer}`);
+    `${Math.round(probe.activationBytes / 1048576)} MB activations | ${probe.renderer} ` +
+    `(weights=${weightCacheHit ? 'hit' : 'miss'})`);
   if (!probe.supported) { refuse(probe.reasons.join('; ')); return; }
 
-  let packed = packWeights(desc, d);
   const Setup_t = ((performance.now() - setupStart) / 1000).toFixed(4);
 
   // ---- preprocessing, identical to inference-webgpu.js ------------------
@@ -157,6 +264,9 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
       packed: packed.data,
       offsets: packed.offsets,
       input,
+      gl,
+      vao: sharedVao,
+      programCache: sharedProgramCache,
       probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
       vox2: probe.vox2,
       onProgress: (frac) => callbackUI('', 0.2 + 0.7 * frac),
@@ -166,8 +276,13 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
       throw new Error('native WebGL2 produced an all-zero volume');
     }
   } catch (err) {
+    if (gl.isContextLost()) {
+      resetSharedGl();
+    }
     if (!d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
       console.warn('[webgl2-native] RGBA16F execution failed; retrying once with RGBA8 quantized activations.', err);
+      const retryGl = ensureSharedGl();
+      if (!retryGl) throw err;
       d = deriveDescriptor(desc, {
         nx: dim, ny: dim, nz: dim,
         activation: entry.activation,
@@ -180,17 +295,24 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
         packed: packed.data,
         offsets: packed.offsets,
         input,
+        gl: retryGl,
+        vao: sharedVao,
+        programCache: sharedProgramCache,
         probability: catLite ? tissueProbabilityConfig(modelEntry, d.nclass) : null,
         vox2: probe.vox2,
         onProgress: (frac) => callbackUI('', 0.2 + 0.7 * frac),
         onLog: (msg) => console.log(msg),
       });
+      probeCache.set(probeKey, { ...probe, useQuantize8Bit: true });
     } else {
       throw err;
     }
   }
   const Inference_t = ((performance.now() - t0) / 1000).toFixed(4);
-  console.log(`[webgl2-native] ---- Inference Time: ${Inference_t} s ---- (${out.path})`);
+  statData.WebGL2_Cache = out.shaderCacheHit ? 'hit' : 'miss';
+  console.log(
+    `[webgl2-native] ---- Inference Time: ${Inference_t} s ---- (${out.path}, shaders=${statData.WebGL2_Cache})`
+  );
   input = null;
 
   // ---- postprocessing, identical to inference-webgpu.js ----------------
@@ -263,6 +385,7 @@ self.addEventListener('message', async (e) => {
     await run(opts, modelEntry, niftiHeader, niftiImage);
   } catch (err) {
     console.error('[webgl2-native] failed', err);
+    if (sharedGl?.isContextLost()) resetSharedGl();
     // Any throw is a refusal from main.js's point of view: it should try the
     // tfjs worker rather than show the user an error, because the tfjs path can
     // still run every one of these models.

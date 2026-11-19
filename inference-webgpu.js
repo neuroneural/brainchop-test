@@ -47,16 +47,17 @@ function isFastV4RunnerName(runnerName) {
     return FAST_V4_RUNNERS.has(runnerName);
 }
 
-// Keep the runner catalog for capability checks, but import only the selected
-// model. Static V4 aliases resolve directly to fastV4Runner so Vite avoids mixed
-// static/dynamic chunk warnings.
+// Keep only the active FP16/FP32 fallback runners referenced by
+// brainchop-parameters.js in the production bundle; static V4 aliases resolve
+// directly to fastV4Runner so Vite avoids emitting unused test-only runners.
 const runnerModules = import.meta.glob([
-    './webgpu_runners/*_runner.js',
-    '!./webgpu_runners/meshnet_fast_v4_runner.js',
-    '!./webgpu_runners/dkatlas24_int8_runner.js',
-    '!./webgpu_runners/mindmap24_int8_runner.js',
-    '!./webgpu_runners/model16chan18cls_int8_runner.js',
-    '!./webgpu_runners/mindgrab_int8_runner.js',
+    './webgpu_runners/mindgrab_runner.js',
+    './webgpu_runners/model16chan18cls_runner.js',
+    './webgpu_runners/model16chan18cls_f32_runner.js',
+    './webgpu_runners/model24chan18cls_gdice_prio_runner.js',
+    './webgpu_runners/model24chan18cls_gdice_prio_probability_runner.js',
+    './webgpu_runners/dkatlas24_synth_runner.js',
+    './webgpu_runners/dkatlas24_synth_f32_runner.js',
 ]);
 
 // Helper to get available runners for debugging

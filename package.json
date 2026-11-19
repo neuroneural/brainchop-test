@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "@niivue/niivue": "1.0.0-rc.204",
-    "@niivue/nv-ext-image-processing": "1.0.0-rc.206",
     "gl-matrix": "^3.4.3"
   },
   "devDependencies": {
