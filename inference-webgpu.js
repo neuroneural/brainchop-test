@@ -800,10 +800,12 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             ? `Tissue maps finished (${elapsedText})`
             : `Segmentation finished (${elapsedText})`;
         const isolateHint = !isProbabilityOutput && (modelEntry.numClasses ?? 0) > 2
-            ? ' \u00b7 Option/Alt-click a region to isolate'
+            ? (opts?.isTouchPrimary
+                ? ' \u00b7 Open Stats to isolate a region'
+                : ' \u00b7 Option/Alt-click a region to isolate')
             : '';
         callbackUI(
-            `${modelEntry.modelName} \u00b7 ${finishLabel}${isolateHint}`,
+            `${finishLabel}${isolateHint}`,
             1,
             '',
             statData

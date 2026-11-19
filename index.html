@@ -39,36 +39,37 @@
       </div>
     </div>
 
-    <span class="tb-divider"></span>
+    <span class="tb-divider" role="separator" aria-orientation="vertical"></span>
 
     <!-- The star of the show: model selector, right after the sliders -->
-    <select id="modelSelect" class="model-select" title="Choose a segmentation model to run">
+    <select id="modelSelect" class="model-select" aria-label="Segmentation model"
+      title="Choose a segmentation model to run">
       <option value="-1" disabled selected>Loading models...</option>
     </select>
 
-    <span class="tb-divider"></span>
+    <span class="tb-divider" role="separator" aria-orientation="vertical"></span>
 
-    <!-- Interaction mode: compact icon toggle (values are DRAG_MODE, set as primaryDragMode) -->
+    <!-- Interaction mode: compact icon toggle (values are DRAG_MODE, set as secondaryDragMode) -->
     <div class="segmented segmented-icons" id="dragSegmented" role="group" aria-label="Mouse drag mode">
-      <button type="button" data-drag="3" title="Pan / zoom" aria-label="Pan / zoom">
+      <button type="button" data-drag="3" aria-pressed="false" title="Pan / zoom" aria-label="Pan / zoom">
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <path d="M12 2v20M2 12h20" />
           <path d="M9 5l3-3 3 3M9 19l3 3 3-3M5 9l-3 3 3 3M19 9l3 3-3 3" />
         </svg>
       </button>
-      <button type="button" data-drag="1" title="Brightness / contrast" aria-label="Brightness / contrast">
+      <button type="button" data-drag="1" aria-pressed="false" title="Brightness / contrast" aria-label="Brightness / contrast">
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <circle cx="12" cy="12" r="9" />
           <path d="M12 3v18a9 9 0 0 0 0-18z" fill="currentColor" stroke="none" />
         </svg>
       </button>
-      <button type="button" data-drag="2" title="Measure a distance" aria-label="Measure a distance">
+      <button type="button" data-drag="2" aria-pressed="false" title="Measure a distance" aria-label="Measure a distance">
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <rect x="2.5" y="8.5" width="19" height="7" rx="1" />
           <path d="M7 8.5v3M11 8.5v4M15 8.5v3M19 8.5v3" />
         </svg>
       </button>
-      <button type="button" data-drag="4" class="active" title="Drag to reslice in 3D" aria-label="Reslice in 3D">
+      <button type="button" data-drag="4" class="active" aria-pressed="true" title="Drag to reslice in 3D" aria-label="Reslice in 3D">
         <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
           <path d="M12 2.5l8.5 4.9v9.2L12 21.5l-8.5-4.9V7.4z" />
           <path d="M12 12v9.5M3.5 7l8.5 5 8.5-5" />
@@ -82,6 +83,15 @@
       <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
         <circle cx="12" cy="12" r="8.5" />
         <circle cx="9.2" cy="9.2" r="2.2" fill="currentColor" stroke="none" />
+      </svg>
+    </button>
+
+    <!-- Reset view: zoom, pan, 3D angle, and contrast (hidden on mobile where pane switcher carries ⟲) -->
+    <button type="button" id="resetViewBtn" class="tb-icon-btn"
+      title="Reset view (zoom, pan, 3D angle, and contrast)" aria-label="Reset view">
+      <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+        <path d="M3 3v5h5" />
       </svg>
     </button>
 
@@ -134,7 +144,7 @@
       </svg>Stats
     </button>
 
-    <span class="tb-divider"></span>
+    <span class="tb-divider" role="separator" aria-orientation="vertical"></span>
 
     <button type="button" id="diagnosticsBtn" class="tb-icon-btn" title="Diagnostics" aria-label="Diagnostics">
       <svg viewBox="0 0 24 24" class="tb-ico" aria-hidden="true">
@@ -159,6 +169,10 @@
       <div class="footer-item" id="location">Drag and drop any NIfTI image</div>
 
       <div class="footer-status">
+        <div class="footer-item" id="activeModelItem" hidden>
+          <span id="activeModelBadge" class="model-badge"></span>
+        </div>
+
         <div class="footer-item">
           <progress id="modelProgress" value="0" max="100" title="Model progress"></progress>
         </div>

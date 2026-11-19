@@ -8,14 +8,38 @@ import { localSystemDetails } from "./brainchop-diagnostics.js";
 import { getLabelHistogramU8 } from "./tensor-utils.js";
 import { buildFreeSurferLut, remapLabelsToFreeSurfer } from "./freesurfer-labels.js";
 import { installResponsiveLayout } from "./responsive-layout.js";
-import { installTouchViewControls } from "./touch-view.js";
+import { installTouchViewControls, resetView } from "./touch-view.js";
+
+// crypto.randomUUID() requires a secure context (HTTPS / localhost); fall back
+// to RFC 4122 v4 via getRandomValues so plain-HTTP LAN dev sessions work too.
+function createVolumeId() {
+  if (typeof crypto !== "undefined") {
+    if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+    if (typeof crypto.getRandomValues === "function") {
+      const b = new Uint8Array(16);
+      crypto.getRandomValues(b);
+      b[6] = (b[6] & 0x0f) | 0x40;
+      b[8] = (b[8] & 0x3f) | 0x80;
+      const hex = Array.from(b, (v) => v.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+  }
+  return `vol-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isTouchPrimary() {
+  return Boolean(
+    window.matchMedia?.("(pointer: coarse)")?.matches &&
+    !window.matchMedia?.("(pointer: fine)")?.matches
+  );
+}
 
 // niivue 1.0 dropped NVImage's methods (clone/saveToDisk/getValue); these
 // replace the three we used. hdr keeps its prototype so the writers can use it.
 function cloneVolume(src, img = src.img.slice(), name = src.name) {
   const hdr = Object.assign(Object.create(Object.getPrototypeOf(src.hdr)), src.hdr);
   const vol = nii2volume(hdr, img, name);
-  vol.id = crypto.randomUUID();  // nii2volume defaults id to name; overlays must stay distinct
+  vol.id = createVolumeId();  // nii2volume defaults id to name; overlays must stay distinct
   return vol;
 }
 
@@ -58,7 +82,7 @@ function cloneOverlayVolume(src, img, name = src.name, hdrOverrides = {}, volOve
     img2RASstart: src.img2RASstart ? [...src.img2RASstart] : undefined,
     volScale: src.volScale ? [...src.volScale] : undefined,
     name,
-    id: crypto.randomUUID(),
+    id: createVolumeId(),
     calMin: 0,
     calMax: 255,
     robustMin: 0,
@@ -386,6 +410,22 @@ async function main() {
     modelSelect.title = baseEntry?.description || "Choose a segmentation model to run";
   }
 
+  const activeModelItem = document.getElementById("activeModelItem");
+  const activeModelBadge = document.getElementById("activeModelBadge");
+  function updateActiveModelBadge(modelEntry) {
+    if (!activeModelItem || !activeModelBadge) return;
+    const name = modelEntry?.modelName?.trim();
+    if (!name) {
+      activeModelItem.hidden = true;
+      activeModelBadge.textContent = "";
+      activeModelBadge.removeAttribute("title");
+      return;
+    }
+    activeModelBadge.textContent = name;
+    activeModelBadge.title = `Active model: ${name}`;
+    activeModelItem.hidden = false;
+  }
+
   // --- Single-label isolation --------------------------------------------
   // Alt/Option-click a region in a 2D panel to show ONLY that label across
   // the X/Y/Z panels and the 3D render. Alt-click the same region again (or
@@ -427,8 +467,11 @@ async function main() {
     dragSegmented.querySelectorAll("button").forEach((btn) => {
       btn.onclick = () => {
         nv1.secondaryDragMode = parseInt(btn.dataset.drag, 10);
-        dragSegmented.querySelectorAll("button").forEach((b) =>
-          b.classList.toggle("active", b === btn));
+        dragSegmented.querySelectorAll("button").forEach((b) => {
+          const active = b === btn;
+          b.classList.toggle("active", active);
+          b.setAttribute("aria-pressed", String(active));
+        });
       };
     });
   }
@@ -546,7 +589,8 @@ async function main() {
         • <strong>Drag & Drop</strong> any NIfTI file to open.
         • Press <strong>C</strong> to toggle/cycle the clip-plane.
         • Press <strong>V</strong> repeatedly to cycle through views.
-        • <strong>Option/Alt-click</strong> a segmentation label or CAT-lite tissue to show it alone in all panels + 3D. Click it again, click the background, or press Esc to restore all overlays.</p>
+        • <strong>Option/Alt-click</strong> a segmentation label or CAT-lite tissue (or use <strong>Stats → isolate</strong> on touch screens) to show it alone in all panels + 3D. Click it again, click the background, or press Esc to restore all overlays.
+        • Click <strong>Reset view</strong> (or <strong>⟲</strong> on mobile) to restore default zoom, pan, 3D angle, and contrast.</p>
 
         <p><strong>🧠 AI Models</strong><br>
         <strong>🪓🧠 Omnimodal Skull Stripping:</strong> <em>Omnimodal Skull Stripping</em> (MindGrab) extracts the brain across T1, T2, FLAIR, DWI, EPI, MRA, PDw, qT1, CT, and PET.<br>
@@ -570,6 +614,11 @@ async function main() {
     shadingBtn.setAttribute("aria-pressed", String(on));
     nv1.volumeIllumination = on ? 0.5 : 0;
   };
+
+  const resetViewBtn = document.getElementById("resetViewBtn");
+  if (resetViewBtn) {
+    resetViewBtn.onclick = () => resetView(nv1);
+  }
 
   diagnosticsBtn.onclick = function () {
     let msg = diagnosticsString;
@@ -696,6 +745,7 @@ async function main() {
 
   async function closeAllOverlays() {
     removeOverlaysNoRender();
+    updateActiveModelBadge(null);
     await nv1.updateGLVolume();
   }
 
@@ -889,7 +939,7 @@ async function main() {
       ...(precisionParam === "fp32" ? { forceFP32: true } : {}),
     };
 
-    const opts = { ...brainChopOpts };
+    const opts = { ...brainChopOpts, isTouchPrimary: isTouchPrimary() };
     // Fix URL construction to handle './' base correctly and allow subfolders
     const rootUrl = new URL(import.meta.env.BASE_URL, window.location.href).href;
     // Remove trailing slash if present to avoid double slashes when appending paths starting with /
@@ -1630,6 +1680,7 @@ async function main() {
       nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
       lastModelEntry = null;
       lastBrainMask = null;
+      updateActiveModelBadge(null);
       syncModelUnderlayOpacityNoRender();
       modelSelect.value = "-1";
       syncModelSelectTooltip();
@@ -1718,6 +1769,7 @@ async function main() {
     lastSegColors = null;
     lastModelEntry = modelEntry;
     lastBrainMask = modelEntry.type === 'Brain_Extraction' ? brainMask || null : null;
+    updateActiveModelBadge(modelEntry);
     if (modelEntry.outputType === 'probability') {
       // CAT-lite passes [GM, WM, CSF]; other probability models a single map.
       const maps = Array.isArray(img) ? img : [img];
@@ -1921,7 +1973,9 @@ async function main() {
   // patch-niivue-render.mjs instead: a flat gain on the composited render
   // preserves hue AND saturation exactly and cannot reach 2D. Leave neutral.
   nv1.gamma = 1;
-  nv1.registerVolumeTransform(clinicalConform); // robust conform worker (0-99.9% clip, <2% neg floor, NaN-safe)
+  if (!nv1.volumeTransforms.includes(clinicalConform.name)) {
+    nv1.registerVolumeTransform(clinicalConform); // robust conform worker (0-99.9% clip, <2% neg floor, NaN-safe)
+  }
   nv1.isLegendVisible = false; // 1.0 defaults it on; it costs ~25% of the canvas width
   nv1.addEventListener("locationChange", (e) => handleLocationChange(e.detail));
   // Alt/Option-click a region to isolate it (see handleIsolateClick).
