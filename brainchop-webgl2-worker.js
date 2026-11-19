@@ -244,8 +244,12 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   addLabelStats(statData, modelEntry.numClasses || actualLabels, actualLabels);
   markSuccess(statData, Inference_t, Postprocess_t, { Preprocess_t, Setup_t });
   callbackImg(outimg, opts, modelEntry, maskResult.mask);
-  const isolateHint = (modelEntry.numClasses ?? 0) > 2 ? ' \u00b7 Option/Alt-click a region to isolate' : '';
-  callbackComplete(`${modelEntry.modelName} \u00b7 Segmentation finished (${elapsedText})${isolateHint}`, statData, {
+  const isolateHint = (modelEntry.numClasses ?? 0) > 2
+    ? (opts?.isTouchPrimary
+        ? ' \u00b7 Open Stats to isolate a region'
+        : ' \u00b7 Option/Alt-click a region to isolate')
+    : '';
+  callbackComplete(`Segmentation finished (${elapsedText})${isolateHint}`, statData, {
     Setup_t,
     Preprocess_t,
     Inference_t,

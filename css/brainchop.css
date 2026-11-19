@@ -106,6 +106,15 @@ header {
   border-color: #7a8087;
 }
 
+.tb-btn:focus-visible,
+.tb-icon-btn:focus-visible,
+.segmented button:focus-visible,
+.model-select:focus-visible,
+.pane-switcher button:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
 .tb-btn:active,
 .tb-icon-btn:active {
   background: rgba(255, 255, 255, 0.05);
@@ -210,13 +219,15 @@ header {
   color: #e6e8ea;
 }
 
-.segmented button.active {
+.segmented button.active,
+.segmented button[aria-pressed="true"] {
   background: #3a424c;
   color: #fff;
 }
 
 .tb-btn.active,
-.tb-icon-btn.active {
+.tb-icon-btn.active,
+.tb-icon-btn[aria-pressed="true"] {
   background: #3a424c;
   border-color: #6b7480;
   color: #fff;
@@ -377,10 +388,10 @@ footer {
 
 /* Left: location / coordinate readout — takes remaining space and truncates */
 #location {
+  display: block;
   flex: 1 1 auto;
   min-width: 0;
-  gap: 12px;
-  line-height: 1;
+  line-height: 1.25;
   font-weight: 500;
   color: #c9ccd1;
   white-space: nowrap;
@@ -392,12 +403,12 @@ footer {
 }
 
 #location .loc-seg {
-  display: inline-block;
+  display: inline;
 }
 
 #location .loc-sep {
   opacity: 0.3;
-  padding: 0 2px;
+  margin: 0 7px;
 }
 
 /* First segment (coordinate group) reads as the primary value */
@@ -435,6 +446,23 @@ footer {
   background: currentColor;
   box-shadow: 0 0 5px currentColor;
   flex-shrink: 0;
+}
+
+/* Active segmentation model badge — stays visible in footer after crosshair moves */
+.model-badge {
+  display: inline-block;
+  max-width: 210px;
+  padding: 3px 9px;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.14);
+  color: #dbeafe;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Progress Bar — slim rounded pill, always visible */
@@ -522,6 +550,12 @@ progress::-moz-progress-bar {
 
   progress {
     width: 56px;
+  }
+
+  .model-badge {
+    max-width: 112px;
+    padding: 2px 7px;
+    font-size: 11px;
   }
 
   .status-text {
@@ -1552,8 +1586,8 @@ body.nv-narrow .pane-switcher {
 }
 
 .pane-switcher button {
-  min-width: 36px;
-  height: 30px;
+  min-inline-size: 36px;
+  min-block-size: 30px;
   padding: 0 9px;
   border: 0;
   border-radius: 999px;
@@ -1564,6 +1598,13 @@ body.nv-narrow .pane-switcher {
   line-height: 1;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
+}
+
+@media (pointer: coarse) {
+  .pane-switcher button {
+    min-inline-size: 40px;
+    min-block-size: 36px;
+  }
 }
 
 .pane-switcher button.active {
@@ -1583,6 +1624,11 @@ body.nv-narrow .pane-switcher {
 
 .pane-switcher .pane-reset:active {
   color: #fff;
+}
+
+/* Mobile already carries ⟲ inside .pane-switcher; avoid duplicating it in the slim header. */
+body.nv-narrow #resetViewBtn {
+  display: none;
 }
 
 /* Slim chrome: ~94px of header+footer becomes ~68px, all of it going to the
@@ -1657,13 +1703,31 @@ body.nv-narrow .footer-content {
   gap: 8px;
 }
 
-body.nv-narrow #location {
-  font-size: 11px;
+body.nv-narrow .footer-status {
   gap: 8px;
 }
 
+body.nv-narrow #location {
+  font-size: 11px;
+}
+
+body.nv-narrow #location .loc-sep {
+  margin: 0 5px;
+}
+
 body.nv-narrow progress {
-  width: 44px;
+  width: 40px;
+}
+
+body.nv-narrow .github-star {
+  padding: 2px 7px;
+  gap: 4px;
+}
+
+body.nv-narrow .model-badge {
+  max-width: 108px;
+  padding: 2px 7px;
+  font-size: 11px;
 }
 
 /* ===========================================================================
