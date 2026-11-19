@@ -465,33 +465,56 @@ footer {
   text-overflow: ellipsis;
 }
 
-/* Progress Bar — slim rounded pill, always visible */
+/* Progress Bar — slim rounded pill, always visible.
+   Follows modern-web-guidance `progress` + `motion` rules:
+   - appearance: none + border: 0 solid + overflow: clip
+   - separate -webkit- / -moz- pseudo-element rules (never grouped)
+   - custom-property animation routing on <progress> itself
+   - compositor-only opacity pulse opted in under prefers-reduced-motion: no-preference */
 progress {
   -webkit-appearance: none;
   -moz-appearance: none;
   appearance: none;
-  height: 6px;
-  width: 90px;
-  border: none;
+  block-size: 6px;
+  inline-size: 90px;
+  border: 0 solid;
   border-radius: 999px;
-  overflow: hidden;
+  overflow: clip;
   background: rgba(255, 255, 255, 0.12);
 }
 
+progress.is-busy {
+  @media (prefers-reduced-motion: no-preference) {
+    --progress-bar-animation: progress-busy-pulse 1.4s ease-in-out infinite;
+  }
+}
+
 progress::-webkit-progress-bar {
-  background: rgba(255, 255, 255, 0.12);
-  border-radius: 999px;
+  background: transparent;
 }
 
 progress::-webkit-progress-value {
   background: linear-gradient(90deg, #3b82f6, #60a5fa);
   border-radius: 999px;
-  transition: width 0.25s ease;
+  transition: inline-size 0.25s ease;
+  animation: var(--progress-bar-animation, revert-rule);
 }
 
 progress::-moz-progress-bar {
   background: linear-gradient(90deg, #3b82f6, #60a5fa);
   border-radius: 999px;
+  transition: inline-size 0.25s ease;
+  animation: var(--progress-bar-animation, revert-rule);
+}
+
+@keyframes progress-busy-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.48;
+  }
 }
 
 /* GitHub star — the only interactive element in the bar */
@@ -1235,6 +1258,57 @@ progress::-moz-progress-bar {
   color: #f2f4f7;
 }
 
+.stat-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+}
+
+.stat-locate {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  min-inline-size: 26px;
+  min-block-size: 26px;
+  margin: 0;
+  float: none;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: #b5bcc4;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.stat-locate svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.stat-locate:hover {
+  background: rgba(59, 130, 246, 0.16);
+  border-color: rgba(96, 165, 250, 0.55);
+  color: #ffffff;
+}
+
+.stat-locate:focus {
+  outline: none;
+}
+
+.stat-locate:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: -2px;
+}
+
 .stat-iso {
   flex: 0 0 auto;
   min-block-size: 26px;
@@ -1272,6 +1346,28 @@ progress::-moz-progress-bar {
 .stat-iso:focus-visible {
   outline: 2px solid #60a5fa;
   outline-offset: -2px;
+}
+
+@media (pointer: coarse) {
+  .stat-actions {
+    gap: 8px;
+  }
+
+  .stat-locate {
+    min-inline-size: 44px;
+    min-block-size: 44px;
+  }
+
+  .stat-locate svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .stat-iso {
+    min-block-size: 44px;
+    padding: 4px 12px;
+    font-size: 12px;
+  }
 }
 
 /* Expanded per-region intensity statistics drawer */
@@ -1418,8 +1514,17 @@ progress::-moz-progress-bar {
 
 @media (max-width: 560px) {
   .stat-trigger {
-    grid-template-columns: 12px 10px minmax(92px, 130px) 1fr 48px;
+    grid-template-columns: 12px 10px minmax(0, 1fr) auto;
     gap: 6px;
+  }
+
+  .stat-track {
+    display: none;
+  }
+
+  .stat-line {
+    gap: 5px;
+    padding: 2px 6px 2px 4px;
   }
 
   .stat-search {

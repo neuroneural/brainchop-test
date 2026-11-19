@@ -5,8 +5,7 @@ import {
     transposeVolume3D,
     transposeVolume3DToU8,
     countUniqueLabelsU8,
-    validateVolumeStats,
-    processSegmentationVolume
+    validateVolumeStats
 } from './tensor-utils.js';
 import {
     createStatData,
@@ -15,7 +14,8 @@ import {
     markFailure,
     ExecutionModes
 } from './diagnostic-stats.js';
-import { isCatLite, runCatLite } from './cat-lite.js';
+import { isCatLite } from './cat-lite.js';
+import { processSegmentationInWorker, runCatLiteInWorker } from './postprocess-client.js';
 import { setupNet as setupNativeNet, nativeUnsupportedReason } from './webgpu_native/meshnet_gpu.js';
 import * as fastV4Runner from './webgpu_runners/meshnet_fast_v4_runner.js';
 
@@ -742,7 +742,15 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
                 : (prior) => (outPerm
                     ? transposeVolume3D(prior, finalShape, outPerm)
                     : (prior instanceof Float32Array ? prior : Float32Array.from(prior)));
-            finalImage = await runCatLite(inferenceResultArray, catLiteIntensityData, modelEntry, statData, toNative);
+            finalImage = await runCatLiteInWorker(
+                inferenceResultArray,
+                catLiteIntensityData,
+                modelEntry,
+                statData,
+                toNative,
+                CONFORMED_SHAPE
+            );
+            catLiteIntensityData = null;
         } else if (isProbabilityOutput) {
             const rawProb = inferenceResultArray[0];
             finalImage = useGpuNativeOutput
@@ -753,6 +761,7 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
             validateVolumeStats(finalImage, true, 'probability');
         } else {
             const rawLabels = inferenceResultArray[0];
+            inferenceResultArray[0] = null;
             let nativeLabels;
             if (useGpuNativeOutput) {
                 nativeLabels = rawLabels instanceof Uint8Array ? rawLabels : new Uint8Array(rawLabels);
@@ -762,13 +771,14 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
                 nativeLabels = rawLabels instanceof Uint8Array ? rawLabels : new Uint8Array(rawLabels);
             }
             validateVolumeStats(nativeLabels, false, 'segmentation');
-            finalImage = await processSegmentationVolume(
+            finalImage = await processSegmentationInWorker(
                 nativeLabels,
                 niftiImage,
                 modelEntry,
                 opts,
                 maskResult,
-                CONFORMED_SHAPE
+                CONFORMED_SHAPE,
+                { transferLabels: true }
             );
         }
         const Postprocess_t = ((performance.now() - postStart) / 1000).toFixed(4);
