@@ -17,8 +17,10 @@
 //   4. Exact Forward + Backward Receptive-Field Cone Skipping + Stratified Exterior
 //      GroupNorm Sampling + Border-Shell Exactness Rule.
 //   5. Universal 3-Tier WebGPU Support:
-//      - Tier 1: `shader-f16` + 32-wide `subgroups` (`subgroupAdd/Min/Max`)
-//      - Tier 2: `shader-f16` without `subgroups` (`8 KiB` shared-memory reduction)
+//      - Tier 1: `shader-f16` + flexible `subgroups` (`32` direct on Apple/NVIDIA,
+//        `32–64`/`64` half-row `subgroupShuffleXor` butterfly on AMD RDNA/Adreno,
+//        `8–32` 2 KiB subgroup-assisted combine on Intel Xe/Arc & ARM Mali)
+//      - Tier 2: `shader-f16` without `subgroups` (`8–12 KiB` loop-free shared-memory reduction)
 //      - Tier 3: `f32` fallback when `shader-f16` is absent (`supportsF32Fallback = true`)
 // ---------------------------------------------------------------------------
 
@@ -161,6 +163,39 @@ function shouldPreferLowMem128OnWindows(device, d, modelEntry) {
   if (modelEntry?.forceLowMem128 === false) return false;
   const plat = detectV4Platform(device);
   return plat.isWindowsSharedIgpu && d.cs >= 24 && d.cs % 4 === 0;
+}
+
+// Select Tier 1 subgroup reduction strategy based on adapter subgroup range:
+//   - 'sg32'     : fixed 32-wide subgroups (Apple Silicon, NVIDIA) -> direct subgroupAdd/Min/Max (0 shared mem)
+//   - 'sg64'     : fixed 64-wide subgroups (Qualcomm Adreno, GCN)  -> 5-step subgroupShuffleXor(16..1) half-row butterfly (0 shared mem)
+//   - 'sg32_64'  : dynamic 32/64 subgroups (AMD RDNA, Adreno)      -> runtime sg_size==32 fast path else 5-step butterfly (0 shared mem)
+//   - 'sg_small' : 8..32 subgroups (Intel Xe/Arc/UHD, ARM Mali)    -> runtime sg_size==32 fast path else 2 KiB 2/4-slot combine
+//   - 'none'     : fallback loop-free shared-memory epilogue
+function resolveSubgroupMode(device, modelEntry) {
+  if (!device?.features?.has?.('subgroups') || modelEntry?.disableSubgroups) {
+    return 'none';
+  }
+  if (modelEntry?.forceSubgroupMode) {
+    return modelEntry.forceSubgroupMode;
+  }
+  const adInfo = device.__adapterInfo || device.adapterInfo || {};
+  const sgMin = adInfo.subgroupMinSize | 0;
+  const sgMax = adInfo.subgroupMaxSize | 0;
+  if (sgMin === 32 && sgMax === 32) return 'sg32';
+  if (sgMin === 64 && sgMax === 64) return 'sg64';
+  if (sgMin >= 32 && sgMax <= 64) return 'sg32_64';
+  if (sgMin >= 8 && sgMax <= 32) return 'sg_small';
+  return 'none';
+}
+
+function subgroupModeLabel(subgroupMode) {
+  switch (subgroupMode) {
+    case 'sg32': return 'subgroups32';
+    case 'sg64': return 'subgroups64-bf';
+    case 'sg32_64': return 'subgroups32-64';
+    case 'sg_small': return 'subgroups8-32';
+    default: return 'shared-8KiB';
+  }
 }
 
 function yieldAfterPacedChunk() {
@@ -746,12 +781,12 @@ function getProbCacheKey(probCfg) {
 }
 
 async function getNetPipes128(
-  device, d, packed, hasF16, hasSubgroups32, probCfg, shaders,
+  device, d, packed, hasF16, subgroupMode, probCfg, shaders,
   { includeCls = true, sequential = false, shouldAbort = null } = {}
 ) {
   const cache = getDeviceMap(netPipeCache, device);
   const f16Tag = hasF16 ? 1 : 0;
-  const sgTag = hasSubgroups32 ? 1 : 0;
+  const sgTag = subgroupMode || 'none';
   const uWeffTag = shaders.useUniformWeff ? 1 : 0;
   const mk = (label, mod, ep, spec) => createLayoutAndPipe(device, label, mod, ep, spec);
 
@@ -872,12 +907,12 @@ async function getNetPipes128(
 }
 
 async function getNetPipesStd(
-  device, d, packed, hasF16, hasSubgroups32, splitHalves, probCfg, shaders,
+  device, d, packed, hasF16, subgroupMode, splitHalves, probCfg, shaders,
   { includeCls = true, sequential = false, shouldAbort = null } = {}
 ) {
   const cache = getDeviceMap(netPipeCache, device);
   const f16Tag = hasF16 ? 1 : 0;
-  const sgTag = hasSubgroups32 ? 1 : 0;
+  const sgTag = subgroupMode || 'none';
   const splitTag = splitHalves ? 1 : 0;
   const uWeffTag = shaders.useUniformWeff ? 1 : 0;
   const chunkTag = shaders.chunkableStd ? 1 : 0;
@@ -2251,10 +2286,182 @@ function createGpuIoController({
   return { prepareInput, finishAndReadback, warmupIoPipelines, dispose };
 }
 
+function buildSubgroupOps(subgroupMode, norm) {
+  if (subgroupMode === 'sg32') {
+    return {
+      decls: '',
+      entryArgs: '',
+      add: (e) => `subgroupAdd(${e})`,
+      min: (e) => `subgroupMin(${e})`,
+      max: (e) => `subgroupMax(${e})`,
+    };
+  }
+  const bfOps = (op, fnName) => {
+    const step = (m) => (op === '+'
+      ? `  x = x + subgroupShuffleXor(x, ${m}u);`
+      : `  x = ${op}(x, subgroupShuffleXor(x, ${m}u));`);
+    if (subgroupMode === 'sg64') {
+      return `fn ${fnName}(v : f32) -> f32 {
+  var x = v;
+${step(16)}
+${step(8)}
+${step(4)}
+${step(2)}
+${step(1)}
+  return x;
+}\n`;
+    }
+    const direct = op === '+' ? 'subgroupAdd' : op === 'min' ? 'subgroupMin' : 'subgroupMax';
+    return `fn ${fnName}(v : f32, sg_size : u32) -> f32 {
+  if (sg_size == 32u) { return ${direct}(v); }
+  var x = v;
+${step(16)}
+${step(8)}
+${step(4)}
+${step(2)}
+${step(1)}
+  return x;
+}\n`;
+  };
+  const decls = (norm === 'none' ? '' : bfOps('+', 'sg32_add')) +
+    bfOps('min', 'sg32_min') +
+    bfOps('max', 'sg32_max');
+  if (subgroupMode === 'sg64') {
+    return {
+      decls,
+      entryArgs: '',
+      add: (e) => `sg32_add(${e})`,
+      min: (e) => `sg32_min(${e})`,
+      max: (e) => `sg32_max(${e})`,
+    };
+  }
+  return {
+    decls,
+    entryArgs: ',\n             @builtin(subgroup_size) sg_size : u32',
+    add: (e) => `sg32_add(${e}, sg_size)`,
+    min: (e) => `sg32_min(${e}, sg_size)`,
+    max: (e) => `sg32_max(${e}, sg_size)`,
+  };
+}
+
+function buildSgSmallDecls({ V4, sw, norm, writeMomFn, momParams, momArgs }) {
+  const isNone = norm === 'none';
+  const shType = isNone ? 'vec2<f32>' : 'vec4<f32>';
+  const sgPack1Fn = isNone
+    ? `fn sg32_pack1(a : ${V4}, slane : u32, c_out : u32, ${momParams}) -> u32 {
+  let f = vec4<f32>(a${sw});
+  let mn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
+  let mx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+  let sp = mx - mn;
+  if (slane == 0u) {
+    write_mom(c_out, vec4<f32>(0.0, 0.0, mn, sp), ${momArgs});
+  }
+  return pack4x8unorm((f - vec4<f32>(mn)) * select(0.0, 1.0 / sp, sp > 1e-7));
+}\n`
+    : `fn sg32_pack1(a : ${V4}, slane : u32, c_out : u32, ${momParams}) -> u32 {
+  let f = vec4<f32>(a${sw});
+  let s = subgroupAdd(f.x + f.y + f.z + f.w);
+  let q = subgroupAdd(dot(f, f));
+  let mn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
+  let mx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+  let sp = mx - mn;
+  if (slane == 0u) {
+    write_mom(c_out, vec4<f32>(s, q, mn, sp), ${momArgs});
+  }
+  return pack4x8unorm((f - vec4<f32>(mn)) * select(0.0, 1.0 / sp, sp > 1e-7));
+}\n`;
+  const sgSubStoreFn = isNone
+    ? `fn sg_sub_store(a : ${V4}, slot : u32, sg_id : u32) {
+  let f = vec4<f32>(a${sw});
+  let mn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
+  let mx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+  if (sg_id == 0u) { sh_sg[slot] = vec2<f32>(mn, mx); }
+}\n`
+    : `fn sg_sub_store(a : ${V4}, slot : u32, sg_id : u32) {
+  let f = vec4<f32>(a${sw});
+  let s = subgroupAdd(f.x + f.y + f.z + f.w);
+  let q = subgroupAdd(dot(f, f));
+  let mn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
+  let mx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+  if (sg_id == 0u) { sh_sg[slot] = vec4<f32>(s, q, mn, mx); }
+}\n`;
+  const combineBody = isNone
+    ? `      let p0 = sh_sg[rb];
+      let p1 = sh_sg[rb + 1u];
+      var rmn = min(p0.x, p1.x);
+      var rmx = max(p0.y, p1.y);
+      if (sg_size == 8u) {
+        let p2 = sh_sg[rb + 2u];
+        let p3 = sh_sg[rb + 3u];
+        rmn = min(rmn, min(p2.x, p3.x));
+        rmx = max(rmx, max(p2.y, p3.y));
+      }
+      let sp = rmx - rmn;
+      sh_res[h * 4u + slane] = vec2<f32>(rmn, select(0.0, 1.0 / sp, sp > 1e-7));
+      write_mom(c_base + slane, vec4<f32>(0.0, 0.0, rmn, sp), ${momArgs});`
+    : `      let p0 = sh_sg[rb];
+      let p1 = sh_sg[rb + 1u];
+      var rs = p0.x + p1.x;
+      var rq = p0.y + p1.y;
+      var rmn = min(p0.z, p1.z);
+      var rmx = max(p0.w, p1.w);
+      if (sg_size == 8u) {
+        let p2 = sh_sg[rb + 2u];
+        let p3 = sh_sg[rb + 3u];
+        rs += p2.x + p3.x;
+        rq += p2.y + p3.y;
+        rmn = min(rmn, min(p2.z, p3.z));
+        rmx = max(rmx, max(p2.w, p3.w));
+      }
+      let sp = rmx - rmn;
+      sh_res[h * 4u + slane] = vec2<f32>(rmn, select(0.0, 1.0 / sp, sp > 1e-7));
+      write_mom(c_base + slane, vec4<f32>(rs, rq, rmn, sp), ${momArgs});`;
+  return `var<workgroup> sh_sg  : array<${shType}, 128>;
+var<workgroup> sh_res : array<vec2<f32>, 32>;
+${writeMomFn}${sgPack1Fn}${sgSubStoreFn}fn reduce_pack4_sg(
+  a0 : ${V4}, a1 : ${V4}, a2 : ${V4}, a3 : ${V4},
+  h : u32, slane : u32, sg_size : u32, sg_id : u32,
+  c_base : u32, ${momParams}
+) -> vec4<u32> {
+  var out_q : vec4<u32>;
+  if (sg_size == 32u) {
+    out_q = vec4<u32>(
+      sg32_pack1(a0, slane, c_base + 0u, ${momArgs}),
+      sg32_pack1(a1, slane, c_base + 1u, ${momArgs}),
+      sg32_pack1(a2, slane, c_base + 2u, ${momArgs}),
+      sg32_pack1(a3, slane, c_base + 3u, ${momArgs})
+    );
+  } else {
+    let b0 = (h * 4u) * 4u + (slane / sg_size);
+    sg_sub_store(a0, b0 + 0u, sg_id);
+    sg_sub_store(a1, b0 + 4u, sg_id);
+    sg_sub_store(a2, b0 + 8u, sg_id);
+    sg_sub_store(a3, b0 + 12u, sg_id);
+    workgroupBarrier();
+    if (slane < 4u) {
+      let rb = (h * 4u + slane) * 4u;
+${combineBody}
+    }
+    workgroupBarrier();
+    let r0 = sh_res[h * 4u + 0u];
+    let r1 = sh_res[h * 4u + 1u];
+    let r2 = sh_res[h * 4u + 2u];
+    let r3 = sh_res[h * 4u + 3u];
+    out_q = vec4<u32>(
+      pack4x8unorm((vec4<f32>(a0${sw}) - vec4<f32>(r0.x)) * r0.y),
+      pack4x8unorm((vec4<f32>(a1${sw}) - vec4<f32>(r1.x)) * r1.y),
+      pack4x8unorm((vec4<f32>(a2${sw}) - vec4<f32>(r2.x)) * r2.y),
+      pack4x8unorm((vec4<f32>(a3${sw}) - vec4<f32>(r3.x)) * r3.y)
+    );
+  }
+  return out_q;
+}\n`;
+}
+
 function buildShaders(cfg) {
   const {
     cs, chan, nclass, clsK4, dilations, activation, norm,
-    hasF16, hasSubgroups32, splitHalves, probCfg, chunkableStd = false,
+    hasF16, subgroupMode = 'none', splitHalves, probCfg, chunkableStd = false,
   } = cfg;
   const oc4 = cs / 4;
   const csHalf = splitHalves ? cs / 2 : cs;
@@ -2268,7 +2475,8 @@ function buildShaders(cfg) {
 
   const qConst = getQuantConstants(activation);
   const f16Enable = hasF16 ? 'enable f16;\n' : '';
-  const sgEnable = hasSubgroups32 ? 'enable subgroups;\n' : '';
+  const useSg = hasF16 && subgroupMode !== 'none';
+  const sgEnable = useSg ? 'enable subgroups;\n' : '';
   const T = hasF16 ? 'f16' : 'f32';
   const suf = hasF16 ? 'h' : 'f';
   const V4 = `vec4<${T}>`;
@@ -2282,9 +2490,11 @@ function buildShaders(cfg) {
         : `y8_0[${yRowExpr} + ${c * X4_VALID}u] = ${wordExpr};`
     );
 
-    if (hasF16 && hasSubgroups32) {
+    if (useSg && (subgroupMode === 'sg32' || subgroupMode === 'sg64' || subgroupMode === 'sg32_64')) {
+      const sgOps = buildSubgroupOps(subgroupMode, norm);
       return {
-        decls: '',
+        decls: sgOps.decls,
+        entryArgs: sgOps.entryArgs,
         localHeader: '',
         emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) =>
           rep(cEnd - cStart, (idx) => {
@@ -2297,8 +2507,8 @@ function buildShaders(cfg) {
             if (norm === 'none') {
               return `  {
     let f = vec4<f32>(${accVar}.v_${idx}${sw});
-    let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
-    let lmx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+    let lmn = ${sgOps.min('min(min(f.x, f.y), min(f.z, f.w))')};
+    let lmx = ${sgOps.max('max(max(f.x, f.y), max(f.z, f.w))')};
     let sp = lmx - lmn;
     let inv = select(0.0, 1.0 / sp, sp > 1e-7);
     if (${writeY8Expr}) {
@@ -2312,10 +2522,10 @@ function buildShaders(cfg) {
             }
             return `  {
     let f = vec4<f32>(${accVar}.v_${idx}${sw});
-    let ls = subgroupAdd(f.x + f.y + f.z + f.w);
-    let lq = subgroupAdd(dot(f, f));
-    let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
-    let lmx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+    let ls = ${sgOps.add('f.x + f.y + f.z + f.w')};
+    let lq = ${sgOps.add('dot(f, f)')};
+    let lmn = ${sgOps.min('min(min(f.x, f.y), min(f.z, f.w))')};
+    let lmx = ${sgOps.max('max(max(f.x, f.y), max(f.z, f.w))')};
     let sp = lmx - lmn;
     let inv = select(0.0, 1.0 / sp, sp > 1e-7);
     if (${writeY8Expr}) {
@@ -2327,6 +2537,48 @@ function buildShaders(cfg) {
     }
   }\n`;
           }),
+      };
+    }
+
+    if (useSg && subgroupMode === 'sg_small') {
+      const writeMomFn = `fn write_mom(c_out : u32, mv : vec4<f32>, ext_off : u32, main_off : u32, mom_mode : u32) {
+  if (mom_mode == 0u) {
+    mom_main[main_off + c_out] = mv;
+  } else if (mom_mode == 1u) {
+    mom_ext[ext_off + c_out] = mv;
+    mom_main[main_off + c_out] = mv;
+  } else {
+    mom_ext[ext_off + c_out] = mv;
+  }
+}\n`;
+      const decls = buildSgSmallDecls({
+        V4, sw, norm, writeMomFn,
+        momParams: 'ext_off : u32, main_off : u32, mom_mode : u32',
+        momArgs: 'ext_off, main_off, mom_mode',
+      });
+      return {
+        decls,
+        entryArgs: ',\n             @builtin(subgroup_size) sg_size : u32,\n             @builtin(subgroup_invocation_id) sg_id : u32',
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, yRowExpr, momMode, writeY8Expr = 'true' }) => {
+          const modeCode = momMode === 'ext_and_main' ? '1u' : momMode === 'ext_only' ? '2u' : '0u';
+          const extOff = momMode === 'main' ? '0u' : `(${hrExpr}) * ${cs}u`;
+          const mainOff = momMode === 'ext_only' ? '0u' : `(row_idx * 2u + sg) * ${cs}u`;
+          let out = `  let ep_ext_off = ${extOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4_sg(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, sg_size, sg_id, ${c}u, ep_ext_off, ep_main_off, ${modeCode});
+    if (${writeY8Expr}) {
+      ${storeY(yRowExpr, c, 'qw.x')}
+      ${storeY(yRowExpr, c + 1, 'qw.y')}
+      ${storeY(yRowExpr, c + 2, 'qw.z')}
+      ${storeY(yRowExpr, c + 3, 'qw.w')}
+    }
+  }\n`;
+          }
+          return out;
+        },
       };
     }
 
@@ -2771,7 +3023,7 @@ ${fmaRange(cStart, cEnd)}
       return `
 @compute @workgroup_size(64, 4, 1)
 fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
-             @builtin(workgroup_id) wid : vec3<u32>) {
+             @builtin(workgroup_id) wid : vec3<u32>${ep0.entryArgs || ''}) {
   let sg = lid.x >> 5u;
   let slane = lid.x & 31u;
 ${ep0.localHeader}  let x_pad = lid.x + ${X4_HALO}u;
@@ -3090,6 +3342,8 @@ fn norm_halo_fill(@builtin(local_invocation_id) lid : vec3<u32>,
 
     const emitUnpack = (vName, uExpr) => {
       if (hasF16) {
+        // Keep vec2<f16>(unpack2x16float(...)): Firefox Naga mis-types bitcast<vec2<f16>>(u32) as f32,
+        // while Dawn/Metal LLVM already folds this to a zero-cost half2 reinterpret.
         return `
           let ${vName} = vec4<f16>(vec2<f16>(unpack2x16float(((${uExpr} & 0x00FF00FFu) << 2u) | 0x3C003C00u)), vec2<f16>(unpack2x16float(((${uExpr} >> 6u) & 0x03FC03FCu) | 0x3C003C00u))) - vec4<f16>(${qConst.sterbenzSub});`;
       }
@@ -3274,7 +3528,7 @@ ${wLoopLo}
       return `
 @compute @workgroup_size(64, 4, 1)
 fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
-             @builtin(workgroup_id) wid : vec3<u32>) {
+             @builtin(workgroup_id) wid : vec3<u32>${epC.entryArgs || ''}) {
   let x4 = lid.x;
   let sg = x4 >> 5u;
   let slane = x4 & 31u;
@@ -3454,7 +3708,7 @@ ${buildClassifierLoopsWgsl({
 function buildShadersLowMem128(cfg) {
   const {
     cs, chan, nclass, clsK4, dilations, activation, norm,
-    hasF16, hasSubgroups32, numConvs, probCfg,
+    hasF16, subgroupMode = 'none', numConvs, probCfg,
   } = cfg;
   const csQ = cs / 4;
   const csHalf = cs / 2;
@@ -3476,7 +3730,8 @@ function buildShadersLowMem128(cfg) {
 
   const qConst = getQuantConstants(activation);
   const f16Enable = hasF16 ? 'enable f16;\n' : '';
-  const sgEnable = hasSubgroups32 ? 'enable subgroups;\n' : '';
+  const useSg = hasF16 && subgroupMode !== 'none';
+  const sgEnable = useSg ? 'enable subgroups;\n' : '';
   const T = hasF16 ? 'f16' : 'f32';
   const suf = hasF16 ? 'h' : 'f';
   const V4 = `vec4<${T}>`;
@@ -3496,9 +3751,11 @@ function buildShadersLowMem128(cfg) {
       return `if (use_act) { act8_${q}[a_row_base + ${cl * X4_PAD}u] = ${wordExpr}; } else { stage[s_row_base + ${c * X4_VALID}u] = ${wordExpr}; }`;
     };
 
-    if (hasF16 && hasSubgroups32) {
+    if (useSg && (subgroupMode === 'sg32' || subgroupMode === 'sg64' || subgroupMode === 'sg32_64')) {
+      const sgOps = buildSubgroupOps(subgroupMode, norm);
       return {
-        decls: '',
+        decls: sgOps.decls,
+        entryArgs: sgOps.entryArgs,
         localHeader: '',
         emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) =>
           rep(cEnd - cStart, (idx) => {
@@ -3506,8 +3763,8 @@ function buildShadersLowMem128(cfg) {
             if (norm === 'none') {
               return `  {
     let f = vec4<f32>(${accVar}.v_${idx}${sw});
-    let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
-    let lmx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+    let lmn = ${sgOps.min('min(min(f.x, f.y), min(f.z, f.w))')};
+    let lmx = ${sgOps.max('max(max(f.x, f.y), max(f.z, f.w))')};
     let sp = lmx - lmn;
     let inv = select(0.0, 1.0 / sp, sp > 1e-7);
     if (${writeY8Expr}) {
@@ -3522,10 +3779,10 @@ function buildShadersLowMem128(cfg) {
             }
             return `  {
     let f = vec4<f32>(${accVar}.v_${idx}${sw});
-    let ls = subgroupAdd(f.x + f.y + f.z + f.w);
-    let lq = subgroupAdd(dot(f, f));
-    let lmn = subgroupMin(min(min(f.x, f.y), min(f.z, f.w)));
-    let lmx = subgroupMax(max(max(f.x, f.y), max(f.z, f.w)));
+    let ls = ${sgOps.add('f.x + f.y + f.z + f.w')};
+    let lq = ${sgOps.add('dot(f, f)')};
+    let lmn = ${sgOps.min('min(min(f.x, f.y), min(f.z, f.w))')};
+    let lmx = ${sgOps.max('max(max(f.x, f.y), max(f.z, f.w))')};
     let sp = lmx - lmn;
     let inv = select(0.0, 1.0 / sp, sp > 1e-7);
     if (${writeY8Expr}) {
@@ -3538,6 +3795,43 @@ function buildShadersLowMem128(cfg) {
     }
   }\n`;
           }),
+      };
+    }
+
+    if (useSg && subgroupMode === 'sg_small') {
+      const writeMomFn = `fn write_mom(c_out : u32, mv : vec4<f32>, mom_off : u32, main_off : u32, also_main : bool) {
+  mom[mom_off + c_out] = mv;
+  if (also_main) {
+    mom[main_off + c_out] = mv;
+  }
+}\n`;
+      const decls = buildSgSmallDecls({
+        V4, sw, norm, writeMomFn,
+        momParams: 'mom_off : u32, main_off : u32, also_main : bool',
+        momArgs: 'mom_off, main_off, also_main',
+      });
+      return {
+        decls,
+        entryArgs: ',\n             @builtin(subgroup_size) sg_size : u32,\n             @builtin(subgroup_invocation_id) sg_id : u32',
+        localHeader: '  let h = lid.y * 2u + sg;\n',
+        emit: ({ accVar, cStart, cEnd, hrExpr, storeMode, momOffExpr, alsoWriteMomMain = false, writeY8Expr = 'true' }) => {
+          const momOff = `${momOffExpr} + (${hrExpr}) * ${cs}u`;
+          const mainOff = alsoWriteMomMain ? `${MOM_MAIN_OFF}u + (row_idx * 2u + sg) * ${cs}u` : '0u';
+          let out = `  let ep_mom_off = ${momOff};\n  let ep_main_off = ${mainOff};\n`;
+          for (let idx = 0; idx < cEnd - cStart; idx += 4) {
+            const c = cStart + idx;
+            out += `  {
+    let qw = reduce_pack4_sg(${accVar}.v_${idx}, ${accVar}.v_${idx + 1}, ${accVar}.v_${idx + 2}, ${accVar}.v_${idx + 3}, h, slane, sg_size, sg_id, ${c}u, ep_mom_off, ep_main_off, ${alsoWriteMomMain});
+    if (${writeY8Expr}) {
+      ${storeY(storeMode, c, 'qw.x')}
+      ${storeY(storeMode, c + 1, 'qw.y')}
+      ${storeY(storeMode, c + 2, 'qw.z')}
+      ${storeY(storeMode, c + 3, 'qw.w')}
+    }
+  }\n`;
+          }
+          return out;
+        },
       };
     }
 
@@ -3981,7 +4275,7 @@ ${fmaRange(cStart, cEnd)}
       return `
 @compute @workgroup_size(64, 4, 1)
 fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
-             @builtin(workgroup_id) wid : vec3<u32>) {
+             @builtin(workgroup_id) wid : vec3<u32>${ep0.entryArgs || ''}) {
   let sg = lid.x >> 5u;
   let slane = lid.x & 31u;
 ${ep0.localHeader}  let x_pad = lid.x + ${X4_HALO}u;
@@ -4307,6 +4601,8 @@ ${rep(4, (q) => emitNormQuarter(q, true))}
 
     const emitUnpack = (vName, uExpr) => {
       if (hasF16) {
+        // Keep vec2<f16>(unpack2x16float(...)): Firefox Naga mis-types bitcast<vec2<f16>>(u32) as f32,
+        // while Dawn/Metal LLVM already folds this to a zero-cost half2 reinterpret.
         return `
           let ${vName} = vec4<f16>(vec2<f16>(unpack2x16float(((${uExpr} & 0x00FF00FFu) << 2u) | 0x3C003C00u)), vec2<f16>(unpack2x16float(((${uExpr} >> 6u) & 0x03FC03FCu) | 0x3C003C00u))) - vec4<f16>(${qConst.sterbenzSub});`;
       }
@@ -4480,7 +4776,7 @@ ${tapHeader}${rep(4, (q) => emitQuarterLoop(q, cStart, cEnd))}      }
       return `
 @compute @workgroup_size(64, 4, 1)
 fn ${fnName}(@builtin(local_invocation_id) lid : vec3<u32>,
-             @builtin(workgroup_id) wid : vec3<u32>) {
+             @builtin(workgroup_id) wid : vec3<u32>${epC.entryArgs || ''}) {
   let x4 = lid.x;
   let sg = x4 >> 5u;
   let slane = x4 & 31u;
@@ -4650,7 +4946,7 @@ ${buildClassifierLoopsWgsl({
   };
 }
 
-async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, modelEntry, probCfg) {
+async function setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelEntry, probCfg) {
   const nvox = DIM * DIM * DIM;
   const outBufBytes = probCfg ? nvox * 4 : nvox;
   const numConvs = d.dilations.length;
@@ -4677,14 +4973,14 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
     activation: d.activation,
     norm: d.norm,
     hasF16,
-    hasSubgroups32,
+    subgroupMode,
     numConvs,
     probCfg,
   });
 
   console.log(
     `[WebGPU-V4-128M] ${d.chan}ch(cs=${d.cs})/${d.nclass}cls (${numConvs} convs, ${d.activation}, norm=${d.norm}` +
-    `${probCfg ? ', prob=3' : ''}) | ${hasF16 ? 'f16+sterbenz' : 'f32'} | ${hasSubgroups32 ? 'subgroups32' : 'shared-8KiB'} ` +
+    `${probCfg ? ', prob=3' : ''}) | ${hasF16 ? 'f16+sterbenz' : 'f32'} | ${subgroupModeLabel(subgroupMode)} ` +
     `| ZYCX-4Q+64slice | maxBuf=${(Math.max(actQBytes, stageBytes, momBytes, outBufBytes) / 1048576).toFixed(1)} MiB`
   );
 
@@ -4766,7 +5062,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, mode
       d,
       packed,
       hasF16,
-      hasSubgroups32,
+      subgroupMode,
       probCfg,
       shaders
     );
@@ -5531,10 +5827,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
   const probCfg = modelEntry?.outputType === 'probability' ? tissueProbabilityConfig(modelEntry, d.nclass) : null;
 
   const hasF16 = !!device.features?.has?.('shader-f16') && !modelEntry?.disableF16;
-  const adInfo = device.__adapterInfo || device.adapterInfo || {};
-  const hasSubgroups32 = !!device.features?.has?.('subgroups') &&
-    adInfo.subgroupMinSize === 32 && adInfo.subgroupMaxSize === 32 &&
-    !modelEntry?.disableSubgroups;
+  const subgroupMode = resolveSubgroupMode(device, modelEntry);
 
   const nvox = DIM * DIM * DIM;
   const outBufBytes = probCfg ? nvox * 4 : nvox;
@@ -5547,7 +5840,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
   const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
   const preferWin128 = shouldPreferLowMem128OnWindows(device, d, modelEntry);
   if ((modelEntry?.forceLowMem128 || preferWin128 || actBytes > maxAllowed || outBufBytes > maxAllowed) && d.cs >= 8 && d.cs % 4 === 0) {
-    return setupNetLowMem128(device, d, packed, hasF16, hasSubgroups32, modelEntry, probCfg);
+    return setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelEntry, probCfg);
   }
   if (actBytes > maxAllowed || outBufBytes > maxAllowed) {
     const needMiB = Math.max(actBytes, outBufBytes) >>> 20;
@@ -5564,7 +5857,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
     activation: d.activation,
     norm: d.norm,
     hasF16,
-    hasSubgroups32,
+    subgroupMode,
     splitHalves,
     probCfg,
     chunkableStd,
@@ -5572,7 +5865,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
 
   console.log(
     `[WebGPU-V4] ${d.chan}ch(cs=${d.cs})/${d.nclass}cls (${d.dilations.length} convs, ${d.activation}, norm=${d.norm}` +
-    `${probCfg ? ', prob=3' : ''}) | ${hasF16 ? 'f16+sterbenz' : 'f32'} | ${hasSubgroups32 ? 'subgroups32' : 'shared-8KiB'} ` +
+    `${probCfg ? ', prob=3' : ''}) | ${hasF16 ? 'f16+sterbenz' : 'f32'} | ${subgroupModeLabel(subgroupMode)} ` +
     `| ZYCX-pad80 | maxBuf=${(Math.max(actBytes, outBufBytes) / 1048576).toFixed(1)} MiB`
   );
 
@@ -5656,7 +5949,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
       d,
       packed,
       hasF16,
-      hasSubgroups32,
+      subgroupMode,
       splitHalves,
       probCfg,
       shaders
@@ -6339,9 +6632,7 @@ export async function warmupV4CorePipelines(device) {
   if (shouldAbort()) return;
 
   const hasF16 = !!device.features?.has?.('shader-f16');
-  const adInfo = device.__adapterInfo || device.adapterInfo || {};
-  const hasSubgroups32 = !!device.features?.has?.('subgroups') &&
-    adInfo.subgroupMinSize === 32 && adInfo.subgroupMaxSize === 32;
+  const subgroupMode = resolveSubgroupMode(device, null);
   const lim = device.limits || {};
   const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
 
@@ -6376,11 +6667,11 @@ export async function warmupV4CorePipelines(device) {
         activation: d.activation,
         norm: d.norm,
         hasF16,
-        hasSubgroups32,
+        subgroupMode,
         numConvs: d.dilations.length,
         probCfg: null,
       });
-      await getNetPipes128(device, d, null, hasF16, hasSubgroups32, null, shaders, {
+      await getNetPipes128(device, d, null, hasF16, subgroupMode, null, shaders, {
         includeCls: false,
         sequential: true,
         shouldAbort,
@@ -6396,12 +6687,12 @@ export async function warmupV4CorePipelines(device) {
         activation: d.activation,
         norm: d.norm,
         hasF16,
-        hasSubgroups32,
+        subgroupMode,
         splitHalves,
         probCfg: null,
         chunkableStd,
       });
-      await getNetPipesStd(device, d, null, hasF16, hasSubgroups32, splitHalves, null, shaders, {
+      await getNetPipesStd(device, d, null, hasF16, subgroupMode, splitHalves, null, shaders, {
         includeCls: false,
         sequential: true,
         shouldAbort,
