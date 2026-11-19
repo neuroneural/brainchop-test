@@ -1,6 +1,5 @@
 import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
 import { clinicalConform } from "./conform-transform.js";
-import { mat4 } from "gl-matrix";
 import { shiny } from "@niivue/niivue/assets/matcaps";
 import { runInferenceWebGpu, warmupWebGpuRunners, yieldForPaint } from "./inference-webgpu.js";
 import { inferenceModelsList, brainChopOpts, resolveModelEntry } from "./brainchop-parameters.js";
@@ -9,6 +8,13 @@ import { getLabelHistogramU8 } from "./tensor-utils.js";
 import { buildFreeSurferLut, remapLabelsToFreeSurfer } from "./freesurfer-labels.js";
 import { installResponsiveLayout } from "./responsive-layout.js";
 import { installTouchViewControls, resetView } from "./touch-view.js";
+import { resliceVolumeInWorker } from "./postprocess-client.js";
+import {
+  buildCatLiteRgbaComposite,
+  updateCatLiteRgbaOpacity,
+  computeCatLiteStats,
+  buildCatLiteStatsCsv,
+} from "./cat-lite-overlay.js";
 
 // crypto.randomUUID() requires a secure context (HTTPS / localhost); fall back
 // to RFC 4122 v4 via getRandomValues so plain-HTTP LAN dev sessions work too.
@@ -358,10 +364,12 @@ async function initializeBackend(viewerGl = null) {
  */
 function updateBackendStatusUI(webgpuAvailable, diagnostics) {
   const statusEl = document.getElementById('backendStatus');
+  const statusItem = document.getElementById('backendStatusItem');
   if (!statusEl) {
     console.log('Backend status element not found in DOM');
     return;
   }
+  if (statusItem) statusItem.hidden = false;
 
   if (webgpuAvailable) {
     const f16Text = diagnostics.f16Support ? ' (F16)' : '';
@@ -436,9 +444,9 @@ async function main() {
   // macOS), whereas altKey is free for in-canvas clicks.
   const ISOLATE_MODIFIER = "altKey";
   let isolatedLabel = null;    // label value shown alone, or null = show all
-  let isolatedProbabilityIndex = null; // selected CAT-lite tissue, or null = show all
-  let probabilityOverlays = null;      // current [GM, WM, CSF] volumes
-  let originalSegImg = null;   // pristine label voxels, for restore + stats
+  let isolatedProbabilityIndex = null; // selected CAT-lite tissue (0=GM,1=WM,2=CSF), or null = show all
+  let catLiteState = null;     // { maps:[gm,wm,csf], tissues, modelEntry, rgba, activeAlphaOffsets, activeBaseAlpha, overlay }
+  let lastFullLabelLut = null; // pristine makeLabelLut(...) object for instant LUT-based isolation restore
   let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
   let nativeInputNV = null;    // volume as loaded (native grid), before conform
   // CAT-lite temporarily dims the T1 so a neutral-gray probability map remains
@@ -515,7 +523,7 @@ async function main() {
       return;
     }
     const img = nv1.volumes[1].img;
-    if (img instanceof Float32Array) {
+    if (catLiteState || img instanceof Float32Array) {
       window.alert("Drawing edits label segmentations, not probability maps.");
       return;
     }
@@ -596,7 +604,7 @@ async function main() {
         <strong>🪓🧠 Omnimodal Skull Stripping:</strong> <em>Omnimodal Skull Stripping</em> (MindGrab) extracts the brain across T1, T2, FLAIR, DWI, EPI, MRA, PDw, qT1, CT, and PET.<br>
         <strong>🪓 / ⚡🪓 Subcortical + Tissue:</strong> <em>Subcortical + Tissue</em> (MindMap 24-channel) and <em>⚡🪓 Subcortical + Tissue</em> (MindMap 16-channel) for sub-3s research and clinical T1w parcellation.<br>
         <strong>⅔🧠 Tissue Fractions:</strong> <em>Tissue fraction maps (GM/WM/CSF)</em> for CAT-inspired continuous partial-volume estimation.<br>
-        <strong>🪓🔪 / 🔪 Cortical + Subcortical Parcellation:</strong> <em>Desikan-Killiany Atlas</em> (104-region cortical + subcortical + 5-part corpus callosum) for standard and clinical T1w MRIs; <em>Desikan-Killiany (lesion scans)</em> for large focal lesions; <em>Desikan-Killiany 50</em> for merged bilateral cortical homologues.</p>
+        <strong>🪓🔪 Cortical + Subcortical Parcellation:</strong> <em>Desikan-Killiany Atlas</em> (104-region cortical + subcortical + 5-part corpus callosum) for standard and clinical T1w MRIs; <em>Desikan-Killiany (lesion scans)</em> for large focal lesions; <em>Desikan-Killiany 50</em> for merged bilateral cortical homologues.</p>
         
         <p><em>Note: Models may run slower on limited devices to ensure memory safety.</em></p>
       </div>
@@ -668,9 +676,20 @@ async function main() {
   };
   function applyOverlayOpacity() {
     const opacity = Number(opacitySlider1.value);
-    nv1.volumes.slice(1).forEach((overlay, i) => {
-      overlay.opacity = probabilityOverlays?.[i] === overlay
-        && isolatedProbabilityIndex !== null && i !== isolatedProbabilityIndex ? 0 : opacity;
+    if (catLiteState && nv1.volumes[1] === catLiteState.overlay) {
+      updateCatLiteRgbaOpacity(
+        catLiteState.rgba,
+        catLiteState.activeAlphaOffsets,
+        catLiteState.activeBaseAlpha,
+        opacity
+      );
+      catLiteState.overlay.opacity = opacity;
+      catLiteState.overlay._dataVersion = (catLiteState.overlay._dataVersion || 0) + 1;
+      nv1.updateGLVolume();
+      return;
+    }
+    nv1.volumes.slice(1).forEach((overlay) => {
+      overlay.opacity = opacity;
     });
     nv1.updateGLVolume();
   }
@@ -737,7 +756,8 @@ async function main() {
 
   function removeOverlaysNoRender() {
     isolatedProbabilityIndex = null;
-    probabilityOverlays = null;
+    catLiteState = null;
+    lastFullLabelLut = null;
     while (nv1.model.volumes.length > 1) {
       nv1.model.removeVolume(nv1.model.volumes.length - 1);
     }
@@ -745,6 +765,7 @@ async function main() {
 
   async function closeAllOverlays() {
     removeOverlaysNoRender();
+    resetLabelIsolation();
     updateActiveModelBadge(null);
     await nv1.updateGLVolume();
   }
@@ -755,34 +776,53 @@ async function main() {
       ? nv1.volumes[1] : null;
   }
 
+  function activeCatLiteState() {
+    return (catLiteState && nv1.volumes.length >= 2 && nv1.volumes[1] === catLiteState.overlay)
+      ? catLiteState : null;
+  }
+
   function resetLabelIsolation() {
     isolatedLabel = null;
-    originalSegImg = null;
+    isolatedProbabilityIndex = null;
     isolationStats = null;
     if (hudEl) hudEl.style.display = "none";
   }
 
-  // Isolation works on the label DATA, not the color LUT: non-selected voxels
-  // are set to background (0). We tried hiding others via the LUT (alpha 0)
-  // instead, but niivue's 3D atlas shader anti-aliases each voxel's ALPHA from
-  // its 6 neighbours while keeping each voxel's own RGB — so hidden voxels
-  // touching the kept region borrowed alpha and smeared their color/glow onto
-  // the surface, burying the folds. Zeroing the data makes those voxels true
-  // background: the shader skips them, the T1 shows through the sulci, and the
-  // kept region keeps clean anti-aliased edges. Fully reversible — the pristine
-  // labels are restored from originalSegImg (also used for stats).
+  // Build a fresh colormapLabel object showing ONLY `labelVal`.
+  // Zeroing BOTH RGB and A (not just A) is load-bearing: NiiVue 1.0's label
+  // orient shader writes `texelFetch(colormap, ...)` directly into the baked
+  // non-premultiplied RGBA8 3D texture, and the 3D ray-marcher samples it with
+  // LINEAR filtering. Setting R=G=B=A=0 makes hidden labels bit-identical to
+  // background (0), preventing color bleed while keeping `ov.img` pristine and
+  // avoiding a 16.77M-voxel CPU copy. Assigning a brand-new object invalidates
+  // NiiVue's WeakMap-keyed GPU LUT cache without scanning label centroids.
+  function buildIsolatedLabelLut(fullLut, labelVal) {
+    const lut = new Uint8ClampedArray(fullLut.lut.length); // all 0 -> R=G=B=A=0
+    const idx = labelVal - (fullLut.min ?? 0);
+    if (idx >= 0 && idx * 4 + 3 < fullLut.lut.length) {
+      const off = idx * 4;
+      lut[off] = fullLut.lut[off];
+      lut[off + 1] = fullLut.lut[off + 1];
+      lut[off + 2] = fullLut.lut[off + 2];
+      lut[off + 3] = fullLut.lut[off + 3];
+    }
+    return {
+      lut,
+      min: fullLut.min,
+      max: fullLut.max,
+      ...(fullLut.labels ? { labels: fullLut.labels } : {}),
+    };
+  }
+
   function applyLabelIsolation() {
     const ov = segOverlay();
     if (!ov) return;
-    if (originalSegImg === null) originalSegImg = ov.img; // capture pristine once
+    if (!lastFullLabelLut) lastFullLabelLut = ov.colormapLabel;
     if (isolatedLabel === null) {
-      ov.img = originalSegImg;
+      ov.colormapLabel = lastFullLabelLut;
       isolationStats = null;
     } else {
-      const src = originalSegImg;
-      const out = new src.constructor(src.length);
-      for (let i = 0; i < src.length; i++) out[i] = (src[i] === isolatedLabel) ? isolatedLabel : 0;
-      ov.img = out;
+      ov.colormapLabel = buildIsolatedLabelLut(lastFullLabelLut, isolatedLabel);
       isolationStats = buildIsolationStats(isolatedLabel);
     }
     nv1.updateGLVolume();
@@ -791,14 +831,16 @@ async function main() {
     drawIsolationHUD();
   }
 
-  // Full stats for one label, formatted as lines for the on-screen readout.
+  // Full stats for one discrete label, formatted as lines for the on-screen readout.
   function buildIsolationStats(labelVal) {
     const base = nv1.volumes[0];
-    const seg = originalSegImg || (nv1.volumes[1] && nv1.volumes[1].img);
+    const ov = segOverlay();
+    const seg = ov?.img;
     if (!base || !seg) return null;
     const pd = base.hdr.pixDims || [];
     const voxMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
-    const rows = computeLabelStats(base.img, seg, voxMm3);
+    const dims = ov.hdr.dims.slice(1, 4);
+    const rows = computeLabelStats(base.img, seg, voxMm3, dims);
     const total = rows.reduce((s, r) => s + r.volume_mm3, 0);
     const r = rows.find((x) => x.label === labelVal);
     if (!r) return null;
@@ -818,10 +860,66 @@ async function main() {
     return { lines, color };
   }
 
+  function buildCatLiteIsolationStats(tissueIndex) {
+    const state = activeCatLiteState();
+    const base = nv1.volumes[0];
+    if (!state || !base) return null;
+    const pd = base.hdr.pixDims || [];
+    const voxMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
+    const dims = base.hdr.dims.slice(1, 4);
+    const { rows, icvMm3 } = computeCatLiteStats(base.img, state.maps, voxMm3, dims, state.modelEntry);
+    const r = rows.find((x) => x.tissueIndex === tissueIndex);
+    if (!r) return null;
+    const pct = icvMm3 > 0 ? (r.volume_mm3 / icvMm3) * 100 : 0;
+    const br = (c) => Math.min(255, c * 0.55 + 130) / 255;
+    return {
+      lines: [
+        r.name,
+        `${fmtCm3(r.volume_mm3)} cm3   (${pct.toFixed(1)}% of ICV)`,
+        `${Math.round(r.effectiveVoxels).toLocaleString()} equiv. voxels`,
+        `intensity  ${r.mean.toFixed(0)} +/- ${r.stdev.toFixed(0)}`,
+      ],
+      color: [br(r.tint[0]), br(r.tint[1]), br(r.tint[2]), 1],
+    };
+  }
+
+  function applyProbabilityIsolation() {
+    const state = activeCatLiteState();
+    if (!state) return;
+    const opacity = Number(opacitySlider1.value);
+    const rebuilt = buildCatLiteRgbaComposite(
+      state.maps,
+      state.modelEntry,
+      isolatedProbabilityIndex,
+      opacity,
+      state.rasLayout
+    );
+    state.rgba = rebuilt.rgba;
+    state.activeAlphaOffsets = rebuilt.activeAlphaOffsets;
+    state.activeBaseAlpha = rebuilt.activeBaseAlpha;
+    state.overlay.img = rebuilt.rgba;
+    state.overlay.opacity = opacity;
+    state.overlay._dataVersion = (state.overlay._dataVersion || 0) + 1;
+    isolationStats = isolatedProbabilityIndex === null
+      ? null
+      : buildCatLiteIsolationStats(isolatedProbabilityIndex);
+    nv1.updateGLVolume();
+    drawIsolationHUD();
+  }
+
+  function isolateProbabilityTissue(tissueIndex) {
+    if (!activeCatLiteState()) return;
+    isolatedProbabilityIndex = (tissueIndex === null || tissueIndex === isolatedProbabilityIndex)
+      ? null
+      : tissueIndex;
+    applyProbabilityIsolation();
+  }
+
   // Isolated-region readout, pinned to the top-left of the 3D render tile.
   // niivue 1.0 has no text API (drawText/drawSceneCore are gone; the overlay
   // hook is raw GL/WebGPU), so this is a plain DOM layer over the canvas.
   let hudEl = null;
+  let hudRafPending = false;
   function drawIsolationHUD() {
     if (!hudEl) {
       hudEl = document.createElement("div");
@@ -830,8 +928,10 @@ async function main() {
         "text-shadow:0 1px 2px #000;white-space:pre;color:#ebebeb";
       nv1.canvas.parentElement.appendChild(hudEl);
     }
+    const isActive = (isolatedLabel !== null && !!segOverlay())
+      || (isolatedProbabilityIndex !== null && !!activeCatLiteState());
     const tile = nv1.view?.screenSlices?.find((s) => s.axCorSag === 4 /* RENDER */);
-    if (isolatedLabel === null || !isolationStats || !segOverlay() || !tile) {
+    if (!isActive || !isolationStats || !tile) {
       // niivue.css gives all divs a display value, overriding the hidden attribute.
       hudEl.style.display = "none";
       return;
@@ -847,14 +947,25 @@ async function main() {
     hudEl.style.display = "block";
   }
 
-  // True (pristine) label under the crosshair, even while a region is isolated,
+  // NiiVue's `view.screenSlices` can lag one animation frame after resize or
+  // pane-switch transitions; re-sync the HUD after layout settles.
+  function scheduleIsolationHUDSync() {
+    if (hudRafPending || (isolatedLabel === null && isolatedProbabilityIndex === null)) return;
+    hudRafPending = true;
+    requestAnimationFrame(() => {
+      hudRafPending = false;
+      drawIsolationHUD();
+    });
+  }
+
+  // Pristine label under the crosshair — `ov.img` is never mutated by isolation,
   // so Alt-clicking a different region switches straight to it.
   function labelUnderCursor() {
     const ov = segOverlay();
     if (!ov || !crosshairVox) return null;
     const idx = rasToNativeIndex(ov, crosshairVox);
     if (idx === null) return null;
-    const v = (originalSegImg || ov.img)[idx];
+    const v = ov.img[idx];
     return v === undefined ? null : Math.round(v * ov.hdr.scl_slope + ov.hdr.scl_inter);
   }
 
@@ -871,15 +982,15 @@ async function main() {
   // are in storage order, while locationChange.vox is in RAS order. An all-zero
   // voxel is background and restores the full view.
   function dominantProbabilityOverlay() {
-    if (!probabilityOverlays || !crosshairVox ||
-        probabilityOverlays.some((ov, i) => nv1.volumes[i + 1] !== ov)) return undefined;
+    const state = activeCatLiteState();
+    const base = nv1.volumes[0];
+    if (!state || !base || !crosshairVox) return undefined;
+    const idx = rasToNativeIndex(base, crosshairVox);
+    if (idx === null) return undefined;
     let bestIndex = null;
     let bestValue = 0;
-    for (let i = 0; i < probabilityOverlays.length; i++) {
-      const ov = probabilityOverlays[i];
-      const idx = rasToNativeIndex(ov, crosshairVox);
-      if (idx === null) return undefined;
-      const value = ov.img[idx];
+    for (let i = 0; i < state.maps.length; i++) {
+      const value = state.maps[i][idx];
       if (Number.isFinite(value) && value > bestValue) {
         bestValue = value;
         bestIndex = i;
@@ -894,14 +1005,10 @@ async function main() {
       const lbl = labelUnderCursor();
       if (lbl === null || Number.isNaN(lbl)) return;
       isolateLabel(lbl);
-    } else {
+    } else if (activeCatLiteState()) {
       const selected = dominantProbabilityOverlay();
       if (selected === undefined) return;
-      const next = selected === isolatedProbabilityIndex ? null : selected;
-      if (next !== isolatedProbabilityIndex) {
-        isolatedProbabilityIndex = next;
-        applyOverlayOpacity();
-      }
+      isolateProbabilityTissue(selected);
     }
     e.preventDefault();
   }
@@ -915,6 +1022,7 @@ async function main() {
       await runInferenceChain();
     } finally {
       suppressBackendModals = false;
+      modelProgress.classList.remove("is-busy");
       modelSelect.value = "-1";
       syncModelSelectTooltip();
     }
@@ -1013,24 +1121,38 @@ async function main() {
   // backendSelect.onchange = runSelectedInference; // Removed
 
   // --- Save actions -------------------------------------------------------
-  // Each action performs the pristine-label swap where relevant (isolation is
-  // a view-only state) so exports always contain the full segmentation.
-  async function withPristineLabels(fn) {
-    const ov = segOverlay();
-    const restore = isolatedLabel !== null && ov && originalSegImg;
-    if (restore) ov.img = originalSegImg;
-    try {
-      return await fn();
-    } finally {
-      if (restore) applyLabelIsolation();
+  // Label isolation mutates only `ov.colormapLabel` (never `ov.img`), so all
+  // NIfTI exports always contain the pristine whole-brain segmentation.
+  // CAT-lite displays a single DT_RGBA32 overlay in the viewer, while exports
+  // materialize the 3 pristine Float32 [GM, WM, CSF] probability maps.
+  function getExportOverlays() {
+    const state = activeCatLiteState();
+    if (state) {
+      return state.maps.map((map, idx) =>
+        cloneOverlayVolume(
+          nv1.volumes[0],
+          map,
+          state.tissues[idx].name,
+          {
+            scl_inter: 0,
+            scl_slope: 1,
+            datatypeCode: 16,     // DT_FLOAT32
+            numBitsPerVoxel: 32,
+            cal_min: 0,
+            cal_max: 1,
+            intent_code: 1001,    // NIFTI_INTENT_ESTIMATE
+          }
+        )
+      );
     }
+    return nv1.volumes.slice(1);
   }
 
   function binaryMaskVolume() {
     const overlay = nv1.volumes[1];
     const labels = lastModelEntry?.type === 'Brain_Extraction'
       ? lastBrainMask
-      : (isolatedLabel !== null && originalSegImg ? originalSegImg : overlay.img);
+      : overlay.img;
     if (!labels || labels.length !== overlay.img.length) {
       throw new Error("The segmentation mask is unavailable. Run the model again.");
     }
@@ -1050,29 +1172,27 @@ async function main() {
     // discrete segmentations, none for intensity outputs (e.g. skull-stripped
     // brain). So save it as-is unless FreeSurfer label-ID remapping is requested.
     const fsLut = useFreeSurfer ? buildFreeSurferLut(lastSegLabelNames) : null;
-    const overlays = nv1.volumes.slice(1);
+    const overlays = getExportOverlays();
     // Serial: three concurrent 256³ gzips compete for memory.
-    await withPristineLabels(async () => {
-      for (const overlay of overlays) {
-        const isLabelOverlay = !!overlay.colormapLabel || overlay.hdr.intent_code === 1002;
-        if (fsLut && isLabelOverlay) {
-          const { img: fsImg, maxLabel } = remapLabelsToFreeSurfer(overlay.img, fsLut);
-          const fsVol = cloneOverlayVolume(overlay, fsImg, overlay.name, {
-            datatypeCode: 4,      // DT_INT16 (FreeSurfer cortical IDs reach 2035)
-            numBitsPerVoxel: 16,
-            scl_slope: 1,
-            scl_inter: 0,
-            cal_min: 0,
-            cal_max: maxLabel,
-            intent_code: 1002,    // NIFTI_INTENT_LABEL
-          });
-          await downloadVolume(fsVol, overlayFilename(overlay, overlays.length, "_fs"));
-        } else {
-          await downloadVolume(overlay, overlayFilename(overlay, overlays.length, ""));
-        }
+    for (const overlay of overlays) {
+      const isLabelOverlay = !!overlay.colormapLabel || overlay.hdr.intent_code === 1002;
+      if (fsLut && isLabelOverlay) {
+        const { img: fsImg, maxLabel } = remapLabelsToFreeSurfer(overlay.img, fsLut);
+        const fsVol = cloneOverlayVolume(overlay, fsImg, overlay.name, {
+          datatypeCode: 4,      // DT_INT16 (FreeSurfer cortical IDs reach 2035)
+          numBitsPerVoxel: 16,
+          scl_slope: 1,
+          scl_inter: 0,
+          cal_min: 0,
+          cal_max: maxLabel,
+          intent_code: 1002,    // NIFTI_INTENT_LABEL
+        });
+        await downloadVolume(fsVol, overlayFilename(overlay, overlays.length, "_fs"));
+      } else {
+        await downloadVolume(overlay, overlayFilename(overlay, overlays.length, ""));
       }
-      if (includeMask) await downloadVolume(binaryMaskVolume(), "binary_mask.nii.gz");
-    });
+    }
+    if (includeMask) await downloadVolume(binaryMaskVolume(), "binary_mask.nii.gz");
   }
 
   // Multi-overlay results (CAT-lite GM/WM/CSF) save one file per overlay.
@@ -1087,11 +1207,18 @@ async function main() {
 
   async function saveScene() {
     if (nv1.volumes.length < 1) { window.alert("No image loaded."); return; }
-    await withPristineLabels(async () => { await nv1.saveDocument("brainchop.nvd"); });
+    const ov = segOverlay();
+    const prevLut = isolatedLabel !== null && ov && lastFullLabelLut ? ov.colormapLabel : null;
+    if (prevLut) ov.colormapLabel = lastFullLabelLut;
+    try {
+      await nv1.saveDocument("brainchop.nvd");
+    } finally {
+      if (prevLut && ov) ov.colormapLabel = prevLut;
+    }
   }
 
   // Native-space segmentation: reslice the conformed (256³, 1 mm) labels back
-  // onto the original input grid. See resliceLabelsToNative() for the method.
+  // onto the original input grid inside the postprocess Web Worker.
   async function saveSegmentationNative({ includeMask = false, useFreeSurfer = false } = {}) {
     if (nv1.volumes.length < 2) { window.alert("No segmentation to save (run a model first)."); return; }
     if (!nativeInputNV || !nativeInputNV.hdr || !nativeInputNV.hdr.affine) {
@@ -1099,177 +1226,50 @@ async function main() {
       return;
     }
     const fsLut = useFreeSurfer ? buildFreeSurferLut(lastSegLabelNames) : null;
-    callbackUI("Reslicing to native space…", 0);
-    await new Promise((r) => setTimeout(r, 30)); // let the status paint before the blocking loop
+    callbackUI("Reslicing to native space…", 0.15);
     try {
-      const overlays = nv1.volumes.slice(1);
-      for (const overlay of overlays) {
+      const overlays = getExportOverlays();
+      for (let i = 0; i < overlays.length; i++) {
+        const overlay = overlays[i];
         const isLabelOverlay = !!overlay.colormapLabel || overlay.hdr.intent_code === 1002;
         const activeLut = fsLut && isLabelOverlay ? fsLut : null;
-        const outNV = await withPristineLabels(() => resliceLabelsToNative(overlay, activeLut));
+        const outNV = await resliceLabelsToNative(overlay, activeLut);
         await downloadVolume(outNV, overlayFilename(overlay, overlays.length, activeLut ? "_fs_native" : "_native"));
+        if (overlays.length > 1) {
+          callbackUI("Reslicing to native space…", 0.15 + ((i + 1) / overlays.length) * 0.75);
+        }
       }
       if (includeMask) {
-        const mask = resliceLabelsToNative(binaryMaskVolume());
+        const mask = await resliceLabelsToNative(binaryMaskVolume());
         await downloadVolume(mask, "binary_mask_native.nii.gz");
       }
       callbackUI("Saved native-space segmentation.", 1);
     } catch (e) {
+      callbackUI("", 0);
       console.error("Native-space reslice failed:", e);
       window.alert("Native-space export failed: " + (e && e.message ? e.message : e));
     }
   }
 
-  // Reslice the conformed overlay onto the native input grid.
-  //
-  // For a label map (segmentation): nearest-neighbour with 2× supersampling and
-  // a majority vote per output voxel — crisper categorical boundaries — written
-  // as Int16 tagged NIFTI_INTENT_LABEL (optionally remapped via `labelLut`).
-  // For an intensity output (e.g. skull-stripped brain): plain nearest-neighbour
-  // keeping the native datatype and NOT tagged as a label — it's an image.
-  // For a Float32 probability map (CAT-lite): trilinear, uint8 with scl_slope 1/255.
-  //
-  // The native→conformed voxel map is built by probing both grids' own affines
-  // at four basis points (origin + unit steps), so it is correct for any
-  // orientation without us re-deriving affine conventions. Validated: when the
-  // two grids are identical the map is the identity.
-  function resliceLabelsToNative(seg, labelLut = null) {
-    const labels = seg.img;                    // pristine labels (see withPristineLabels)
-    const A = nativeInputNV.hdr.affine;        // native storage-voxel -> mm (row-major 4x4)
-    const nx = nativeInputNV.hdr.dims[1], ny = nativeInputNV.hdr.dims[2], nz = nativeInputNV.hdr.dims[3];
-    const snx = seg.hdr.dims[1], sny = seg.hdr.dims[2], snz = seg.hdr.dims[3];
-
-    const applyAffine = (a, v) => [
-      a[0][0] * v[0] + a[0][1] * v[1] + a[0][2] * v[2] + a[0][3],
-      a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2] + a[1][3],
-      a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2] + a[2][3],
-    ];
-    // mm -> conformed storage voxel. niivue 1.0's NVImage has no mm2vox, so
-    // invert the overlay's own storage-voxel -> mm affine instead.
-    const segInv = mat4.create();
-    if (!mat4.invert(segInv, mat4.fromValues(...seg.hdr.affine[0], ...seg.hdr.affine[1],
-                                             ...seg.hdr.affine[2], ...seg.hdr.affine[3]))) {
-      throw new Error("Segmentation affine is not invertible");
-    }
-    // gl-matrix is column-major, and fromValues consumed the rows in order, so
-    // segInv is the inverse's transpose — read it back the same way.
-    const applyInv = (m, v) => [
-      m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3],
-      m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7],
-      m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11],
-    ];
-    // native storage voxel -> conformed storage voxel (fractional)
-    const f = (v) => applyInv(segInv, applyAffine(A, v));
-    const o = f([0, 0, 0]);
-    const ex = f([1, 0, 0]).map((x, i) => x - o[i]);
-    const ey = f([0, 1, 0]).map((x, i) => x - o[i]);
-    const ez = f([0, 0, 1]).map((x, i) => x - o[i]);
-
-    // Is this a discrete label map (segmentation) or a continuous intensity
-    // output (e.g. skull-stripped brain from Brain_Extraction/mindgrab)? Label
-    // overlays carry a colormapLabel; intensity ones use a plain colormap.
+  // Reslice the conformed overlay onto the native input grid in a Web Worker.
+  // See reslice-volume.js for exact supersampled majority-vote / trilinear math.
+  async function resliceLabelsToNative(seg, labelLut = null) {
     const isLabel = !!seg.colormapLabel || seg.hdr.intent_code === 1002;
-    const nvox = nx * ny * nz;
-    const outNV = cloneVolume(nativeInputNV);
-    const sample = (x, y, z) =>
-      (x >= 0 && x < snx && y >= 0 && y < sny && z >= 0 && z < snz)
-        ? labels[x + y * snx + z * snx * sny] : 0;
-
-    if (isLabel) {
-      // 2× supersample: 8 offsets at ±0.25 native voxel, in conformed space.
-      const deltas = [];
-      for (const dx of [-0.25, 0.25])
-        for (const dy of [-0.25, 0.25])
-          for (const dz of [-0.25, 0.25])
-            deltas.push([
-              dx * ex[0] + dy * ey[0] + dz * ez[0],
-              dx * ex[1] + dy * ey[1] + dz * ez[1],
-              dx * ex[2] + dy * ey[2] + dz * ez[2],
-            ]);
-      const out = new Int16Array(nvox);
-      const lutLen = labelLut ? labelLut.length : 0;
-      let maxLabel = 0;
-      const tv = new Int32Array(8), tc = new Int32Array(8); // majority tally (≤8 distinct)
-      let idx = 0;
-      for (let k = 0; k < nz; k++) {
-        for (let j = 0; j < ny; j++) {
-          let bx = o[0] + j * ey[0] + k * ez[0];
-          let by = o[1] + j * ey[1] + k * ez[1];
-          let bz = o[2] + j * ey[2] + k * ez[2];
-          for (let i = 0; i < nx; i++) {
-            let nt = 0;
-            for (let s = 0; s < 8; s++) {
-              const lbl = sample(
-                Math.round(bx + deltas[s][0]),
-                Math.round(by + deltas[s][1]),
-                Math.round(bz + deltas[s][2]));
-              let t = -1;
-              for (let q = 0; q < nt; q++) if (tv[q] === lbl) { t = q; break; }
-              if (t < 0) { tv[nt] = lbl; tc[nt] = 1; nt++; } else { tc[t]++; }
-            }
-            let best = tv[0], bc = tc[0];
-            for (let q = 1; q < nt; q++) if (tc[q] > bc) { bc = tc[q]; best = tv[q]; }
-            if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
-            if (best > maxLabel) maxLabel = best;
-            out[idx++] = best;
-            bx += ex[0]; by += ex[1]; bz += ex[2];
-          }
-        }
-      }
-      outNV.hdr.datatypeCode = 4;      // DT_INT16
-      outNV.hdr.numBitsPerVoxel = 16;
-      outNV.hdr.scl_slope = 1;
-      outNV.hdr.scl_inter = 0;
-      outNV.hdr.cal_min = 0;
-      outNV.hdr.cal_max = maxLabel;
-      outNV.hdr.intent_code = 1002;    // NIFTI_INTENT_LABEL
-      outNV.img = out;
-    } else {
-      // Intensity output (skull-stripped brain): plain nearest-neighbour, keep
-      // the native datatype, and do NOT tag as LABEL — this is an image.
-      // Probabilities (0..1 float) would truncate to 0 in the native integer
-      // type: store as uint8 0..255 with scl_slope 1/255 instead.
-      const isProbability = seg.img instanceof Float32Array;
-      const scale = isProbability ? 255 : 1;
-      const round = isProbability ? 0.5 : 0;
-      const out = isProbability ? new Uint8Array(nvox) : outNV.img;
-      out.fill(0);
-      if (isProbability) {
-        Object.assign(outNV.hdr, { datatypeCode: 2, numBitsPerVoxel: 8, cal_min: 0, cal_max: 1 });
-        outNV.img = out;
-      }
-      outNV.hdr.scl_slope = 1 / scale;
-      outNV.hdr.scl_inter = 0;
-      // Partial-volume fractions are continuous: trilinear keeps them smooth
-      // instead of blocky. Integer conformed coordinates are voxel centres.
-      const trilinear = (x, y, z) => {
-        const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
-        const fx = x - x0, fy = y - y0, fz = z - z0;
-        const v000 = sample(x0, y0, z0), v100 = sample(x0 + 1, y0, z0);
-        const v010 = sample(x0, y0 + 1, z0), v110 = sample(x0 + 1, y0 + 1, z0);
-        const v001 = sample(x0, y0, z0 + 1), v101 = sample(x0 + 1, y0, z0 + 1);
-        const v011 = sample(x0, y0 + 1, z0 + 1), v111 = sample(x0 + 1, y0 + 1, z0 + 1);
-        const y0z0 = v000 + fx * (v100 - v000), y1z0 = v010 + fx * (v110 - v010);
-        const y0z1 = v001 + fx * (v101 - v001), y1z1 = v011 + fx * (v111 - v011);
-        const z0v = y0z0 + fy * (y1z0 - y0z0), z1v = y0z1 + fy * (y1z1 - y0z1);
-        return z0v + fz * (z1v - z0v);
-      };
-      const at = isProbability
-        ? trilinear
-        : (x, y, z) => sample(Math.round(x), Math.round(y), Math.round(z));
-      let idx = 0;
-      for (let k = 0; k < nz; k++) {
-        for (let j = 0; j < ny; j++) {
-          let bx = o[0] + j * ey[0] + k * ez[0];
-          let by = o[1] + j * ey[1] + k * ez[1];
-          let bz = o[2] + j * ey[2] + k * ez[2];
-          for (let i = 0; i < nx; i++) {
-            out[idx++] = at(bx, by, bz) * scale + round;
-            bx += ex[0]; by += ex[1]; bz += ex[2];
-          }
-        }
-      }
-    }
+    const isProbability = !isLabel && seg.img instanceof Float32Array;
+    const dstTypedArrayKind = nativeInputNV.img?.constructor?.name || "Uint8Array";
+    const { img, hdrPatch } = await resliceVolumeInWorker({
+      srcImg: seg.img,
+      srcDims: [seg.hdr.dims[1], seg.hdr.dims[2], seg.hdr.dims[3]],
+      srcAffine: seg.hdr.affine,
+      dstDims: [nativeInputNV.hdr.dims[1], nativeInputNV.hdr.dims[2], nativeInputNV.hdr.dims[3]],
+      dstAffine: nativeInputNV.hdr.affine,
+      isLabel,
+      isProbability,
+      dstTypedArrayKind,
+      labelLut,
+    });
+    const outNV = cloneVolume(nativeInputNV, img);
+    Object.assign(outNV.hdr, hdrPatch);
     return outNV;
   }
 
@@ -1392,27 +1392,53 @@ async function main() {
   const saveBtn = document.getElementById("saveBtn");
   if (saveBtn) saveBtn.onclick = openSaveModal;
 
-  // Compute per-label statistics of the input image intensities within each
-  // segmentation label. Single pass builds a 256-bin histogram per label
-  // (the conformed input is Uint8Array, so bins are exact), from which
-  // count/volume/min/max/quartiles/mean/stdev are derived.
-  function computeLabelStats(imgArr, labelArr, voxelVolMm3) {
+  // Compute per-label statistics + 3D storage-voxel centroids of the input
+  // image intensities within each segmentation label. Single pass builds a
+  // 256-bin histogram per label (conformed input is Uint8Array, so bins are
+  // exact), deriving count/volume/min/max/quartiles/mean/stdev/centroidVox.
+  function computeLabelStats(imgArr, labelArr, voxelVolMm3, dims = [256, 256, 256]) {
     const HIST = 256;
-    const stats = new Map(); // labelValue -> { count, sum, sumSq, hist }
+    const stats = new Map(); // labelValue -> { count, sum, sumSq, sumX, sumY, sumZ, hist }
+    const [nx, ny, nz] = dims;
     const n = labelArr.length;
-    for (let i = 0; i < n; i++) {
-      const lbl = labelArr[i];
-      if (lbl === 0) continue; // skip background
-      let s = stats.get(lbl);
-      if (!s) {
-        s = { count: 0, sum: 0, sumSq: 0, hist: new Float64Array(HIST) };
-        stats.set(lbl, s);
+    if (nx * ny * nz === n) {
+      let i = 0;
+      for (let z = 0; z < nz; z++) {
+        for (let y = 0; y < ny; y++) {
+          for (let x = 0; x < nx; x++, i++) {
+            const lbl = labelArr[i];
+            if (lbl === 0) continue; // skip background
+            let s = stats.get(lbl);
+            if (!s) {
+              s = { count: 0, sum: 0, sumSq: 0, sumX: 0, sumY: 0, sumZ: 0, hist: new Float64Array(HIST) };
+              stats.set(lbl, s);
+            }
+            const v = imgArr[i];
+            s.count++;
+            s.sum += v;
+            s.sumSq += v * v;
+            s.sumX += x;
+            s.sumY += y;
+            s.sumZ += z;
+            s.hist[v]++;
+          }
+        }
       }
-      const v = imgArr[i];
-      s.count++;
-      s.sum += v;
-      s.sumSq += v * v;
-      s.hist[v]++;
+    } else {
+      for (let i = 0; i < n; i++) {
+        const lbl = labelArr[i];
+        if (lbl === 0) continue;
+        let s = stats.get(lbl);
+        if (!s) {
+          s = { count: 0, sum: 0, sumSq: 0, sumX: 0, sumY: 0, sumZ: 0, hist: new Float64Array(HIST) };
+          stats.set(lbl, s);
+        }
+        const v = imgArr[i];
+        s.count++;
+        s.sum += v;
+        s.sumSq += v * v;
+        s.hist[v]++;
+      }
     }
 
     const quantileFromHist = (hist, count, p) => {
@@ -1444,10 +1470,91 @@ async function main() {
         q3: quantileFromHist(s.hist, s.count, 0.75),
         mean,
         stdev: Math.sqrt(variance),
+        centroidVox: [s.sumX / s.count, s.sumY / s.count, s.sumZ / s.count],
       });
     }
     return rows;
   }
+
+  // Jump the 2D/3D crosshair directly to a region's anatomical centroid.
+  // Storage-voxel coordinates map to world mm via `vol.hdr.affine` (never
+  // `matRAS`, because `vol.img` is in storage order). For C-shaped or bilateral
+  // structures whose arithmetic mean falls outside the structure itself, snap
+  // to the closest actual in-region voxel on click so the crosshair always
+  // lands inside the chosen structure.
+  function jumpToRegionCentroid(row, { vol, labelArr = null, probMap = null } = {}) {
+    if (!row?.centroidVox || !vol?.hdr?.affine) return;
+    const [nx, ny, nz] = vol.hdr.dims.slice(1, 4);
+    let [vx, vy, vz] = row.centroidVox;
+    const rx = Math.max(0, Math.min(nx - 1, Math.round(vx)));
+    const ry = Math.max(0, Math.min(ny - 1, Math.round(vy)));
+    const rz = Math.max(0, Math.min(nz - 1, Math.round(vz)));
+    const centerIdx = rx + ry * nx + rz * nx * ny;
+
+    if (labelArr && labelArr[centerIdx] !== row.label) {
+      let bestDist = Infinity;
+      let bx = rx, by = ry, bz = rz;
+      let idx = 0;
+      for (let z = 0; z < nz; z++) {
+        const dz = z - vz;
+        const dz2 = dz * dz;
+        for (let y = 0; y < ny; y++) {
+          const dy = y - vy;
+          const dyz2 = dy * dy + dz2;
+          for (let x = 0; x < nx; x++, idx++) {
+            if (labelArr[idx] !== row.label) continue;
+            const dx = x - vx;
+            const d2 = dx * dx + dyz2;
+            if (d2 < bestDist) {
+              bestDist = d2;
+              bx = x; by = y; bz = z;
+            }
+          }
+        }
+      }
+      if (Number.isFinite(bestDist)) {
+        vx = bx; vy = by; vz = bz;
+      }
+    } else if (probMap && !(probMap[centerIdx] >= 0.5)) {
+      let bestDist = Infinity;
+      let bx = rx, by = ry, bz = rz;
+      let idx = 0;
+      for (let z = 0; z < nz; z++) {
+        const dz = z - vz;
+        const dz2 = dz * dz;
+        for (let y = 0; y < ny; y++) {
+          const dy = y - vy;
+          const dyz2 = dy * dy + dz2;
+          for (let x = 0; x < nx; x++, idx++) {
+            if (!(probMap[idx] >= 0.5)) continue;
+            const dx = x - vx;
+            const d2 = dx * dx + dyz2;
+            if (d2 < bestDist) {
+              bestDist = d2;
+              bx = x; by = y; bz = z;
+            }
+          }
+        }
+      }
+      if (Number.isFinite(bestDist)) {
+        vx = bx; vy = by; vz = bz;
+      }
+    }
+
+    const A = vol.hdr.affine;
+    const mm = [
+      A[0][0] * vx + A[0][1] * vy + A[0][2] * vz + A[0][3],
+      A[1][0] * vx + A[1][1] * vy + A[1][2] * vz + A[1][3],
+      A[2][0] * vx + A[2][1] * vy + A[2][2] * vz + A[2][3],
+    ];
+    nv1.setCrosshairPos(mm);
+  }
+
+  const STAT_LOCATE_ICON =
+    '<svg viewBox="0 0 24 24" aria-hidden="true">' +
+    '<circle cx="12" cy="12" r="5.5"/>' +
+    '<path d="M12 2.5v4M12 17.5v4M2.5 12h4M17.5 12h4"/>' +
+    '</svg>';
 
   function buildStatsCsv(rows, fsLut = null) {
     const header = fsLut
@@ -1466,38 +1573,60 @@ async function main() {
     return lines.join("\n") + "\n";
   }
 
-  function downloadCsv(rows, fsLut = null) {
-    const blob = new Blob([buildStatsCsv(rows, fsLut)], { type: "text/csv" });
+  function downloadCsvText(csvText, filename = "mask_stats.csv") {
+    const blob = new Blob([csvText], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "mask_stats.csv";
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
   }
 
+  function downloadCsv(rows, fsLut = null) {
+    downloadCsvText(buildStatsCsv(rows, fsLut), "mask_stats.csv");
+  }
+
   const fmtCm3 = (mm3) => { const v = mm3 / 1000; return v >= 10 ? Math.round(v).toLocaleString() : v.toFixed(1); };
 
-  function buildStatsPanelHtml(rows, totalMm3, fsLut = null) {
+  function buildStatsPanelHtml(rows, totalMm3, fsLut = null, { isCatLiteMode = false } = {}) {
     const maxVol = Math.max(...rows.map((r) => r.volume_mm3));
-    const colorOf = (r) => (lastSegColors && lastSegColors.R && lastSegColors.R[r.label] != null)
-      ? `rgb(${lastSegColors.R[r.label]},${lastSegColors.G[r.label]},${lastSegColors.B[r.label]})`
-      : "#6b9bd1";
+    const colorOf = (r) => {
+      if (r.colorCss) return r.colorCss;
+      return (lastSegColors && lastSegColors.R && lastSegColors.R[r.label] != null)
+        ? `rgb(${lastSegColors.R[r.label]},${lastSegColors.G[r.label]},${lastSegColors.B[r.label]})`
+        : "#6b9bd1";
+    };
+    const canIsolate = isCatLiteMode || !!segOverlay();
     let body = "";
     for (const r of rows) {
       const pct = totalMm3 > 0 ? (r.volume_mm3 / totalMm3) * 100 : 0;
       const wAbs = maxVol > 0 ? (r.volume_mm3 / maxVol) * 100 : 0;
-      const isIso = isolatedLabel === r.label;
-      const fsId = fsLut && r.label < fsLut.length ? fsLut[r.label] : null;
+      const isIso = isCatLiteMode
+        ? isolatedProbabilityIndex === r.tissueIndex
+        : isolatedLabel === r.label;
+      const fsId = !isCatLiteMode && fsLut && r.label < fsLut.length ? fsLut[r.label] : null;
       const val = `<span class="stat-val" data-cm3="${fmtCm3(r.volume_mm3)}" data-pct="${pct.toFixed(1)}%">${fmtCm3(r.volume_mm3)}</span>`;
       const bar = `<span class="stat-bar" style="width:${wAbs.toFixed(2)}%;background:${colorOf(r)}" data-w-abs="${wAbs.toFixed(2)}" data-w-pct="${pct.toFixed(2)}"></span>`;
       const cell = (k, v) => `<div class="stat-kv"><span class="k">${k}</span><span class="v">${v}</span></div>`;
-      const detail = cell("min", r.min) + cell("max", r.max)
-        + cell("Q1", r.q1) + cell("Q3", r.q3)
-        + cell("median", r.median) + cell("mean", r.mean.toFixed(2))
-        + cell("SD", r.stdev.toFixed(2)) + cell("voxels", r.voxels.toLocaleString());
+      const detail = isCatLiteMode
+        ? cell("% ICV", `${pct.toFixed(1)}%`) + cell("cm³", fmtCm3(r.volume_mm3))
+          + cell("mean", r.mean.toFixed(2)) + cell("SD", r.stdev.toFixed(2))
+          + cell("min", r.min) + cell("max", r.max)
+          + cell("equiv. vox", Math.round(r.effectiveVoxels).toLocaleString())
+          + cell("support", r.supportVoxels.toLocaleString())
+        : cell("min", r.min) + cell("max", r.max)
+          + cell("Q1", r.q1) + cell("Q3", r.q3)
+          + cell("median", r.median) + cell("mean", r.mean.toFixed(2))
+          + cell("SD", r.stdev.toFixed(2)) + cell("voxels", r.voxels.toLocaleString());
+      const idChip = isCatLiteMode
+        ? `<span class="stat-id-chip">${escapeHtml(r.tissueKey.toUpperCase())}</span>`
+        : `<span class="stat-id-chip">ID ${r.label}</span>`;
+      const isoBtnHtml = canIsolate
+        ? `<button type="button" class="stat-iso${isIso ? " active" : ""}" aria-pressed="${isIso}" aria-label="${isIso ? "Isolated" : "Isolate"} ${escapeHtml(r.name)}">${isIso ? "isolated" : "isolate"}</button>`
+        : "";
       body += `
         <div class="stat-row${isIso ? " is-isolated" : ""}" data-label="${r.label}" data-name="${escapeHtml(r.name.toLowerCase())}">
           <div class="stat-line">
@@ -1508,13 +1637,16 @@ async function main() {
               <span class="stat-track" aria-hidden="true">${bar}</span>
               ${val}
             </button>
-            <button type="button" class="stat-iso${isIso ? " active" : ""}" aria-pressed="${isIso}" aria-label="Isolate ${escapeHtml(r.name)}">${isIso ? "isolated" : "isolate"}</button>
+            <span class="stat-actions">
+              <button type="button" class="stat-locate" aria-label="Locate ${escapeHtml(r.name)}" title="Jump crosshair to ${escapeHtml(r.name)}">${STAT_LOCATE_ICON}</button>
+              ${isoBtnHtml}
+            </span>
           </div>
           <div class="stat-detail" hidden>
             <div class="stat-detail-meta">
               <span class="stat-detail-fullname">${escapeHtml(r.name)}</span>
               <span class="stat-detail-badges">
-                <span class="stat-id-chip">ID ${r.label}</span>
+                ${idChip}
                 ${fsId ? `<span class="save-badge">FS ${fsId}</span>` : ""}
               </span>
             </div>
@@ -1522,7 +1654,9 @@ async function main() {
           </div>
         </div>`;
     }
-    const regionWord = rows.length === 1 ? "region" : "regions";
+    const unitNoun = isCatLiteMode ? (rows.length === 1 ? "tissue" : "tissues") : (rows.length === 1 ? "region" : "regions");
+    const totalSuffix = isCatLiteMode ? " cm³ ICV" : " cm³";
+    const pctLabel = isCatLiteMode ? "% of ICV" : "% of total";
     const searchHtml = rows.length > 8
       ? `<search class="stat-search">
            <input type="search" id="statsFilterInput" class="stat-filter" placeholder="Filter regions…" aria-label="Filter regions" autocorrect="off" autocapitalize="none" spellcheck="false">
@@ -1533,9 +1667,9 @@ async function main() {
         <div class="stat-toolbar">
           <div class="stat-toggle" role="group" aria-label="Volume display unit">
             <button type="button" data-mode="cm3" class="active" aria-pressed="true">cm³</button>
-            <button type="button" data-mode="pct" aria-pressed="false">% of total</button>
+            <button type="button" data-mode="pct" aria-pressed="false">${pctLabel}</button>
           </div>
-          <span class="stat-total" id="statsUnitLabel">${rows.length} ${regionWord} &middot; ${fmtCm3(totalMm3)} cm³</span>
+          <span class="stat-total" id="statsUnitLabel">${rows.length} ${unitNoun} &middot; ${fmtCm3(totalMm3)}${totalSuffix}</span>
           ${searchHtml}
         </div>
         <div id="statsRows">
@@ -1543,7 +1677,7 @@ async function main() {
           <p id="statsEmpty" class="stat-empty" hidden>No matching regions</p>
         </div>
         <div class="stat-footer">
-          <span class="stat-footer-hint">Select a row for intensity stats &middot; Isolate solos in 3D</span>
+          <span class="stat-footer-hint">Select a row for stats &middot; Crosshair jumps &middot; Isolate solos in 3D</span>
           <button type="button" id="statsDownloadBtn" class="stat-csv-btn">
             ${SAVE_ICONS.arrow}
             <span>Download CSV</span>
@@ -1557,34 +1691,62 @@ async function main() {
       showModal("Region volumes", "<p>No segmentation to measure — run a model first.</p>");
       return;
     }
-    // Each distinct float would become its own label (and 256-bin histogram).
-    if (nv1.volumes[1].img instanceof Float32Array) {
-      showModal("Region volumes", "<p>Region statistics require a discrete label segmentation, not continuous probability maps.</p>");
-      return;
-    }
+
     const imgArr = nv1.volumes[0].img;   // conformed input intensities
-    // Use pristine labels so region stats stay whole-brain even while isolated.
-    const labelArr = originalSegImg || nv1.volumes[1].img; // segmentation labels
-    if (!imgArr || !labelArr || imgArr.length !== labelArr.length) {
-      showModal("Region volumes", "<p>Input and segmentation grids do not match.</p>");
-      return;
-    }
     const pd = nv1.volumes[0].hdr.pixDims || [];
     const voxelVolMm3 = (pd[1] && pd[2] && pd[3]) ? pd[1] * pd[2] * pd[3] : 1;
+    const catState = activeCatLiteState();
 
-    let rows = computeLabelStats(imgArr, labelArr, voxelVolMm3);
-    if (rows.length === 0) {
-      showModal("Region volumes", "<p>No non-background labels found in the segmentation.</p>");
+    let rows;
+    let totalMm3;
+    let fsLut = null;
+    let isCatLiteMode = false;
+    let labelArr = null;
+    const overlayVol = nv1.volumes[1];
+
+    if (catState) {
+      isCatLiteMode = true;
+      const dims = nv1.volumes[0].hdr.dims.slice(1, 4);
+      const computed = computeCatLiteStats(imgArr, catState.maps, voxelVolMm3, dims, catState.modelEntry);
+      rows = computed.rows;
+      totalMm3 = computed.icvMm3;
+      if (rows.length === 0) {
+        showModal("Tissue volumes", "<p>No non-zero tissue fractions found.</p>");
+        return;
+      }
+      // Keep canonical GM / WM / CSF order or largest first? Largest-first matches
+      // the bar-chart visual hierarchy used by every other model.
+      rows = rows.slice().sort((a, b) => b.volume_mm3 - a.volume_mm3);
+    } else if (overlayVol.img instanceof Float32Array) {
+      showModal("Region volumes", "<p>Region statistics require a discrete label segmentation or CAT-lite GM/WM/CSF tissue maps.</p>");
       return;
+    } else {
+      labelArr = overlayVol.img; // always pristine with LUT-based isolation
+      if (!imgArr || !labelArr || imgArr.length !== labelArr.length) {
+        showModal("Region volumes", "<p>Input and segmentation grids do not match.</p>");
+        return;
+      }
+      const dims = overlayVol.hdr.dims.slice(1, 4);
+      rows = computeLabelStats(imgArr, labelArr, voxelVolMm3, dims);
+      if (rows.length === 0) {
+        showModal("Region volumes", "<p>No non-background labels found in the segmentation.</p>");
+        return;
+      }
+      // Largest region first, matching the reference panel layout.
+      rows = rows.slice().sort((a, b) => b.volume_mm3 - a.volume_mm3);
+      totalMm3 = rows.reduce((s, r) => s + r.volume_mm3, 0);
+      fsLut = lastModelEntry && lastModelEntry.type !== "Brain_Extraction"
+        ? buildFreeSurferLut(lastSegLabelNames)
+        : null;
     }
-    // Largest region first, matching the reference panel layout.
-    rows = rows.slice().sort((a, b) => b.volume_mm3 - a.volume_mm3);
-    const totalMm3 = rows.reduce((s, r) => s + r.volume_mm3, 0);
-    const fsLut = lastModelEntry && lastModelEntry.type !== "Brain_Extraction"
-      ? buildFreeSurferLut(lastSegLabelNames)
-      : null;
 
-    showModal("Region volumes", buildStatsPanelHtml(rows, totalMm3, fsLut), { hideClose: true, statsMode: true });
+    const rowByLabel = new Map(rows.map((r) => [r.label, r]));
+    const modalTitle = isCatLiteMode ? "Tissue volumes" : "Region volumes";
+    showModal(
+      modalTitle,
+      buildStatsPanelHtml(rows, totalMm3, fsLut, { isCatLiteMode }),
+      { hideClose: true, statsMode: true }
+    );
 
     // Wire up interactivity (innerHTML strips <script>, so attach handlers here).
     const panel = document.getElementById("statsPanel");
@@ -1592,13 +1754,16 @@ async function main() {
 
     let currentMode = "cm3";
     let visibleCount = rows.length;
+    const unitNoun = isCatLiteMode ? (rows.length === 1 ? "tissue" : "tissues") : (rows.length === 1 ? "region" : "regions");
     const updateUnitSummary = () => {
       const unitEl = document.getElementById("statsUnitLabel");
       if (!unitEl) return;
       const countText = visibleCount === rows.length
-        ? `${rows.length} ${rows.length === 1 ? "region" : "regions"}`
-        : `${visibleCount} of ${rows.length} regions`;
-      const totalText = currentMode === "pct" ? "100% of volume" : `${fmtCm3(totalMm3)} cm³`;
+        ? `${rows.length} ${unitNoun}`
+        : `${visibleCount} of ${rows.length} ${unitNoun}`;
+      const totalText = currentMode === "pct"
+        ? (isCatLiteMode ? "100% of ICV" : "100% of volume")
+        : `${fmtCm3(totalMm3)}${isCatLiteMode ? " cm³ ICV" : " cm³"}`;
       unitEl.innerHTML = `${countText} &middot; ${totalText}`;
     };
 
@@ -1657,18 +1822,47 @@ async function main() {
       };
     });
 
-    // Per-row "isolate": show only that region in the viewer and close the
-    // dialog so it's visible.
-    panel.querySelectorAll(".stat-iso").forEach((btn) => {
+    // Per-row "Locate": jump the 2D/3D crosshair straight to the region's centroid.
+    panel.querySelectorAll(".stat-locate").forEach((btn) => {
       btn.onclick = () => {
         const labelVal = parseInt(btn.closest(".stat-row").dataset.label, 10);
-        if (!Number.isNaN(labelVal)) isolateLabel(labelVal);
+        const row = rowByLabel.get(labelVal);
+        if (row) {
+          jumpToRegionCentroid(row, {
+            vol: isCatLiteMode ? nv1.volumes[0] : overlayVol,
+            labelArr: isCatLiteMode ? null : labelArr,
+            probMap: isCatLiteMode ? catState.maps[row.tissueIndex] : null,
+          });
+        }
         const dlg = document.getElementById("appDialog");
         if (dlg && dlg.open) dlg.close();
       };
     });
 
-    document.getElementById("statsDownloadBtn").onclick = () => downloadCsv(rows, fsLut);
+    // Per-row "isolate": show only that region/tissue in the viewer and close
+    // the dialog so it's visible.
+    panel.querySelectorAll(".stat-iso").forEach((btn) => {
+      btn.onclick = () => {
+        const labelVal = parseInt(btn.closest(".stat-row").dataset.label, 10);
+        if (!Number.isNaN(labelVal)) {
+          if (isCatLiteMode) {
+            isolateProbabilityTissue(labelVal);
+          } else {
+            isolateLabel(labelVal);
+          }
+        }
+        const dlg = document.getElementById("appDialog");
+        if (dlg && dlg.open) dlg.close();
+      };
+    });
+
+    document.getElementById("statsDownloadBtn").onclick = () => {
+      if (isCatLiteMode) {
+        downloadCsvText(buildCatLiteStatsCsv(rows, totalMm3), "tissue_stats.csv");
+      } else {
+        downloadCsv(rows, fsLut);
+      }
+    };
   };
 
   function doLoadImage() {
@@ -1771,14 +1965,87 @@ async function main() {
     lastBrainMask = modelEntry.type === 'Brain_Extraction' ? brainMask || null : null;
     updateActiveModelBadge(modelEntry);
     if (modelEntry.outputType === 'probability') {
-      // CAT-lite passes [GM, WM, CSF]; other probability models a single map.
+      // CAT-lite passes [GM, WM, CSF]: display as a single DT_RGBA32 composite
+      // overlay (1×64 MiB GPU texture, ~10× faster opacity drag, zero readPixels
+      // stall) while retaining the 3 pristine Float32 maps for Save, Stats, and
+      // Alt-click tissue isolation.
       const maps = Array.isArray(img) ? img : [img];
-      const overlays = [];
-      for (let i = 0; i < maps.length; i++) {
-        overlays.push(await addProbabilityOverlay(maps[i], modelEntry, modelEntry.probabilityTissues?.[i]));
-      }
-      if (modelEntry.probabilityPostprocess === 'cat-lite' && overlays.length === 3) {
-        probabilityOverlays = overlays;
+      if (modelEntry.probabilityPostprocess === 'cat-lite' && maps.length === 3) {
+        const base = nv1.volumes[0];
+        const floatMaps = maps.map((m) => (m instanceof Float32Array ? m : Float32Array.from(m)));
+        const opacity = Number(opacitySlider1.value);
+        const rasLayout = (base.dimsRAS && base.img2RASstart && base.img2RASstep)
+          ? {
+              dimsRAS: [...base.dimsRAS],
+              img2RASstart: [...base.img2RASstart],
+              img2RASstep: [...base.img2RASstep],
+            }
+          : null;
+        const comp = buildCatLiteRgbaComposite(floatMaps, modelEntry, null, opacity, rasLayout);
+        const rasVolOverrides = comp.isRasOrdered
+          ? {
+              dims: [...rasLayout.dimsRAS],
+              permRAS: [1, 2, 3],
+              img2RASstart: [0, 0, 0],
+              img2RASstep: [1, rasLayout.dimsRAS[1], rasLayout.dimsRAS[1] * rasLayout.dimsRAS[2]],
+            }
+          : {};
+        const rasHdrOverrides = comp.isRasOrdered
+          ? {
+              dims: [3, rasLayout.dimsRAS[1], rasLayout.dimsRAS[2], rasLayout.dimsRAS[3], 1, 1, 1, 1],
+              ...(base.matRAS && base.matRAS.length >= 16
+                ? {
+                    affine: [
+                      [base.matRAS[0], base.matRAS[4], base.matRAS[8], base.matRAS[12]],
+                      [base.matRAS[1], base.matRAS[5], base.matRAS[9], base.matRAS[13]],
+                      [base.matRAS[2], base.matRAS[6], base.matRAS[10], base.matRAS[14]],
+                      [base.matRAS[3], base.matRAS[7], base.matRAS[11], base.matRAS[15]],
+                    ],
+                  }
+                : {}),
+            }
+          : {};
+        const overlayVolume = cloneOverlayVolume(
+          base,
+          comp.rgba,
+          "cat_lite_tissues",
+          {
+            ...rasHdrOverrides,
+            scl_inter: 0,
+            scl_slope: 1,
+            datatypeCode: 2304,     // DT_RGBA32
+            numBitsPerVoxel: 32,
+            cal_min: 0,
+            cal_max: 255,
+            intent_code: 1001,      // NIFTI_INTENT_ESTIMATE
+          },
+          {
+            ...rasVolOverrides,
+            calMin: 0,
+            calMax: 255,
+            robustMin: 0,
+            robustMax: 255,
+            globalMin: 0,
+            globalMax: 255,
+            opacity,
+          }
+        );
+        await nv1.model.addVolume(overlayVolume);
+        const addedOverlay = nv1.volumes.at(-1);
+        catLiteState = {
+          maps: floatMaps,
+          tissues: comp.tissues,
+          modelEntry,
+          rasLayout: comp.isRasOrdered ? rasLayout : null,
+          rgba: comp.rgba,
+          activeAlphaOffsets: comp.activeAlphaOffsets,
+          activeBaseAlpha: comp.activeBaseAlpha,
+          overlay: addedOverlay,
+        };
+      } else {
+        for (let i = 0; i < maps.length; i++) {
+          await addProbabilityOverlay(maps[i], modelEntry, modelEntry.probabilityTissues?.[i]);
+        }
       }
       syncModelUnderlayOpacityNoRender(modelEntry);
       await nv1.updateGLVolume();
@@ -1865,6 +2132,7 @@ async function main() {
     if (colormapLabel && addedSeg && !addedSeg.colormapLabel) {
       addedSeg.colormapLabel = colormapLabel;
     }
+    lastFullLabelLut = colormapLabel ? addedSeg.colormapLabel : null;
     syncModelUnderlayOpacityNoRender(modelEntry);
     await nv1.updateGLVolume();
   }
@@ -1906,12 +2174,14 @@ async function main() {
       if (locEl) locEl.innerHTML = formatStatusSegments(message);
     }
     if (isNaN(progressFrac)) {
+      modelProgress.classList.remove("is-busy");
       const memstatusItem = document.getElementById("memstatusItem");
       if (memstatusItem) memstatusItem.hidden = false;
       memstatus.style.color = "#ef4444";
       memstatus.textContent = "Memory Issue";
     } else if (progressFrac >= 0) {
       modelProgress.value = progressFrac * modelProgress.max;
+      modelProgress.classList.toggle("is-busy", progressFrac > 0 && progressFrac < 1);
     }
     if (modalMessage) {
       if (suppressBackendModals) {
@@ -1931,10 +2201,27 @@ async function main() {
 
   function handleLocationChange(data) {
     crosshairVox = data.vox;
-    document.getElementById("location").innerHTML = data.string
+    const segments = data.string
       .split("   ")
       .map((value) => value.trim())
-      .filter((value) => value !== "")
+      .filter((value) => value !== "");
+    const state = activeCatLiteState();
+    const base = nv1.volumes[0];
+    if (state && base && crosshairVox) {
+      // NiiVue appends a dummy scalar readout ("0" / RGBA byte) for the
+      // DT_RGBA32 display overlay; replace it with live GM/WM/CSF fractions.
+      if (segments.length > 1) segments.pop();
+      const idx = rasToNativeIndex(base, crosshairVox);
+      if (idx !== null) {
+        const gm = state.maps[0][idx] || 0;
+        const wm = state.maps[1][idx] || 0;
+        const csf = state.maps[2][idx] || 0;
+        if (gm + wm + csf >= 0.005) {
+          segments.push(`GM ${gm.toFixed(2)} WM ${wm.toFixed(2)} CSF ${csf.toFixed(2)}`);
+        }
+      }
+    }
+    document.getElementById("location").innerHTML = segments
       .map((value) => `<span class="loc-seg">${escapeHtml(value)}</span>`)
       .join('<span class="loc-sep">&middot;</span>');
   }
@@ -1990,7 +2277,7 @@ async function main() {
       applyLabelIsolation();
     } else if (isolatedProbabilityIndex !== null) {
       isolatedProbabilityIndex = null;
-      applyOverlayOpacity();
+      applyProbabilityIsolation();
     }
   });
 
@@ -2005,9 +2292,13 @@ async function main() {
   const _origDrawScene = nv1.drawScene.bind(nv1);
   nv1.drawScene = function (needsSync) {
     const r = _origDrawScene(needsSync);
-    try { drawIsolationHUD(); } catch (e) { console.warn("isolation HUD draw failed", e); }
+    try {
+      drawIsolationHUD();
+      scheduleIsolationHUDSync();
+    } catch (e) { console.warn("isolation HUD draw failed", e); }
     return r;
   };
+  window.addEventListener("resize", scheduleIsolationHUDSync);
   // Left button: navigate, always. This is what 0.62 did for every toolbar
   // selection -- its dragMode never touched the left button at all.
   nv1.primaryDragMode = DRAG_MODE.crosshair;
@@ -2132,11 +2423,48 @@ function showModal(title, message, opts = {}) {
   dialog.showModal();
 }
 
+const STAR_CACHE_KEY = "brainchop:gh-stars:v1";
+const STAR_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
 async function updateStarCount() {
+  const starEl = document.getElementById("star-count");
+  if (!starEl) return;
+
+  // Paint cached star count immediately (eliminating "0" flash) and skip the
+  // unauthenticated GitHub API call (60 req/hr limit) while cache is fresh.
+  let cached = null;
+  try {
+    const raw = window.localStorage?.getItem(STAR_CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.count === "number" && Number.isFinite(parsed.count)) {
+        cached = parsed;
+        starEl.textContent = String(parsed.count);
+      }
+    }
+  } catch {
+    // private browsing / disabled storage — proceed to live fetch
+  }
+
+  if (cached && typeof cached.ts === "number" && Date.now() - cached.ts < STAR_CACHE_TTL_MS) {
+    return;
+  }
+
   try {
     const response = await fetch("https://api.github.com/repos/neuroneural/brainchop");
+    if (!response.ok) return;
     const data = await response.json();
-    document.getElementById("star-count").textContent = data.stargazers_count;
+    if (typeof data?.stargazers_count === "number" && Number.isFinite(data.stargazers_count)) {
+      starEl.textContent = String(data.stargazers_count);
+      try {
+        window.localStorage?.setItem(
+          STAR_CACHE_KEY,
+          JSON.stringify({ count: data.stargazers_count, ts: Date.now() })
+        );
+      } catch {
+        // ignore quota / private-mode write errors
+      }
+    }
   } catch (error) {
     console.error("Error fetching star count:", error);
   }
