@@ -198,7 +198,7 @@ let backendAttemptMessages = [];
 // ?inference=webgpu is an explicit test override for checking future WebKit builds.
 const IS_SAFARI = /Safari/.test(navigator.userAgent) && !/Chrome|Chromium|CriOS|FxiOS|Edg|Android/.test(navigator.userAgent);
 const SAFARI_LEGACY_WEBGPU_GATE = IS_SAFARI && new URLSearchParams(window.location.search).get('inference') !== 'webgpu';
-const FORCE_WEBGL2_TESTING = false;
+const FORCE_WEBGL2_TESTING = new URLSearchParams(window.location.search).get('inference') === 'webgl2';
 
 // The NATIVE WebGL2 runner (webgl2_runners/) handles WebGL2 fallback without tfjs.
 // The import stays DYNAMIC so WebGPU users never fetch the WebGL2 worker chunk.
@@ -668,32 +668,75 @@ async function main() {
     });
   };
 
-  // updateGLVolume already coalesces: one call in flight, newest pending value
-  // re-runs on completion. A drag never queues a backlog of stale redraws.
+  // Background opacity is a live 2D/3D shader uniform in NiiVue 1.0 (never
+  // baked into volumeTexture), so BG dragging needs only drawScene() (~1 ms)
+  // rather than a full updateGLVolume() rebuild.
   opacitySlider0.oninput = () => {
-    if (nv1.volumes[0]) nv1.volumes[0].opacity = Number(opacitySlider0.value);
-    nv1.updateGLVolume();
+    if (!nv1.volumes[0]) return;
+    nv1.volumes[0].opacity = Number(opacitySlider0.value);
+    nv1.drawScene();
   };
+
+  // Overlay opacity & LUT isolation skip rebuilding volumes[0] and its
+  // 512-pass 3D Sobel gradient texture:
+  //   - Scalar/label non-zero->non-zero opacity: updateVolumeAffineOnly() re-runs
+  //     only the overlay orient pass on the resident GPU texture.
+  //   - CAT-lite DT_RGBA32 or 0<->non-zero toggles: updateVolumeData(1) scopes
+  //     the GPU update strictly to volumes[1], never touching volumes[0].
+  let prevOverlayOpacity = Number(opacitySlider1.value);
+  let overlayOpacityRaf = 0;
+
+  function refreshOverlayOnly({ dataChanged = false, allowAffineFastPath = true } = {}) {
+    if (nv1.volumes.length < 2) return nv1.updateGLVolume();
+    const ov = nv1.volumes[1];
+    const opacity = ov.opacity ?? 1;
+    const toggledVisibility = (prevOverlayOpacity === 0) !== (opacity === 0);
+    prevOverlayOpacity = opacity;
+
+    if (
+      allowAffineFastPath &&
+      !dataChanged &&
+      !toggledVisibility &&
+      opacity > 0 &&
+      nv1.volumes.length === 2 &&
+      typeof nv1.updateVolumeAffineOnly === "function"
+    ) {
+      return nv1.updateVolumeAffineOnly();
+    }
+    if (nv1.volumes.length === 2 && typeof nv1.updateVolumeData === "function") {
+      return nv1.updateVolumeData(1);
+    }
+    return nv1.updateGLVolume();
+  }
+
   function applyOverlayOpacity() {
     const opacity = Number(opacitySlider1.value);
     if (catLiteState && nv1.volumes[1] === catLiteState.overlay) {
-      updateCatLiteRgbaOpacity(
-        catLiteState.rgba,
-        catLiteState.activeAlphaOffsets,
-        catLiteState.activeBaseAlpha,
-        opacity
-      );
+      if (opacity > 0) {
+        updateCatLiteRgbaOpacity(
+          catLiteState.rgba,
+          catLiteState.activeAlphaOffsets,
+          catLiteState.activeBaseAlpha,
+          opacity
+        );
+      }
       catLiteState.overlay.opacity = opacity;
-      catLiteState.overlay._dataVersion = (catLiteState.overlay._dataVersion || 0) + 1;
-      nv1.updateGLVolume();
+      refreshOverlayOnly({ dataChanged: true, allowAffineFastPath: false });
       return;
     }
     nv1.volumes.slice(1).forEach((overlay) => {
       overlay.opacity = opacity;
     });
-    nv1.updateGLVolume();
+    refreshOverlayOnly({ dataChanged: false, allowAffineFastPath: true });
   }
-  opacitySlider1.oninput = applyOverlayOpacity;
+
+  opacitySlider1.oninput = () => {
+    if (overlayOpacityRaf) return;
+    overlayOpacityRaf = requestAnimationFrame(() => {
+      overlayOpacityRaf = 0;
+      applyOverlayOpacity();
+    });
+  };
 
   function syncModelUnderlayOpacityNoRender(modelEntry = null) {
     const underlayOpacity = modelEntry?.probabilityUnderlayOpacity;
@@ -825,7 +868,7 @@ async function main() {
       ov.colormapLabel = buildIsolatedLabelLut(lastFullLabelLut, isolatedLabel);
       isolationStats = buildIsolationStats(isolatedLabel);
     }
-    nv1.updateGLVolume();
+    refreshOverlayOnly({ dataChanged: false, allowAffineFastPath: true });
     // The readout is a DOM layer, so update it when the isolation state changes.
     // updateGLVolume can finish without going through our drawScene hook.
     drawIsolationHUD();
@@ -899,11 +942,10 @@ async function main() {
     state.activeBaseAlpha = rebuilt.activeBaseAlpha;
     state.overlay.img = rebuilt.rgba;
     state.overlay.opacity = opacity;
-    state.overlay._dataVersion = (state.overlay._dataVersion || 0) + 1;
     isolationStats = isolatedProbabilityIndex === null
       ? null
       : buildCatLiteIsolationStats(isolatedProbabilityIndex);
-    nv1.updateGLVolume();
+    refreshOverlayOnly({ dataChanged: true, allowAffineFastPath: false });
     drawIsolationHUD();
   }
 
@@ -2048,6 +2090,7 @@ async function main() {
         }
       }
       syncModelUnderlayOpacityNoRender(modelEntry);
+      prevOverlayOpacity = Number(opacitySlider1.value);
       await nv1.updateGLVolume();
       return;
     }
@@ -2134,6 +2177,7 @@ async function main() {
     }
     lastFullLabelLut = colormapLabel ? addedSeg.colormapLabel : null;
     syncModelUnderlayOpacityNoRender(modelEntry);
+    prevOverlayOpacity = Number(opacitySlider1.value);
     await nv1.updateGLVolume();
   }
 
@@ -2205,6 +2249,7 @@ async function main() {
       .split("   ")
       .map((value) => value.trim())
       .filter((value) => value !== "");
+    let tissueHtml = "";
     const state = activeCatLiteState();
     const base = nv1.volumes[0];
     if (state && base && crosshairVox) {
@@ -2217,13 +2262,18 @@ async function main() {
         const wm = state.maps[1][idx] || 0;
         const csf = state.maps[2][idx] || 0;
         if (gm + wm + csf >= 0.005) {
-          segments.push(`GM ${gm.toFixed(2)} WM ${wm.toFixed(2)} CSF ${csf.toFixed(2)}`);
+          tissueHtml =
+            '<span class="loc-seg loc-tissues">' +
+            `<span class="loc-k">GM</span> <span class="loc-v">${gm.toFixed(2)}</span> ` +
+            `<span class="loc-k">WM</span> <span class="loc-v">${wm.toFixed(2)}</span> ` +
+            `<span class="loc-k">CSF</span> <span class="loc-v">${csf.toFixed(2)}</span>` +
+            "</span>";
         }
       }
     }
-    document.getElementById("location").innerHTML = segments
-      .map((value) => `<span class="loc-seg">${escapeHtml(value)}</span>`)
-      .join('<span class="loc-sep">&middot;</span>');
+    const htmlParts = segments.map((value) => `<span class="loc-seg">${escapeHtml(value)}</span>`);
+    if (tissueHtml) htmlParts.push(tissueHtml);
+    document.getElementById("location").innerHTML = htmlParts.join('<span class="loc-sep">&middot;</span>');
   }
 
   // Keep WebGL2 as the proven default while comparing NiiVue's WebGPU renderer.
@@ -2473,4 +2523,16 @@ async function updateStarCount() {
 (async function () {
   await main();
   await updateStarCount();
+  if (import.meta.env.PROD && "serviceWorker" in navigator) {
+    const registerSw = () => {
+      navigator.serviceWorker.register("./sw.js", { scope: "./" }).catch((err) => {
+        console.warn("[PWA] Service Worker registration failed:", err);
+      });
+    };
+    if (document.readyState === "complete") {
+      registerSw();
+    } else {
+      window.addEventListener("load", registerSw, { once: true });
+    }
+  }
 })();

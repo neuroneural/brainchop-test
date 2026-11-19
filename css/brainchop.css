@@ -417,6 +417,23 @@ footer {
   font-weight: 600;
 }
 
+/* CAT-lite tissue fractions: dim the GM/WM/CSF labels so the numbers stand out */
+#location .loc-tissues .loc-k {
+  color: #7c8591;
+  font-size: 0.88em;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+#location .loc-tissues .loc-v {
+  color: #f2f4f7;
+  font-weight: 600;
+}
+
+#location .loc-tissues .loc-v:not(:last-child) {
+  margin-inline-end: 0.65em;
+}
+
 /* Right: status cluster — never shrinks */
 .footer-status {
   display: flex;

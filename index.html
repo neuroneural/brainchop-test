@@ -4,15 +4,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#1e2024" />
 
-  <!-- DNS prefetch for external resources -->
-  <link rel="dns-prefetch" href="//cdnjs.cloudflare.com" />
-
-  <!-- Preconnect to external domains -->
-  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin />
-
-  <!-- Favicon -->
+  <!-- PWA manifest & icons -->
+  <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="icon" type="image/x-icon" href="favicon.ico" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
 
   <!-- Preload critical CSS -->
   <link rel="preload" href="./niivue.css" as="style" />
