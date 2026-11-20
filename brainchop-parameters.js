@@ -85,7 +85,7 @@ const inferenceModelsList = [
       'Omnimodal skull stripping (MindGrab) delivering high-accuracy brain extraction across T1, T2, FLAIR, DWI, EPI, MRA, PDw, qT1, CT, and PET via the 8-bit V4 WebGPU engine (80 MiB mobile / 160 MiB desktop max buffer) or native WebGL2.'
   },
   {
-    // Primary 24-channel Subcortical + Tissue model (MindMap v3.5 Unified).
+    // Primary 24-channel Subcortical + Tissue model (MindMap-18 v4.0 Gold).
     id: 21,
     type: 'Atlas',
     path: '/models/model24chan18cls_gdice_prio/model.json',
@@ -120,7 +120,7 @@ const inferenceModelsList = [
       "Runs via the 8-bit V4 WebGPU engine (120–240 MiB max buffer) or native WebGL2.",
     inferenceDelay: 100,
     description:
-      'Primary T1w brain parcellation into 17 regions (gray and white matter plus subcortical structures) via a 24-channel gridding-free MeshNet (MindMap v3.5 Unified: sharp sulci, intact occipital ribbon, and clinical slice/noise/bias robustness), accelerated by the 8-bit V4 WebGPU engine (120 MiB mobile / 240 MiB desktop max buffer).'
+      'Primary T1w brain parcellation into 17 regions (gray and white matter plus subcortical structures) via a 24-channel gridding-free MeshNet (MindMap-18 v4.0: sharp sulci, clinical atrophy sensitivity, and slice/noise/bias robustness), accelerated by the 8-bit V4 WebGPU engine (120 MiB mobile / 240 MiB desktop max buffer).'
   },
   {
     // CAT-inspired experiment. The runner returns grouped GM, WM and CSF priors.
@@ -190,8 +190,8 @@ const inferenceModelsList = [
       'CAT-inspired GM/WM/CSF partial-volume estimate. The 24-channel model supplies joint GM/WM/CSF priors; normalized T1 intensity, a coarse local bias estimate, spatial regularization, and explicit GM-CSF/GM-WM mixture classes produce continuous GM, WM and CSF fractions. Experimental and not a CAT12 result.'
   },
   {
-    // Primary 104-class DK-atlas model (MindSnap): best overall T1-weighted
-    // 104-class cortical + subcortical parcellation with zero runtime parameter overhead.
+    // Primary 104-class DK-atlas model (MindSnap-104 v4.0 Gold): best overall T1-weighted
+    // 104-class cortical + subcortical parcellation with clinical atrophy sensitivity and zero runtime overhead.
     id: 5,
     type: 'Atlas',
     path: '/models/model24chan104cls_v3_repbn/model.json',
@@ -226,12 +226,12 @@ const inferenceModelsList = [
       "Runs via the 8-bit V4 WebGPU engine (120–240 MiB max buffer) or native WebGL2.",
     inferenceDelay: 100,
     description:
-      'Primary 104-region Desikan-Killiany atlas parcellation (cortical + subcortical + 5-part corpus callosum) for research and clinical T1-weighted MRI, running via the 8-bit V4 WebGPU engine (~3.0s on M1, 120 MiB mobile / 240 MiB desktop max buffer) or native WebGL2.'
+      'Primary 104-region Desikan-Killiany atlas parcellation (cortical + subcortical + 5-part corpus callosum) for research and clinical T1-weighted MRI (MindSnap-104 v4.0: sharp sulci, clinical atrophy sensitivity, spotless CSF/cerebellum), running via the 8-bit V4 WebGPU engine (~3.0s on M1, 120 MiB mobile / 240 MiB desktop max buffer) or native WebGL2.'
   },
   {
-    // Primary 50-class bilateral Desikan-Killiany model (MindSnap-50 v3.5):
+    // Primary 50-class bilateral Desikan-Killiany model (MindSnap-50 v4.0 Gold):
     // 24-channel gridding-free MeshNet (GroupNorm + GELU, RF=255) with built-in
-    // full-head skull stripping and lossless 8-bit V4 WebGPU / native WebGL2 support.
+    // full-head skull stripping, clinical atrophy sensitivity, and lossless 8-bit V4 WebGPU / native WebGL2 support.
     id: 4,
     type: 'Atlas',
     path: '/models/model24chan50cls/model.json',
@@ -266,7 +266,7 @@ const inferenceModelsList = [
       "Runs via the 8-bit V4 WebGPU engine (120–240 MiB max buffer) or native WebGL2.",
     inferenceDelay: 100,
     description:
-      'Bilateral 50-region Desikan-Killiany cortical + subcortical + corpus callosum parcellation with built-in skull stripping (MindSnap-50 v3.5), running via the 8-bit V4 WebGPU engine (~3.0s on M1, 120 MiB mobile / 240 MiB desktop max buffer) or native WebGL2.'
+      'Bilateral 50-region Desikan-Killiany cortical + subcortical + corpus callosum parcellation with built-in skull stripping (MindSnap-50 v4.0: sharp sulci and clinical atrophy sensitivity), running via the 8-bit V4 WebGPU engine (~3.0s on M1, 120 MiB mobile / 240 MiB desktop max buffer) or native WebGL2.'
   },
   {
     id: 6,

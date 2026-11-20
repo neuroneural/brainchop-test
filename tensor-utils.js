@@ -393,7 +393,7 @@ export async function processSegmentationVolume(
     const bwStartTime = performance.now();
     const BWInstance = new BWLabeler();
 
-    const FILL_NEIGHBOR_DEFAULT_IDS = [5, 14, 15, 58, 59, 60, 598, 608];
+    const FILL_NEIGHBOR_DEFAULT_IDS = [3, 5, 8, 9, 14, 15, 21, 38, 58, 59, 60, 218, 598, 608];
     const relabelSuppressed =
       !!opts.fillSuppressedWithNeighborLabel || FILL_NEIGHBOR_DEFAULT_IDS.includes(modelEntry.id);
 
