@@ -1,9 +1,9 @@
 // Standalone unit tests for reslice-volume.js:
-//   - Adaptive center-anchored odd-count majority vote for categorical labels
+//   - Adaptive center-outward midpoint-pair majority vote (n = 1, 4, 6, 8)
 //   - Bit-exact floor(v + 0.5) rounding (matching brainchopC conform.c)
-//   - Zero directional bias & exact reflection symmetry on 2 mm anisotropic grids
-//   - Full symmetric slice coverage on 3 mm, 5 mm, and 7 mm thick-slice grids
-//   - Center-anchored tie breaking, OOB background votes, FreeSurfer LUT & hdrPatch
+//   - Zero directional bias at BOTH integer (C) and half-integer (C + 0.5) centers
+//     for 2 mm, 3 mm, 5 mm, and 7 mm anisotropic scans (incl. odd-dim scans)
+//   - Center-outward tie breaking, OOB background votes, FreeSurfer LUT & hdrPatch
 //   - Unchanged probability (trilinear) and intensity (nearest-neighbor) paths
 //
 // Run: node tests/reslice-volume.mjs
@@ -27,8 +27,8 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. 1 mm identity, 1.5 mm fast path, +0.5 shift, and negative half-integer
-//    exact floor(v + 0.5) rounding
+// 1. 1 mm identity, 1.5 mm fast path (n = 1), +0.5 shift, and negative
+//    half-integer exact floor(v + 0.5) rounding
 // ---------------------------------------------------------------------------
 {
   const dims = [5, 5, 5];
@@ -81,7 +81,6 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     dstAffine: makeDiagAffine(1, 1, 1, -0.25, 0, 0),
     isLabel: true,
   });
-  // bx = -0.25, 0.75, 1.75 -> floor(bx + 0.5) = 0, 1, 2
   assert.deepEqual(Array.from(resNegQuarter.img), [10, 20, 30]);
 
   const resNegHalf = resliceVolumeData({
@@ -92,7 +91,6 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     dstAffine: makeDiagAffine(1, 1, 1, -0.5, 0, 0),
     isLabel: true,
   });
-  // bx = -0.5, 0.5, 1.5 -> floor(bx + 0.5) = 0, 1, 2 (C floor(-0.5 + 0.5) == 0)
   assert.deepEqual(Array.from(resNegHalf.img), [10, 20, 30]);
 
   const resNegPastHalf = resliceVolumeData({
@@ -103,19 +101,18 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     dstAffine: makeDiagAffine(1, 1, 1, -0.5001, 0, 0),
     isLabel: true,
   });
-  // bx = -0.5001, 0.4999, 1.4999 -> floor(bx + 0.5) = -1 (OOB->0), 0, 1
   assert.deepEqual(Array.from(resNegPastHalf.img), [0, 10, 20]);
 }
 
 // ---------------------------------------------------------------------------
-// 2. 2 mm anisotropic grid (ey = +2.0 and ey = -2.0, integer conformed centers):
-//    ZERO directional shift & exact reflection symmetry
+// 2. 2 mm anisotropic grid (n = 4, offsets ±0.125, ±0.375):
+//    ZERO directional shift & symmetry at BOTH integer C and half-integer C+0.5
 // ---------------------------------------------------------------------------
 {
   const sny = 21; // y = 0..20, center at y = 10
-  const ny = 11;  // native j = 0..10 maps to conformed y = 0, 2, 4, ..., 20
+  const ny = 11;  // native j = 0..10 maps to conformed y = 0, 2, ..., 20
 
-  // 2a. Symmetric block centered at y = 10 (y in [6..14]) -> zero centroid shift
+  // 2a. Integer centers C: probes {C, C, C-1, C+1} -> zero centroid shift
   //     for both ey = +2.0 and ey = -2.0.
   const symSrc = new Uint8Array(sny);
   for (let y = 6; y <= 14; y++) symSrc[y] = 4;
@@ -136,13 +133,10 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     dstAffine: makeDiagAffine(1, -2, 1, 0, 20, 0),
     isLabel: true,
   });
-  // j = 3 (y=6: {5,6,7} -> 0,4,4 -> 4) .. j = 7 (y=14: {13,14,15} -> 4,4,0 -> 4)
-  // j = 2 (y=4: {3,4,5} -> 0,0,0 -> 0), j = 8 (y=16: {15,16,17} -> 0,0,0 -> 0)
   const expectedSym = [0, 0, 0, 4, 4, 4, 4, 4, 0, 0, 0];
   assert.deepEqual(Array.from(pos2.img), expectedSym);
   assert.deepEqual(Array.from(neg2.img), expectedSym);
 
-  // Check exact center of mass = 10.0 mm (zero bias).
   let sumMm = 0;
   let count = 0;
   for (let j = 0; j < ny; j++) {
@@ -154,7 +148,6 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
   assert.equal(sumMm / count, 10.0);
 
   // 2b. Narrow symmetric 3-voxel slab around y = 10 ([9, 10, 11] = 7):
-  //     only j = 5 (y = 10) gets 7; neighbors j = 4 ({7,8,9}) and j = 6 ({11,12,13}) get 0.
   const narrow = new Uint8Array(sny);
   narrow[9] = 7;
   narrow[10] = 7;
@@ -170,7 +163,7 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
   assert.deepEqual(Array.from(resNarrow.img), [0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0]);
 
   // 2c. Exact reflection symmetry across an arbitrary multi-label volume
-  //     (including 3-way ties!) for BOTH ey = +2.0 and ey = -2.0.
+  //     for BOTH ey = +2.0 and ey = -2.0 at integer centers C.
   const randSrc = new Uint8Array(sny);
   let seed = 1337;
   for (let y = 0; y < sny; y++) {
@@ -206,69 +199,135 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
 
   assert.deepEqual(Array.from(revFwd), Array.from(fwd).reverse());
   assert.deepEqual(Array.from(negDir), Array.from(fwd).reverse());
+
+  // 2d. Half-integer centers C + 0.5 (y = 0.5, 2.5, ..., 20.5, exact center 10.5):
+  //     probes {C, C+1, C, C+1} — exact 50/50 split, zero half-integers, zero shift.
+  const halfSrc = new Uint8Array(22);
+  for (let y = 8; y <= 13; y++) halfSrc[y] = 4; // 6 voxels centered at 10.5
+  const res2Half = resliceVolumeData({
+    srcImg: halfSrc,
+    srcDims: [1, 22, 1],
+    srcAffine: ID_AFFINE,
+    dstDims: [1, 11, 1],
+    dstAffine: makeDiagAffine(1, 2, 1, 0, 0.5, 0),
+    isLabel: true,
+  });
+  assert.deepEqual(Array.from(res2Half.img), [0, 0, 0, 0, 4, 4, 4, 0, 0, 0, 0]);
+  let sumHalfMm = 0;
+  let cntHalf = 0;
+  for (let j = 0; j < 11; j++) {
+    if (res2Half.img[j] === 4) {
+      sumHalfMm += 0.5 + 2 * j;
+      cntHalf++;
+    }
+  }
+  assert.equal(sumHalfMm / cntHalf, 10.5);
 }
 
 // ---------------------------------------------------------------------------
-// 3. Equal-count 3-way ties on 2 mm and 3 mm ([7, 2, 9] -> center label 2)
+// 3. 3 mm anisotropic grid (n = 4, offsets ±0.125, ±0.375):
+//    Integer centers C ({C, C, C-1, C+1}) AND odd-dim half-integer C + 0.5
+//    ({C, C+1, C-1, C+2}) — zero +0.5 shift!
 // ---------------------------------------------------------------------------
 {
-  const srcTie = Uint8Array.from([0, 7, 2, 9, 0]); // center at index 2 -> [7, 2, 9]
-  const srcTieRev = Uint8Array.from([0, 9, 2, 7, 0]);
-
+  // 3a. Integer center C (z = 1, probes {1, 1, 0, 2}):
+  //     center label gets 2 votes & appears first; 3-way ties & 2-vs-2 center ties pick center.
   for (const step of [2, -2, 3, -3]) {
-    for (const vol of [srcTie, srcTieRev]) {
-      const resY = resliceVolumeData({
-        srcImg: vol,
-        srcDims: [1, 5, 1],
+    for (const [triplet, expected] of [
+      [[4, 4, 9], 4],
+      [[9, 4, 4], 4],
+      [[4, 9, 4], 9],
+      [[7, 2, 9], 2],
+      [[9, 2, 7], 2],
+    ]) {
+      const res = resliceVolumeData({
+        srcImg: Uint8Array.from(triplet),
+        srcDims: [1, 1, 3],
         srcAffine: ID_AFFINE,
         dstDims: [1, 1, 1],
-        dstAffine: makeDiagAffine(1, step, 1, 0, 2, 0),
+        dstAffine: makeDiagAffine(1, 1, step, 0, 0, 1),
         isLabel: true,
       });
       assert.equal(
-        resY.img[0],
-        2,
-        `3-way tie on step=${step} must pick center label 2, got ${resY.img[0]}`
+        res.img[0],
+        expected,
+        `step=${step} integer center [${triplet}] -> expected ${expected}, got ${res.img[0]}`
       );
     }
+  }
+
+  // 3b. Odd-dimension 3 mm half-integer center C + 0.5 (c0 = 1.5, probes {1, 2, 0, 3}):
+  //     - [8, 2, 3, 8] -> 8 proves BOTH z=0 (C-1) and z=3 (C+2) are sampled!
+  //       (Odd-3 shifted +0.5 here, skipped z=0, and returned 3.)
+  //     - [9, 2, 2, 9] -> 2 (centermost pair {1, 2} beats outer {0, 3} on 2-vs-2 tie)
+  //     - [1, 2, 3, 4] -> 2 (centermost probe -0.125 -> C wins 4-way tie)
+  for (const [quad, expected] of [
+    [[8, 2, 3, 8], 8],
+    [[8, 8, 8, 1], 8],
+    [[1, 8, 8, 8], 8],
+    [[8, 1, 8, 8], 8],
+    [[8, 8, 1, 8], 8],
+    [[9, 2, 2, 9], 2],
+    [[1, 2, 3, 4], 2],
+  ]) {
+    const res = resliceVolumeData({
+      srcImg: Uint8Array.from(quad),
+      srcDims: [1, 1, 4],
+      srcAffine: ID_AFFINE,
+      dstDims: [1, 1, 1],
+      dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 1.5),
+      isLabel: true,
+    });
+    assert.equal(
+      res.img[0],
+      expected,
+      `3 mm half-integer c0=1.5 [${quad}] -> expected ${expected}, got ${res.img[0]}`
+    );
+  }
+
+  // 3c. Odd-dim 3 mm slab centered at 13.5 (nz = 9, z(k) = 1.5 + 3k):
+  //     zero centroid shift for both 4-voxel [12..15] and 8-voxel [10..17] slabs.
+  for (const [lo, hi, expected] of [
+    [12, 15, [0, 0, 0, 0, 4, 0, 0, 0, 0]],
+    [10, 17, [0, 0, 0, 4, 4, 4, 0, 0, 0]],
+  ]) {
+    const slab = new Uint8Array(30);
+    for (let z = lo; z <= hi; z++) slab[z] = 4;
+    const res = resliceVolumeData({
+      srcImg: slab,
+      srcDims: [1, 1, 30],
+      srcAffine: ID_AFFINE,
+      dstDims: [1, 1, 9],
+      dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 1.5),
+      isLabel: true,
+    });
+    assert.deepEqual(Array.from(res.img), expected);
+    let sMm = 0;
+    let cnt = 0;
+    for (let k = 0; k < 9; k++) {
+      if (res.img[k] === 4) {
+        sMm += 1.5 + 3 * k;
+        cnt++;
+      }
+    }
+    assert.equal(sMm / cnt, 13.5, `3 mm odd-dim slab [${lo}..${hi}] must have exact 13.5 mm centroid`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// 4. 3 mm, 5 mm, and 7 mm anisotropic grids: center slice included and
-//    all 3 / 5 / 7 sub-slices covered symmetrically
+// 4. 5 mm anisotropic grid (n = 6, offsets ±0.5/6, ±1.5/6, ±2.5/6):
+//    Integer centers C ({C, C, C-1, C+1, C-2, C+2}) AND odd-dim half-integer
+//    C + 0.5 ({C, C+1, C-1, C+2, C-2, C+3}) — zero +0.5 shift!
 // ---------------------------------------------------------------------------
 {
-  // 4a. 3 mm (n = 3, offsets [0, -1/3, +1/3] -> {C-1, C, C+1}):
-  //     Every pair of 2 matching labels beats the 3rd regardless of position.
-  for (const [triplet, expected] of [
-    [[4, 4, 9], 4],
-    [[9, 4, 4], 4],
-    [[4, 9, 4], 4],
-    [[7, 2, 9], 2],
-  ]) {
-    const res = resliceVolumeData({
-      srcImg: Uint8Array.from(triplet),
-      srcDims: [1, 1, 3],
-      srcAffine: ID_AFFINE,
-      dstDims: [1, 1, 1],
-      dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 1),
-      isLabel: true,
-    });
-    assert.equal(res.img[0], expected, `3 mm triplet [${triplet}] -> expected ${expected}`);
-  }
-
-  // 4b. 5 mm (n = 5, offsets [0, -1/5, +1/5, -2/5, +2/5] -> {C-2, C-1, C, C+1, C+2}):
-  //     - Outer + center [8, 1, 8, 1, 8] -> 8 (3 vs 2; proves center & outer ±2 are hit)
-  //     - Outer-only majority [8, 2, 3, 4, 8] -> 8 (2 vs 1,1,1; proves BOTH ±2 are hit)
-  //     - 5-way tie [11, 12, 13, 14, 15] -> 13 (center wins)
-  //     - Inner-vs-outer tie [11, 12, 13, 12, 11] -> 12 (closer-to-center ±1/5 beats ±2/5)
+  // 4a. Integer center C = 2 (probes {2, 2, 1, 3, 0, 4}):
   for (const [quint, expected] of [
-    [[8, 1, 8, 1, 8], 8],
-    [[8, 2, 3, 4, 8], 8],
-    [[11, 12, 13, 14, 15], 13],
-    [[11, 12, 13, 12, 11], 12],
-    [[1, 9, 9, 9, 1], 9],
+    [[8, 1, 8, 1, 8], 8],      // 4 vs 2
+    [[8, 8, 3, 4, 8], 8],      // 3 vs 2 (proves both outer C-2 and C+2 are hit)
+    [[8, 2, 3, 4, 8], 3],      // center 3 gets 2 votes & appears first, beats outer 8 (2-vs-2)
+    [[11, 12, 13, 14, 15], 13],// center 13 gets 2 votes vs 1 each
+    [[11, 12, 13, 12, 11], 13],// 2-vs-2-vs-2 tie -> center 13 wins
+    [[1, 9, 9, 9, 1], 9],      // 4 vs 2
   ]) {
     const res = resliceVolumeData({
       srcImg: Uint8Array.from(quint),
@@ -278,15 +337,76 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
       dstAffine: makeDiagAffine(1, 1, 5, 0, 0, 2),
       isLabel: true,
     });
-    assert.equal(res.img[0], expected, `5 mm quint [${quint}] -> expected ${expected}`);
+    assert.equal(res.img[0], expected, `5 mm integer center [${quint}] -> expected ${expected}`);
   }
 
-  // 4c. 7 mm (n = 7, offsets [0, ±1/7, ±2/7, ±3/7] -> {C-3..C+3}):
-  //     - Outer-only [9, 2, 3, 4, 5, 6, 9] -> 9 (proves ±3 are hit)
-  //     - 7-way tie [1, 2, 3, 4, 5, 6, 7] -> 4 (center wins)
+  // 4b. Odd-dimension 5 mm half-integer center C + 0.5 (c0 = 2.5, probes {2, 3, 1, 4, 0, 5}):
+  //     - [8, 2, 3, 4, 5, 8] -> 8 proves BOTH z=0 (C-2) and z=5 (C+3) are sampled!
+  //       (Odd-5 shifted +0.5 here, skipped z=0, and returned 3.)
+  //     - [1, 9, 2, 2, 9, 1] -> 2 (centermost pair {2, 3} wins 2-vs-2-vs-2 tie)
+  //     - [11, 12, 13, 14, 15, 16] -> 13 (centermost probe -0.5/6 -> C wins 6-way tie)
+  for (const [sext, expected] of [
+    [[8, 2, 3, 4, 5, 8], 8],
+    [[8, 8, 8, 8, 1, 1], 8],
+    [[1, 1, 8, 8, 8, 8], 8],
+    [[9, 9, 2, 2, 9, 9], 9],
+    [[1, 9, 2, 2, 9, 1], 2],
+    [[11, 12, 13, 14, 15, 16], 13],
+  ]) {
+    const res = resliceVolumeData({
+      srcImg: Uint8Array.from(sext),
+      srcDims: [1, 1, 6],
+      srcAffine: ID_AFFINE,
+      dstDims: [1, 1, 1],
+      dstAffine: makeDiagAffine(1, 1, 5, 0, 0, 2.5),
+      isLabel: true,
+    });
+    assert.equal(
+      res.img[0],
+      expected,
+      `5 mm half-integer c0=2.5 [${sext}] -> expected ${expected}, got ${res.img[0]}`
+    );
+  }
+
+  // 4c. Odd-dim 5 mm slabs centered at 17.5 (nz = 7, z(k) = 2.5 + 5k):
+  //     zero centroid shift for 6-voxel [15..20], 12-voxel [12..23], and 16-voxel [10..25] slabs.
+  for (const [lo, hi, expected] of [
+    [15, 20, [0, 0, 0, 4, 0, 0, 0]],
+    [12, 23, [0, 0, 4, 4, 4, 0, 0]],
+    [10, 25, [0, 0, 4, 4, 4, 0, 0]],
+  ]) {
+    const slab = new Uint8Array(35);
+    for (let z = lo; z <= hi; z++) slab[z] = 4;
+    const res = resliceVolumeData({
+      srcImg: slab,
+      srcDims: [1, 1, 35],
+      srcAffine: ID_AFFINE,
+      dstDims: [1, 1, 7],
+      dstAffine: makeDiagAffine(1, 1, 5, 0, 0, 2.5),
+      isLabel: true,
+    });
+    assert.deepEqual(Array.from(res.img), expected);
+    let sMm = 0;
+    let cnt = 0;
+    for (let k = 0; k < 7; k++) {
+      if (res.img[k] === 4) {
+        sMm += 2.5 + 5 * k;
+        cnt++;
+      }
+    }
+    assert.equal(sMm / cnt, 17.5, `5 mm odd-dim slab [${lo}..${hi}] must have exact 17.5 mm centroid`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. 7 mm anisotropic grid (n = 8, offsets ±0.0625, ±0.1875, ±0.3125, ±0.4375),
+//    multi-axis anisotropic (96 taps & max 512 taps), and oblique/rotated axes
+// ---------------------------------------------------------------------------
+{
+  // 5a. 7 mm integer center C = 3 (probes {3, 3, 2, 4, 1, 5, 0, 6}):
   for (const [sept, expected] of [
-    [[9, 2, 3, 4, 5, 6, 9], 9],
-    [[1, 2, 3, 4, 5, 6, 7], 4],
+    [[9, 9, 3, 4, 5, 6, 9], 9], // 3 vs 2 for center 4 -> proves outer ±3 are hit
+    [[1, 2, 3, 4, 5, 6, 7], 4], // center 4 gets 2 votes vs 1 each
   ]) {
     const res = resliceVolumeData({
       srcImg: Uint8Array.from(sept),
@@ -296,99 +416,106 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
       dstAffine: makeDiagAffine(1, 1, 7, 0, 0, 3),
       isLabel: true,
     });
-    assert.equal(res.img[0], expected, `7 mm sept [${sept}] -> expected ${expected}`);
+    assert.equal(res.img[0], expected, `7 mm integer center [${sept}] -> expected ${expected}`);
   }
 
-  // 4d. Multi-axis anisotropic (2 x 2 x 5 mm => 3 * 3 * 5 = 45 taps, > 8):
-  //     Ensure dynamic Int32Array(nDeltas) tally handles 45 taps cleanly.
-  const src45 = new Uint8Array(3 * 3 * 5);
-  src45.fill(3);
-  // Set 23 voxels to label 11 (> half of 45)
-  for (let i = 0; i < 23; i++) src45[i] = 11;
-  const res45 = resliceVolumeData({
-    srcImg: src45,
-    srcDims: [3, 3, 5],
+  // 5b. 7 mm half-integer center C + 0.5 = 3.5 (probes {3, 4, 2, 5, 1, 6, 0, 7}):
+  for (const [oct, expected] of [
+    [[9, 2, 3, 4, 5, 6, 7, 9], 9], // 2 vs 1 each -> proves BOTH z=0 (C-3) and z=7 (C+4) are hit
+    [[9, 1, 2, 8, 8, 3, 4, 9], 8], // centermost pair {3, 4} beats outer {0, 7} on 2-vs-2 tie
+    [[1, 2, 3, 4, 5, 6, 7, 8], 4], // centermost probe -0.0625 -> C wins 8-way tie
+  ]) {
+    const res = resliceVolumeData({
+      srcImg: Uint8Array.from(oct),
+      srcDims: [1, 1, 8],
+      srcAffine: ID_AFFINE,
+      dstDims: [1, 1, 1],
+      dstAffine: makeDiagAffine(1, 1, 7, 0, 0, 3.5),
+      isLabel: true,
+    });
+    assert.equal(res.img[0], expected, `7 mm half-integer c0=3.5 [${oct}] -> expected ${expected}`);
+  }
+
+  // 5c. Multi-axis anisotropic (3 x 3 x 5 mm => 4 * 4 * 6 = 96 taps at half-integer center):
+  //     Every one of the 96 voxels in [0..3] x [0..3] x [0..5] is sampled once.
+  const src96 = new Uint8Array(4 * 4 * 6);
+  src96.fill(3);
+  for (let i = 0; i < 49; i++) src96[i] = 11; // 49 > 47
+  const res96 = resliceVolumeData({
+    srcImg: src96,
+    srcDims: [4, 4, 6],
     srcAffine: ID_AFFINE,
     dstDims: [1, 1, 1],
-    dstAffine: makeDiagAffine(2, 2, 5, 1, 1, 2),
+    dstAffine: makeDiagAffine(3, 3, 5, 1.5, 1.5, 2.5),
     isLabel: true,
   });
-  assert.equal(res45.img[0], 11);
+  assert.equal(res96.img[0], 11);
 
-  // 4e. Oblique/rotated axes:
-  //     - 45° rotated 3 mm step [3/sqrt(2), 3/sqrt(2), 0] (len = 3.0 -> n = 3)
-  //       hits diagonal neighbors (1,1) and (3,3) around center (2,2).
-  //     - 45° rotated 2.05 mm axes with all entries ±1.45 (< 1.5001 individually,
-  //       but Euclidean len = 2.0506 > 1.5001 -> 3x3 = 9 taps) picks surrounding
-  //       label 9 (6 votes) over center label 5 (3 votes).
-  const s3 = 3 / Math.SQRT2;
-  const rotSrc = new Uint8Array(5 * 5); // x in 0..4, y in 0..4, z=0
+  // 5d. Maximum 3D probe count (7 x 7 x 7 mm => 8 * 8 * 8 = 512 taps at half-integer center):
+  const src512 = new Uint8Array(8 * 8 * 8);
+  src512.fill(5);
+  for (let i = 0; i < 257; i++) src512[i] = 14; // 257 > 255
+  const res512 = resliceVolumeData({
+    srcImg: src512,
+    srcDims: [8, 8, 8],
+    srcAffine: ID_AFFINE,
+    dstDims: [1, 1, 1],
+    dstAffine: makeDiagAffine(7, 7, 7, 3.5, 3.5, 3.5),
+    isLabel: true,
+  });
+  assert.equal(res512.img[0], 14);
+
+  // 5e. Oblique/rotated 2.05 mm axes: every affine entry is ±1.45 (< 1.5001 individually),
+  //     but Euclidean step length is sqrt(1.45^2 + 1.45^2) = 2.0506 > 1.5001 -> 4x4 = 16 taps:
+  //     4 inner taps hit center (2,2)=5, 12 outer taps hit neighbors=9 -> 9 wins (12 vs 4).
+  const rotSrc = new Uint8Array(5 * 5);
+  rotSrc.fill(9);
   rotSrc[2 + 2 * 5] = 5;
-  rotSrc[1 + 1 * 5] = 9;
-  rotSrc[3 + 3 * 5] = 9;
-  const resRot3 = resliceVolumeData({
+  const resRot = resliceVolumeData({
     srcImg: rotSrc,
     srcDims: [5, 5, 1],
     srcAffine: ID_AFFINE,
     dstDims: [1, 1, 1],
     dstAffine: [
-      [s3, -1 / Math.SQRT2, 0, 2],
-      [s3, 1 / Math.SQRT2, 0, 2],
-      [0, 0, 1, 0],
-      [0, 0, 0, 1],
-    ],
-    isLabel: true,
-  });
-  assert.equal(resRot3.img[0], 9);
-
-  const rotSrc2 = new Uint8Array(5 * 5);
-  rotSrc2.fill(9);
-  rotSrc2[2 + 2 * 5] = 5;
-  const resRot2 = resliceVolumeData({
-    srcImg: rotSrc2,
-    srcDims: [5, 5, 1],
-    srcAffine: ID_AFFINE,
-    dstDims: [1, 1, 1],
-    dstAffine: [
-      [1.45, -1.45, 0, 2.1],
+      [1.45, -1.45, 0, 2.0],
       [1.45, 1.45, 0, 2.0],
       [0, 0, 1, 0],
       [0, 0, 0, 1],
     ],
     isLabel: true,
   });
-  assert.equal(resRot2.img[0], 9);
+  assert.equal(resRot.img[0], 9);
 }
 
 // ---------------------------------------------------------------------------
-// 5. Out-of-bounds background counting, FreeSurfer labelLut & hdrPatch
+// 6. Out-of-bounds background counting, FreeSurfer labelLut & hdrPatch
 // ---------------------------------------------------------------------------
 {
-  // 5a. OOB samples vote as background (0):
-  //     At z = 0 with 3 mm step, taps hit z in {-1 (OOB->0), 0, +1}.
+  // 6a. OOB samples vote as background (0):
+  //     At z = 0.5 with 3 mm step (n = 4), taps hit z in {0, 1, -1 (OOB->0), 2}.
   const oobMajority = resliceVolumeData({
-    srcImg: Uint8Array.from([5, 0]),
-    srcDims: [1, 1, 2],
+    srcImg: Uint8Array.from([5, 6, 0]),
+    srcDims: [1, 1, 3],
     srcAffine: ID_AFFINE,
     dstDims: [1, 1, 1],
-    dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 0),
+    dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 0.5),
     isLabel: true,
   });
-  // Votes: center=5, -1=0(OOB), +1=0 -> background 0 wins (2 vs 1).
+  // Votes: 5, 6, 0 (OOB), 0 -> background 0 wins (2 vs 1 vs 1).
   assert.equal(oobMajority.img[0], 0);
 
   const oobTie = resliceVolumeData({
-    srcImg: Uint8Array.from([5, 6]),
-    srcDims: [1, 1, 2],
+    srcImg: Uint8Array.from([5, 6, 7]),
+    srcDims: [1, 1, 3],
     srcAffine: ID_AFFINE,
     dstDims: [1, 1, 1],
-    dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 0),
+    dstAffine: makeDiagAffine(1, 1, 3, 0, 0, 0.5),
     isLabel: true,
   });
-  // Votes: center=5, -1=0(OOB), +1=6 -> 3-way tie resolves to center 5.
+  // Votes: 5, 6, 0 (OOB), 7 -> 4-way tie resolves to centermost probe 5.
   assert.equal(oobTie.img[0], 5);
 
-  // 5b. FreeSurfer labelLut remapping & NIFTI_INTENT_LABEL hdrPatch on both
+  // 6b. FreeSurfer labelLut remapping & NIFTI_INTENT_LABEL hdrPatch on both
   //     fast path (nDeltas === 1) and majority-vote path (nDeltas > 1).
   const lut = new Int16Array([0, 2, 1001, 2035]);
   const srcLut = Uint8Array.from([0, 1, 2, 3, 3, 3]);
@@ -421,8 +548,8 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     isLabel: true,
     labelLut: lut,
   });
-  // i=0 -> x=1 ({0,1,2} -> tie -> center 1 -> lut 2)
-  // i=1 -> x=4 ({3,4,5} -> [3,3,3] -> 3 -> lut 2035)
+  // i=0 -> x=1 ({1,1,0,2} -> center 1 gets 2 votes -> lut 2)
+  // i=1 -> x=4 ({4,4,3,5} -> [3,3,3,3] -> 3 -> lut 2035)
   assert.deepEqual(Array.from(resMulti.img), [2, 2035]);
   assert.deepEqual(resMulti.hdrPatch, {
     datatypeCode: 4,
@@ -436,11 +563,10 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Probability (trilinear) & intensity (nearest-neighbor) paths unchanged
+// 7. Probability (trilinear) & intensity (nearest-neighbor) paths unchanged
 // ---------------------------------------------------------------------------
 {
-  // 6a. Probability map: trilinear interpolation & uint8 0..255 with scl_slope=1/255.
-  const srcProb = new Float32Array([0, 1, 0, 1, 0, 1, 0, 1]); // 2x2x2: x=0 -> 0, x=1 -> 1
+  const srcProb = new Float32Array([0, 1, 0, 1, 0, 1, 0, 1]);
   const resProb = resliceVolumeData({
     srcImg: srcProb,
     srcDims: [2, 2, 2],
@@ -451,7 +577,7 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     isProbability: true,
   });
   assert.ok(resProb.img instanceof Uint8Array);
-  assert.equal(resProb.img[0], 128); // Math.trunc(0.5 * 255 + 0.5) = 128
+  assert.equal(resProb.img[0], 128);
   assert.equal(resProb.hdrPatch.datatypeCode, 2);
   assert.equal(resProb.hdrPatch.numBitsPerVoxel, 8);
   assert.equal(resProb.hdrPatch.cal_min, 0);
@@ -459,8 +585,6 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
   assert.ok(Math.abs(resProb.hdrPatch.scl_slope - 1 / 255) < 1e-12);
   assert.equal(resProb.hdrPatch.scl_inter, 0);
 
-  // 6b. Intensity output: nearest-neighbor preserving native TypedArray kind,
-  //     NOT tagged with NIFTI_INTENT_LABEL.
   const srcInt = new Int16Array([100, 200, 300, 400]);
   const resInt = resliceVolumeData({
     srcImg: srcInt,
@@ -473,8 +597,10 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
     dstTypedArrayKind: "Int16Array",
   });
   assert.ok(resInt.img instanceof Int16Array);
-  assert.deepEqual(Array.from(resInt.img), [100, 300]); // round(0.4)=0, round(2.4)=2
+  assert.deepEqual(Array.from(resInt.img), [100, 300]);
   assert.deepEqual(resInt.hdrPatch, { scl_slope: 1, scl_inter: 0 });
 }
 
-console.log("reslice-volume OK (all 1/1.5/2/3/5/7 mm label, symmetry, tie, OOB, LUT, probability & intensity checks passed).");
+console.log(
+  "reslice-volume OK (all 1/1.5/2/3/5/7 mm integer & half-integer center, symmetry, tie, OOB, LUT, probability & intensity checks passed)."
+);

@@ -3,8 +3,8 @@
 // thread:
 //   1. `processSegmentation`: 6-connected BWLabeler + hierarchical / per-class
 //      connected-component filtering (used by inference-webgpu.js).
-//   2. `resliceToNative`: adaptive center-anchored majority-vote / trilinear
-//      native-grid resampling during Save -> Native space.
+//   2. `resliceToNative`: adaptive center-outward midpoint majority-vote /
+//      trilinear native-grid resampling during Save -> Native space.
 
 import { processSegmentationVolume } from "./tensor-utils.js";
 import { resliceVolumeData } from "./reslice-volume.js";

@@ -21,11 +21,13 @@ const TYPED_ARRAY_CTORS = {
  * Reslice a conformed segmentation, intensity volume, or probability map onto
  * a target native grid.
  *
- * - Discrete label map (`isLabel === true`): adaptive center-anchored odd-count
- *   majority vote per destination axis (1 tap at exact center for step length
- *   `L <= 1.5001` conformed voxels; symmetric 3, 5, or 7 taps `{0, ±1/n, ...}`
- *   for `L <= 3.5001`, `L <= 5.5001`, or `L > 5.5001`, with `deltas[0] = [0,0,0]`
- *   so equal-vote ties always resolve to the voxel center), written as Int16
+ * - Discrete label map (`isLabel === true`): adaptive center-outward midpoint
+ *   pair majority vote per destination axis (1 tap `[0]` at exact center for
+ *   step length `L <= 1.5001` conformed voxels; symmetric `n = 4, 6, or 8`
+ *   midpoint taps `±(m + 0.5) / n` ordered center-outward for `L <= 3.5001`,
+ *   `L <= 5.5001`, or `L > 5.5001`, avoiding half-integer `.5` collisions at
+ *   both integer `C` and odd-dimension half-integer `C + 0.5` centers while
+ *   resolving equal-vote ties to the centermost probe), written as Int16
  *   tagged NIFTI_INTENT_LABEL (1002), optionally remapped via `labelLut`.
  * - Probability map (`isProbability === true`): trilinear interpolation stored
  *   as Uint8 (0..255) with `scl_slope = 1/255`.
@@ -103,19 +105,24 @@ export function resliceVolumeData({
       : 0;
 
   if (isLabel) {
-    // Adaptive center-anchored odd-count sub-voxel offsets per destination axis
+    // Adaptive center-outward midpoint-pair sub-voxel offsets per destination axis
     // (bit-exact with brainchopC conform.c):
     //   L <= 1.5001 -> 1 tap  [0]
-    //   L <= 3.5001 -> 3 taps [0, -1/3, +1/3]
-    //   L <= 5.5001 -> 5 taps [0, -1/5, +1/5, -2/5, +2/5]
-    //   L >  5.5001 -> 7 taps [0, -1/7, +1/7, -2/7, +2/7, -3/7, +3/7]
+    //   L <= 3.5001 -> 4 taps [-0.5/4, +0.5/4, -1.5/4, +1.5/4]
+    //   L <= 5.5001 -> 6 taps [-0.5/6, +0.5/6, -1.5/6, +1.5/6, -2.5/6, +2.5/6]
+    //   L >  5.5001 -> 8 taps [±0.5/8, ±1.5/8, ±2.5/8, ±3.5/8]
+    // Midpoint pairs eliminate half-integer (.5) rounding collisions at BOTH
+    // integer centers C and odd-dimension half-integer centers C + 0.5, while
+    // center-outward ordering resolves ties to the centermost probe.
     const axisOffsets = (e) => {
       const len = Math.sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
-      const n = len <= 1.5001 ? 1 : len <= 3.5001 ? 3 : len <= 5.5001 ? 5 : 7;
-      const offs = [0.0];
-      const half = (n - 1) >> 1;
-      for (let m = 1; m <= half; m++) {
-        offs.push(-m / n, m / n);
+      if (len <= 1.5001) return [0.0];
+      const n = len <= 3.5001 ? 4 : len <= 5.5001 ? 6 : 8;
+      const offs = new Array(n);
+      for (let m = 0; m < n / 2; m++) {
+        const d = (m + 0.5) / n;
+        offs[2 * m] = -d;
+        offs[2 * m + 1] = d;
       }
       return offs;
     };
