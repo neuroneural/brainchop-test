@@ -63,7 +63,7 @@ Each entry in `inferenceModelsList` is a plain object read by `runInferenceChain
 ## Known caveats
 
 - `nv1.addVolume` always fires `volumeLoaded` (= `doLoadImage`). `doLoadImage` only captures `nativeInputNV` for single-volume scenes, `ensureConformed` restores it after swapping in the conformed copy, and startup calls `doLoadImage()` once because the default `t1_crop.nii.gz` loads before the hook is installed. Keep all three or native export silently becomes 256³ (or refuses with "Original input grid is unavailable").
-- Native-space export: labels use 2x-supersampled majority vote, probability maps trilinear, other intensity outputs nearest-neighbour.
+- Native-space export: labels use adaptive center-outward midpoint-pair majority vote (exact center for ≤1.5 mm axes, symmetric 4/6/8-tap midpoint pairs with center-outward tie-breaking for coarser axes), probability maps trilinear, other intensity outputs nearest-neighbour.
 - No `eslint.config.js` exists despite ESLint 9 + `eslint-plugin-vue`/`globals` in devDependencies; `npx eslint .` fails outright.
 - `npm test` currently fails at browser launch: @playwright/test 1.57.0 wants `chromium_headless_shell-1200`, and only 1194/1228 are in `~/Library/Caches/ms-playwright`. Run `npx playwright install chromium` to fix.
 - Even once installed, the bundled browsers do not expose WebGPU here; a test that needs it would have to use system Chrome (`channel: 'chrome'`, `--enable-unsafe-webgpu`). Nothing in `tests/` does — `webgl2_gate.mjs` drives bundled chromium/firefox for WebGL2 only.

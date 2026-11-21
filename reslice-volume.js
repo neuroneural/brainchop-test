@@ -21,9 +21,14 @@ const TYPED_ARRAY_CTORS = {
  * Reslice a conformed segmentation, intensity volume, or probability map onto
  * a target native grid.
  *
- * - Discrete label map (`isLabel === true`): 2× supersampled (8 sub-voxel
- *   offsets at ±0.25 native voxel) majority vote, written as Int16 tagged
- *   NIFTI_INTENT_LABEL (1002), optionally remapped via `labelLut`.
+ * - Discrete label map (`isLabel === true`): adaptive center-outward midpoint
+ *   pair majority vote per destination axis (1 tap `[0]` at exact center for
+ *   step length `L <= 1.5001` conformed voxels; symmetric `n = 4, 6, or 8`
+ *   midpoint taps `±(m + 0.5) / n` ordered center-outward for `L <= 3.5001`,
+ *   `L <= 5.5001`, or `L > 5.5001`, avoiding half-integer `.5` collisions at
+ *   both integer `C` and odd-dimension half-integer `C + 0.5` centers while
+ *   resolving equal-vote ties to the centermost probe), written as Int16
+ *   tagged NIFTI_INTENT_LABEL (1002), optionally remapped via `labelLut`.
  * - Probability map (`isProbability === true`): trilinear interpolation stored
  *   as Uint8 (0..255) with `scl_slope = 1/255`.
  * - Intensity output (e.g. MindGrab skull-stripped brain): nearest-neighbor,
@@ -100,11 +105,35 @@ export function resliceVolumeData({
       : 0;
 
   if (isLabel) {
-    // 2× supersample: 8 offsets at ±0.25 native voxel, in conformed space.
+    // Adaptive center-outward midpoint-pair sub-voxel offsets per destination axis
+    // (bit-exact with brainchopC conform.c):
+    //   L <= 1.5001 -> 1 tap  [0]
+    //   L <= 3.5001 -> 4 taps [-0.5/4, +0.5/4, -1.5/4, +1.5/4]
+    //   L <= 5.5001 -> 6 taps [-0.5/6, +0.5/6, -1.5/6, +1.5/6, -2.5/6, +2.5/6]
+    //   L >  5.5001 -> 8 taps [±0.5/8, ±1.5/8, ±2.5/8, ±3.5/8]
+    // Midpoint pairs eliminate half-integer (.5) rounding collisions at BOTH
+    // integer centers C and odd-dimension half-integer centers C + 0.5, while
+    // center-outward ordering resolves ties to the centermost probe.
+    const axisOffsets = (e) => {
+      const len = Math.sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+      if (len <= 1.5001) return [0.0];
+      const n = len <= 3.5001 ? 4 : len <= 5.5001 ? 6 : 8;
+      const offs = new Array(n);
+      for (let m = 0; m < n / 2; m++) {
+        const d = (m + 0.5) / n;
+        offs[2 * m] = -d;
+        offs[2 * m + 1] = d;
+      }
+      return offs;
+    };
+
+    const ox = axisOffsets(ex);
+    const oy = axisOffsets(ey);
+    const oz = axisOffsets(ez);
     const deltas = [];
-    for (const dx of [-0.25, 0.25]) {
-      for (const dy of [-0.25, 0.25]) {
-        for (const dz of [-0.25, 0.25]) {
+    for (const dx of ox) {
+      for (const dy of oy) {
+        for (const dz of oz) {
           deltas.push([
             dx * ex[0] + dy * ey[0] + dz * ez[0],
             dx * ex[1] + dy * ey[1] + dz * ez[1],
@@ -117,52 +146,77 @@ export function resliceVolumeData({
     const out = new Int16Array(nvox);
     const lutLen = labelLut ? labelLut.length : 0;
     let maxLabel = 0;
-    const tv = new Int32Array(8);
-    const tc = new Int32Array(8); // majority tally (<=8 distinct)
+    const nDeltas = deltas.length;
     let idx = 0;
 
-    for (let k = 0; k < nz; k++) {
-      for (let j = 0; j < ny; j++) {
-        let bx = o[0] + j * ey[0] + k * ez[0];
-        let by = o[1] + j * ey[1] + k * ez[1];
-        let bz = o[2] + j * ey[2] + k * ez[2];
-        for (let i = 0; i < nx; i++) {
-          let nt = 0;
-          for (let s = 0; s < 8; s++) {
-            const lbl = sample(
-              Math.round(bx + deltas[s][0]),
-              Math.round(by + deltas[s][1]),
-              Math.round(bz + deltas[s][2])
+    if (nDeltas === 1) {
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          let bx = o[0] + j * ey[0] + k * ez[0];
+          let by = o[1] + j * ey[1] + k * ez[1];
+          let bz = o[2] + j * ey[2] + k * ez[2];
+          for (let i = 0; i < nx; i++) {
+            let best = sample(
+              Math.floor(bx + 0.5),
+              Math.floor(by + 0.5),
+              Math.floor(bz + 0.5)
             );
-            let t = -1;
-            for (let q = 0; q < nt; q++) {
-              if (tv[q] === lbl) {
-                t = q;
-                break;
+            if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
+            if (best > maxLabel) maxLabel = best;
+            out[idx++] = best;
+            bx += ex[0];
+            by += ex[1];
+            bz += ex[2];
+          }
+        }
+      }
+    } else {
+      const tv = new Int32Array(nDeltas);
+      const tc = new Int32Array(nDeltas);
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          let bx = o[0] + j * ey[0] + k * ez[0];
+          let by = o[1] + j * ey[1] + k * ez[1];
+          let bz = o[2] + j * ey[2] + k * ez[2];
+          for (let i = 0; i < nx; i++) {
+            let nt = 0;
+            for (let s = 0; s < nDeltas; s++) {
+              const d = deltas[s];
+              const lbl = sample(
+                Math.floor(bx + d[0] + 0.5),
+                Math.floor(by + d[1] + 0.5),
+                Math.floor(bz + d[2] + 0.5)
+              );
+              let t = -1;
+              for (let q = 0; q < nt; q++) {
+                if (tv[q] === lbl) {
+                  t = q;
+                  break;
+                }
+              }
+              if (t < 0) {
+                tv[nt] = lbl;
+                tc[nt] = 1;
+                nt++;
+              } else {
+                tc[t]++;
               }
             }
-            if (t < 0) {
-              tv[nt] = lbl;
-              tc[nt] = 1;
-              nt++;
-            } else {
-              tc[t]++;
+            let best = tv[0];
+            let bc = tc[0];
+            for (let q = 1; q < nt; q++) {
+              if (tc[q] > bc) {
+                bc = tc[q];
+                best = tv[q];
+              }
             }
+            if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
+            if (best > maxLabel) maxLabel = best;
+            out[idx++] = best;
+            bx += ex[0];
+            by += ex[1];
+            bz += ex[2];
           }
-          let best = tv[0];
-          let bc = tc[0];
-          for (let q = 1; q < nt; q++) {
-            if (tc[q] > bc) {
-              bc = tc[q];
-              best = tv[q];
-            }
-          }
-          if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
-          if (best > maxLabel) maxLabel = best;
-          out[idx++] = best;
-          bx += ex[0];
-          by += ex[1];
-          bz += ex[2];
         }
       }
     }
