@@ -21,9 +21,12 @@ const TYPED_ARRAY_CTORS = {
  * Reslice a conformed segmentation, intensity volume, or probability map onto
  * a target native grid.
  *
- * - Discrete label map (`isLabel === true`): 2× supersampled (8 sub-voxel
- *   offsets at ±0.25 native voxel) majority vote, written as Int16 tagged
- *   NIFTI_INTENT_LABEL (1002), optionally remapped via `labelLut`.
+ * - Discrete label map (`isLabel === true`): adaptive center-anchored odd-count
+ *   majority vote per destination axis (1 tap at exact center for step length
+ *   `L <= 1.5001` conformed voxels; symmetric 3, 5, or 7 taps `{0, ±1/n, ...}`
+ *   for `L <= 3.5001`, `L <= 5.5001`, or `L > 5.5001`, with `deltas[0] = [0,0,0]`
+ *   so equal-vote ties always resolve to the voxel center), written as Int16
+ *   tagged NIFTI_INTENT_LABEL (1002), optionally remapped via `labelLut`.
  * - Probability map (`isProbability === true`): trilinear interpolation stored
  *   as Uint8 (0..255) with `scl_slope = 1/255`.
  * - Intensity output (e.g. MindGrab skull-stripped brain): nearest-neighbor,
@@ -100,11 +103,30 @@ export function resliceVolumeData({
       : 0;
 
   if (isLabel) {
-    // 2× supersample: 8 offsets at ±0.25 native voxel, in conformed space.
+    // Adaptive center-anchored odd-count sub-voxel offsets per destination axis
+    // (bit-exact with brainchopC conform.c):
+    //   L <= 1.5001 -> 1 tap  [0]
+    //   L <= 3.5001 -> 3 taps [0, -1/3, +1/3]
+    //   L <= 5.5001 -> 5 taps [0, -1/5, +1/5, -2/5, +2/5]
+    //   L >  5.5001 -> 7 taps [0, -1/7, +1/7, -2/7, +2/7, -3/7, +3/7]
+    const axisOffsets = (e) => {
+      const len = Math.sqrt(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+      const n = len <= 1.5001 ? 1 : len <= 3.5001 ? 3 : len <= 5.5001 ? 5 : 7;
+      const offs = [0.0];
+      const half = (n - 1) >> 1;
+      for (let m = 1; m <= half; m++) {
+        offs.push(-m / n, m / n);
+      }
+      return offs;
+    };
+
+    const ox = axisOffsets(ex);
+    const oy = axisOffsets(ey);
+    const oz = axisOffsets(ez);
     const deltas = [];
-    for (const dx of [-0.25, 0.25]) {
-      for (const dy of [-0.25, 0.25]) {
-        for (const dz of [-0.25, 0.25]) {
+    for (const dx of ox) {
+      for (const dy of oy) {
+        for (const dz of oz) {
           deltas.push([
             dx * ex[0] + dy * ey[0] + dz * ez[0],
             dx * ex[1] + dy * ey[1] + dz * ez[1],
@@ -117,52 +139,77 @@ export function resliceVolumeData({
     const out = new Int16Array(nvox);
     const lutLen = labelLut ? labelLut.length : 0;
     let maxLabel = 0;
-    const tv = new Int32Array(8);
-    const tc = new Int32Array(8); // majority tally (<=8 distinct)
+    const nDeltas = deltas.length;
     let idx = 0;
 
-    for (let k = 0; k < nz; k++) {
-      for (let j = 0; j < ny; j++) {
-        let bx = o[0] + j * ey[0] + k * ez[0];
-        let by = o[1] + j * ey[1] + k * ez[1];
-        let bz = o[2] + j * ey[2] + k * ez[2];
-        for (let i = 0; i < nx; i++) {
-          let nt = 0;
-          for (let s = 0; s < 8; s++) {
-            const lbl = sample(
-              Math.round(bx + deltas[s][0]),
-              Math.round(by + deltas[s][1]),
-              Math.round(bz + deltas[s][2])
+    if (nDeltas === 1) {
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          let bx = o[0] + j * ey[0] + k * ez[0];
+          let by = o[1] + j * ey[1] + k * ez[1];
+          let bz = o[2] + j * ey[2] + k * ez[2];
+          for (let i = 0; i < nx; i++) {
+            let best = sample(
+              Math.floor(bx + 0.5),
+              Math.floor(by + 0.5),
+              Math.floor(bz + 0.5)
             );
-            let t = -1;
-            for (let q = 0; q < nt; q++) {
-              if (tv[q] === lbl) {
-                t = q;
-                break;
+            if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
+            if (best > maxLabel) maxLabel = best;
+            out[idx++] = best;
+            bx += ex[0];
+            by += ex[1];
+            bz += ex[2];
+          }
+        }
+      }
+    } else {
+      const tv = new Int32Array(nDeltas);
+      const tc = new Int32Array(nDeltas);
+      for (let k = 0; k < nz; k++) {
+        for (let j = 0; j < ny; j++) {
+          let bx = o[0] + j * ey[0] + k * ez[0];
+          let by = o[1] + j * ey[1] + k * ez[1];
+          let bz = o[2] + j * ey[2] + k * ez[2];
+          for (let i = 0; i < nx; i++) {
+            let nt = 0;
+            for (let s = 0; s < nDeltas; s++) {
+              const d = deltas[s];
+              const lbl = sample(
+                Math.floor(bx + d[0] + 0.5),
+                Math.floor(by + d[1] + 0.5),
+                Math.floor(bz + d[2] + 0.5)
+              );
+              let t = -1;
+              for (let q = 0; q < nt; q++) {
+                if (tv[q] === lbl) {
+                  t = q;
+                  break;
+                }
+              }
+              if (t < 0) {
+                tv[nt] = lbl;
+                tc[nt] = 1;
+                nt++;
+              } else {
+                tc[t]++;
               }
             }
-            if (t < 0) {
-              tv[nt] = lbl;
-              tc[nt] = 1;
-              nt++;
-            } else {
-              tc[t]++;
+            let best = tv[0];
+            let bc = tc[0];
+            for (let q = 1; q < nt; q++) {
+              if (tc[q] > bc) {
+                bc = tc[q];
+                best = tv[q];
+              }
             }
+            if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
+            if (best > maxLabel) maxLabel = best;
+            out[idx++] = best;
+            bx += ex[0];
+            by += ex[1];
+            bz += ex[2];
           }
-          let best = tv[0];
-          let bc = tc[0];
-          for (let q = 1; q < nt; q++) {
-            if (tc[q] > bc) {
-              bc = tc[q];
-              best = tv[q];
-            }
-          }
-          if (labelLut && best >= 0 && best < lutLen) best = labelLut[best];
-          if (best > maxLabel) maxLabel = best;
-          out[idx++] = best;
-          bx += ex[0];
-          by += ex[1];
-          bz += ex[2];
         }
       }
     }
