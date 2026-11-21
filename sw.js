@@ -8,7 +8,7 @@
 //   - Other same-origin static files: StaleWhileRevalidate
 //   - Non-GET & cross-origin requests (e.g. GitHub API): bypassed (never cache POST/opaque)
 
-const BUILD_VERSION = 'fbe414482da3';
+const BUILD_VERSION = 'ce830378c2e4';
 const SHELL_CACHE = `brainchop-shell-${BUILD_VERSION}`;
 const MODELS_CACHE = 'brainchop-models-v1';
 const MAX_MODEL_ENTRIES = 32;
@@ -17,10 +17,10 @@ const PRECACHE_URLS = [
   "./",
   "./assets/brainchop-webgl2-worker-B3DVb-sO.js",
   "./assets/conform-worker-CLIpQIO-.js",
-  "./assets/index-BGlnkbEI.js",
   "./assets/index-BR4eI4-m.css",
+  "./assets/index-SBOtNBNR.js",
   "./assets/inference-webgl2-DCvDqNLP.js",
-  "./assets/postprocess-worker-CXaByQ7c.js",
+  "./assets/postprocess-worker-B3M6a4-n.js",
   "./assets/vendor-FBY2Vxgc.js",
   "./assets/vendor-math-oqRZD8Fx.js",
   "./assets/vendor-niivue-Cvdr5q4M.js",
