@@ -661,9 +661,9 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         await yieldForPaint();
         const inferStart = performance.now();
         const onInferProgress = activeEntry.supportsGpuNativeIO
-            ? (frac) => {
+            ? (frac, stage) => {
                 const clamped = Math.max(0, Math.min(1, Number(frac) || 0));
-                callbackUI('', 0.3 + 0.6 * clamped);
+                callbackUI(stage ? `Segmenting… · ${stage}` : '', 0.3 + 0.6 * clamped);
             }
             : undefined;
         const ioOpts = (useGpuNativeInput || useGpuNativeOutput || onInferProgress)

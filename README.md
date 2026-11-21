@@ -68,11 +68,11 @@ For **v3** click [here](https://neuroneural.github.io/brainchop/v3).
 
 ## Models & Backends
 
-Inference runs through browser GPU backends in order, falling through silently on failure or unsupported hardware: **WebGPU** &rarr; **native WebGL2** (raw GLSL runner, `webgl2_runners/`) &rarr; **tfjs WebWorker** &rarr; **tfjs main thread**. Only a full-chain failure is shown to the user.
+Inference tries **WebGPU** and then **native WebGL2** (raw GLSL runner, `webgl2_runners/`). The app displays an error if both backends are unavailable or fail. This build has no CPU inference backend.
 
 Most models output a discrete label segmentation. An experimental **CAT-lite** model (24-channel GM/WM/CSF priors, neural-assisted partial-volume estimation — not a CAT12 result) instead outputs continuous GM/WM/CSF fraction maps, shown as three overlays. Saves write one file per tissue: `segmentation_{gm,wm,csf}.nii.gz` (float32, 256&sup3; conformed) or `segmentation_{gm,wm,csf}_native.nii.gz` (uint8, trilinear resliced to the input grid).
 
-Any browser with WebGL2 can run the label models; WebGPU (Chrome/Edge) is the fastest path. CAT-lite needs WebGPU or the native WebGL2 runner and ~1.5&nbsp;GiB of GPU memory — the tfjs fallbacks return label maps only.
+Native WebGL2 requires renderable floating-point textures, enough draw buffers for the model, and enough GPU memory. A full 24-channel volume uses ~1.5&nbsp;GiB for RGBA16F activations alone.
 
 ## Development
 

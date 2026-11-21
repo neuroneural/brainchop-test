@@ -1,7 +1,6 @@
 // brainchop-webgl2-worker.js
 // ---------------------------------------------------------------------------
-// Worker for the NATIVE WebGL2 path (webgl2_runners/), as distinct from
-// brainchop-webworker.js which is the tfjs path and remains the fallback.
+// Worker for the native WebGL2 path (webgl2_runners/).
 //
 // WHY A WORKER, not the main thread like inference-webgpu.js. The WebGL2 runner
 // is synchronous: readPixels blocks and there is no cooperative yield. brainchopC
@@ -186,7 +185,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
   }
 
   // ---- probe (cached per model/quantization on the shared GL context) --
-  const canAutoQ8 = !d.quantize8Bit && !!modelEntry.autoQuantize8BitFallback && desc.norm === 'gn';
+  const canAutoQ8 = !d.quantize8Bit && !!modelEntry.autoQuantize8BitFallback && d.norm === 'gn';
   const probeKey = `${entry.name}:${dim}:${+!!d.quantize8Bit}:${+!!canAutoQ8}`;
   let probe = probeCache.get(probeKey);
   if (probe) {
@@ -279,7 +278,7 @@ async function run(opts, modelEntry, niftiHeader, niftiImage) {
     if (gl.isContextLost()) {
       resetSharedGl();
     }
-    if (!d.quantize8Bit && modelEntry.autoQuantize8BitFallback && desc.norm === 'gn') {
+    if (!d.quantize8Bit && canAutoQ8) {
       console.warn('[webgl2-native] RGBA16F execution failed; retrying once with RGBA8 quantized activations.', err);
       const retryGl = ensureSharedGl();
       if (!retryGl) throw err;
@@ -386,9 +385,7 @@ self.addEventListener('message', async (e) => {
   } catch (err) {
     console.error('[webgl2-native] failed', err);
     if (sharedGl?.isContextLost()) resetSharedGl();
-    // Any throw is a refusal from main.js's point of view: it should try the
-    // tfjs worker rather than show the user an error, because the tfjs path can
-    // still run every one of these models.
+    // Return the failure to main.js for the backend diagnostics.
     try {
       const statData = createStatData(modelEntry, 'webgl2-native');
       markFailure(statData, err, 'native WebGL2 runner');

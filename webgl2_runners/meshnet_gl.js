@@ -12,8 +12,8 @@
 // STRUCTURE follows the C, including the one thing that file got right the hard
 // way: ONE EXIT. Every handle is declared up front and null until created, every
 // failure throws, and a single `finally` deletes textures, framebuffers and
-// programs. brainchop-test's existing worker fallback is only a real fallback if
-// this releases ~1-2 GiB cleanly on the way out.
+// programs. Release the activation textures after each run to keep the
+// worker usable for subsequent models.
 //
 // SYNCHRONOUS BY NATURE. readPixels blocks. brainchopC measured the in-thread
 // WebGL2 path drawing THREE FRAMES in 2.2 seconds -- a hung tab. Run this in a
@@ -21,6 +21,7 @@
 // ---------------------------------------------------------------------------
 
 import { buildSources, WTEX_W, LAB_W } from './kernels.js';
+import { isLinuxMesaIntelGen9 } from '../gpu-compatibility.js';
 
 // ---------------------------------------------------------------- capabilities
 
@@ -315,11 +316,9 @@ function checkGl(gl, where) {
   // finished and returned. A listener is still registered, but only so the loss
   // gets logged -- isContextLost() is what actually stops the run.
   //
-  // Losing the context is the likely failure mode when a large model's activation
-  // set does not fit (1.5 GiB at 24 channels, 2.0 at 32), and per the standing
-  // rule it must make the run fail rather than return a blank volume.
+  // A driver reset or memory pressure can invalidate the context mid-run.
   if (gl.isContextLost()) {
-    throw new Error(`the WebGL context was lost at ${where} (most likely the activation set did not fit)`);
+    throw new Error(`the WebGL context was lost at ${where}`);
   }
   const e = gl.getError();
   if (e !== gl.NO_ERROR) {
@@ -595,6 +594,29 @@ export function runMeshNetGL(o) {
     const bind3d = (unit, t) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_3D, t); };
     const bind2d = (unit, t) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); };
     const draw = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const renderer = describeRenderer(gl);
+    // Mesa on Intel Gen9 can return corrupt readbacks or reset under long GPU
+    // workloads. Bound the queued work using the same readback used on D3D11.
+    const paceDraws = isLinuxMesaIntelGen9(renderer);
+    const syncDraws = (where) => {
+      hardSync(gl, fboLab);
+      checkGl(gl, where);
+    };
+    // Keep the viewport fixed so gl_FragCoord and the packed label layout
+    // stay identical. Drain each strip before submitting the next one.
+    const drawRows = (width, firstRow, rows, rowsPerDraw, where) => {
+      if (!paceDraws) {
+        draw();
+        return;
+      }
+      gl.enable(gl.SCISSOR_TEST);
+      for (let row = firstRow; row < firstRow + rows; row += rowsPerDraw) {
+        gl.scissor(0, row, width, Math.min(rowsPerDraw, firstRow + rows - row));
+        draw();
+        syncDraws(where);
+      }
+      gl.disable(gl.SCISSOR_TEST);
+    };
 
     // ---- the model ------------------------------------------------------
     let cur = setP, nxt = setQ, curFbo = fboP, nxtFbo = fboQ;
@@ -617,6 +639,7 @@ export function runMeshNetGL(o) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, nxtFbo[z]);
         gl.uniform1i(uZ, z);
         draw();
+        if (paceDraws && (z & 15) === 15) syncDraws('conv_first');
       }
       checkGl(gl, 'conv_first');
     }
@@ -632,7 +655,7 @@ export function runMeshNetGL(o) {
         bind3d(0, fromList[g]);
         gl.uniform1i(uRow, g * ny);
         gl.viewport(0, g * ny, nx, ny);
-        draw();
+        drawRows(nx, g * ny, ny, 64, `moments layer ${li}`);
       }
       gl.useProgram(progs.momentsB);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboMomB);
@@ -654,9 +677,7 @@ export function runMeshNetGL(o) {
       gl.viewport(0, 0, 1, P);
       draw();
 
-      // norm: no readback anywhere -- `norm` samples the 1xP moments texture
-      // directly. A CPU-side finish would put one synchronous readPixels stall
-      // per layer in the middle of the pipeline.
+      // Norm samples the 1xP moments texture directly.
       const p = progs.norm;
       gl.useProgram(p);
       for (let g = 0; g < P; g++) bind3d(g, fromList[g]);
@@ -672,6 +693,7 @@ export function runMeshNetGL(o) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, toFbo[z]);
         gl.uniform1i(uZ, z);
         draw();
+        if (paceDraws && (z & 15) === 15) syncDraws(`norm layer ${li}`);
       }
       checkGl(gl, `norm layer ${li}`);
     };
@@ -709,7 +731,7 @@ export function runMeshNetGL(o) {
       o.onLog?.(`[webgl2] layer 1 sample: ${s}`);
     }
 
-    const isD3D11 = /Direct3D/i.test(describeRenderer(gl)) || (
+    const isD3D11 = /Direct3D/i.test(renderer) || (
       typeof navigator !== 'undefined' && /Windows|Win32|Win64/i.test(
         `${navigator.userAgentData?.platform || ''} ${navigator.platform || ''} ${navigator.userAgent || ''}`
       )
@@ -735,6 +757,7 @@ export function runMeshNetGL(o) {
           gl.bindFramebuffer(gl.FRAMEBUFFER, fboQ2[k]);
           gl.uniform1i(uZ, k * 2);
           draw();
+          if (paceDraws && (k & 3) === 3) syncDraws(`conv layer ${li}`);
           if (isD3D11 && ((k & 31) === 31)) gl.flush();
         }
       } else {
@@ -742,6 +765,7 @@ export function runMeshNetGL(o) {
           gl.bindFramebuffer(gl.FRAMEBUFFER, nxtFbo[z]);
           gl.uniform1i(uZ, z);
           draw();
+          if (paceDraws && (z & 7) === 7) syncDraws(`conv layer ${li}`);
           if (isD3D11 && ((z & 63) === 63)) gl.flush();
         }
       }
@@ -757,9 +781,8 @@ export function runMeshNetGL(o) {
       // multi-second flush at Layer 9/13 that trips WDDM TDR / OOM and resets
       // NiiVue's shared GPU-process context. Sync per layer on D3D11, and issue a
       // non-blocking flush elsewhere.
-      if (isD3D11) {
-        hardSync(gl, fboLab);
-        checkGl(gl, `sync layer ${li}`);
+      if (isD3D11 || paceDraws) {
+        syncDraws(`sync layer ${li}`);
       } else {
         gl.flush();
         if (li % 8 === 0) hardSync(gl, fboLab);
@@ -812,7 +835,7 @@ export function runMeshNetGL(o) {
       gl.uniform1i(U(p, 'uHasBias'), o.offsets.clsBiasFloat >= 0 ? 1 : 0);
       gl.bindFramebuffer(gl.FRAMEBUFFER, fboLab);
       gl.viewport(0, 0, LAB_W, labRows);
-      draw();
+      drawRows(LAB_W, 0, labRows, 16, 'classify');
       checkGl(gl, 'classify');
 
       // The only transfer off the device: one byte per voxel, because each RGBA8
@@ -833,13 +856,13 @@ export function runMeshNetGL(o) {
       support,
       ms,
       shaderCacheHit,
-      path: `webgl2-native P=${P}${useVox2 ? ' vox2' : ''}${o.probability ? ' tissue-probability' : ''} ${nx}x${ny}x${nz}`,
+      path: `webgl2-native P=${P}${useVox2 ? ' vox2' : ''}${paceDraws ? ' paced' : ''}${o.probability ? ' tissue-probability' : ''} ${nx}x${ny}x${nz}`,
     };
   } finally {
     // One exit. brainchopC's repeat test gates WebGL2 harder than WebGPU
-    // precisely here: leaking a single activation set fails the third run, and
-    // brainchop-test needs the tfjs fallback to still have a GPU to run on.
+    // precisely here: leaking a single activation set fails subsequent runs.
     if (gl) {
+      gl.disable(gl.SCISSOR_TEST);
       for (const f of owned.fbos) gl.deleteFramebuffer(f);
       for (const t of owned.textures) gl.deleteTexture(t);
       for (const p of owned.programs) gl.deleteProgram(p);
