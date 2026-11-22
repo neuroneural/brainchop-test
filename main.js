@@ -1,7 +1,16 @@
 import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
 import { clinicalConform } from "./conform-transform.js";
 import { shiny } from "@niivue/niivue/assets/matcaps";
-import { runInferenceWebGpu, warmupWebGpuRunners, yieldForPaint } from "./inference-webgpu.js";
+import {
+  runInferenceWebGpu,
+  warmupWebGpuRunners,
+  releaseWebGpuWorkspace,
+  yieldForPaint,
+} from "./inference-webgpu.js";
+import {
+  applyWebGpuUrlOverrides,
+  executeWithWebGpuSafeModeRetry,
+} from "./gpu-compatibility.js";
 import { inferenceModelsList, brainChopOpts, resolveModelEntry } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import { getLabelHistogramU8 } from "./tensor-utils.js";
@@ -178,19 +187,13 @@ let isWebGpuAvailable = false;
 let gpuDeviceLostRecoveries = 0;
 
 // --- Backend fallback chain state -----------------------------------------
-// runSelectedInference() tries WebGPU, then the native WebGL2 runner, then the
-// tfjs worker (fast, then seqConv), then the main thread. Every one of those
-// stages reports its own failure through callbackUI's modalMessage, which used
-// to pop a blocking window.alert -- so a user on a machine where WebGPU is
-// unavailable got "WebGPU Error: ..." and then a perfectly good segmentation
-// from the next backend. An earlier backend giving up is a console-level event.
-// Messages are collected here and only surfaced if the whole chain fails.
+// The inference chain tries WebGPU and then native WebGL2. Collect errors
+// from both attempts and only show the modal if the whole chain fails.
 let suppressBackendModals = false;
 let backendAttemptMessages = [];
 
 // --- DEBUG OVERRIDE -------------------------------------------------------
-// Inference normally tries WebGPU first, then native WebGL2, then tfjs WebGL.
-// Safari takes the latter two paths because its current WebGPU results fail.
+// Safari uses native WebGL2 for legacy models because their WebGPU results fail.
 // Safari 26.5 advertises shader-f16, but its WebGPU compute path has returned
 // an all-class-2 cube for the light tissue model and all-zero labels for the
 // 18-class model on this machine. Native WebGL2 produced a real segmentation.
@@ -452,7 +455,7 @@ async function main() {
   // CAT-lite temporarily dims the T1 so a neutral-gray probability map remains
   // readable. Preserve the user's slider value and restore it when leaving the
   // probability view; never force ordinary segmentations to 100%.
-  let probabilityUnderlayRestoreValue = null;
+  let modelUnderlayRestoreValue = null;
   let nativeInputName = "input.nii.gz";
   let crosshairVox = null; // background voxel index at the crosshair, from locationChange
 
@@ -739,16 +742,18 @@ async function main() {
   };
 
   function syncModelUnderlayOpacityNoRender(modelEntry = null) {
-    const underlayOpacity = modelEntry?.probabilityUnderlayOpacity;
+    const underlayOpacity = modelEntry?.type === "Brain_Extraction"
+      ? 0
+      : modelEntry?.probabilityUnderlayOpacity;
     if (underlayOpacity !== undefined) {
-      if (probabilityUnderlayRestoreValue === null) {
-        probabilityUnderlayRestoreValue = opacitySlider0.value;
+      if (modelUnderlayRestoreValue === null) {
+        modelUnderlayRestoreValue = opacitySlider0.value;
       }
       opacitySlider0.value = underlayOpacity;
       if (nv1.volumes[0]) nv1.volumes[0].opacity = Number(underlayOpacity);
-    } else if (probabilityUnderlayRestoreValue !== null) {
-      opacitySlider0.value = probabilityUnderlayRestoreValue;
-      probabilityUnderlayRestoreValue = null;
+    } else if (modelUnderlayRestoreValue !== null) {
+      opacitySlider0.value = modelUnderlayRestoreValue;
+      modelUnderlayRestoreValue = null;
       if (nv1.volumes[0]) nv1.volumes[0].opacity = Number(opacitySlider0.value);
     }
   }
@@ -1074,6 +1079,7 @@ async function main() {
     const selectedModelIndex = modelSelect.value;
     if (selectedModelIndex === "-1") return;
     if (modelSelect.selectedIndex < 0) return;
+    await initialBackend;
 
     const memstatusItem = document.getElementById("memstatusItem");
     if (memstatusItem) memstatusItem.hidden = true;
@@ -1082,7 +1088,8 @@ async function main() {
     await ensureConformed();
 
     const baseModelEntry = inferenceModelsList[selectedModelIndex];
-    const precisionParam = (new URLSearchParams(window.location.search).get("precision") || "").toLowerCase();
+    const params = new URLSearchParams(window.location.search);
+    const precisionParam = (params.get("precision") || "").toLowerCase();
     const useWebGpuV4 = precisionParam !== "fp16" && precisionParam !== "fp32";
     const modelEntry = {
       ...resolveModelEntry(baseModelEntry, useWebGpuV4),
@@ -1116,15 +1123,50 @@ async function main() {
     if (isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost && !skipWebGpu && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
 
-      const currentModelEntry = { ...modelEntry, enableTTA: false };
+      const currentModelEntry = applyWebGpuUrlOverrides(
+        { ...modelEntry, enableTTA: false },
+        window.location.search
+      );
+      const acquireFreshWebGpuDevice = async ({ failedDevice }) => {
+        if (failedDevice) {
+          try { releaseWebGpuWorkspace(failedDevice); } catch {}
+          if (!failedDevice.__isLost) {
+            try { failedDevice.destroy(); } catch {}
+          }
+        }
+        gpuDevice = null;
+        isWebGpuAvailable = false;
+        await initializeBackend(nv1.view?.gl);
+        return isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost ? gpuDevice : null;
+      };
 
       try {
-        await runInferenceWebGpu(gpuDevice, opts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+        await executeWithWebGpuSafeModeRetry({
+          device: gpuDevice,
+          modelEntry: currentModelEntry,
+          runAttempt: (dev, entry) =>
+            runInferenceWebGpu(dev, opts, entry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI),
+          requestFreshDevice: acquireFreshWebGpuDevice,
+          onRetry: ({ failureKind, error }) => {
+            console.warn(
+              `[WebGPU-V4] ${failureKind} during standard run (${error?.message || error}); ` +
+              `persisted low-memory safe mode and retrying once in LowMem128 + paced.`
+            );
+            callbackUI("Retrying in low-memory WebGPU mode\u2026", 0.05);
+          },
+        });
+        gpuDeviceLostRecoveries = 0;
         return; // Success
       } catch (e) {
         lastError = e;
+        const msg = e?.message || String(e);
+        if (!backendAttemptMessages.some((m) => m.includes(msg))) {
+          backendAttemptMessages.push(`WebGPU: ${msg}`);
+        }
         console.error("WebGPU inference failed, falling back to native WebGL2.", e);
       }
+    } else if (!skipWebGpu && modelEntry.webgpu_safetensor) {
+      backendAttemptMessages.push(`WebGPU: ${window.webgpuDiagnostics?.error || "no usable adapter or device"}`);
     }
 
     // 2. Native WebGL2 worker runner (webgl2_runners/): prefer faster/exact RGBA16F first,
@@ -1145,9 +1187,11 @@ async function main() {
           return; // Success
         }
         lastError = new Error("Native WebGL2 unavailable (no OffscreenCanvas WebGL2 context).");
+        backendAttemptMessages.push(lastError.message);
         console.warn(lastError.message);
       } catch (e) {
         lastError = e;
+        backendAttemptMessages.push(`WebGL2: ${e?.message || e}`);
         console.error("Native WebGL2 failed.", e);
       }
     }
@@ -2369,6 +2413,7 @@ async function main() {
   }
   nv1.volumeIsNearestInterpolation = true;
   await nv1.loadVolumes([{ url: "./t1_crop.nii.gz" }]);
+  const initialBackend = initializeBackend(nv1.view?.gl);
 
   // Clear loading placeholder
   modelSelect.innerHTML = "";
@@ -2408,7 +2453,7 @@ async function main() {
   syncModelSelectTooltip();
   setPen(-1);
 
-  await initializeBackend(nv1.view?.gl);
+  await initialBackend;
 
   // --- FIX IS HERE ---
   // Use URLSearchParams to correctly parse the query string.

@@ -188,10 +188,8 @@ async function localSystemDetails(statData, gl = null) {
   if (gl) {
     console.log('MAX_TEXTURE_SIZE :', gl.getParameter(gl.MAX_TEXTURE_SIZE))
     console.log('MAX_RENDERBUFFER_SIZE :', gl.getParameter(gl.MAX_RENDERBUFFER_SIZE))
-    // -- check to see   if  machine has two graphics card: one is the builtin e.g. Intel Iris Pro, the other is NVIDIA GeForce GT 750M.
-    // -- check browser use which one, if debugInfo is null then installed  GPU is not used
     const debugInfo = gl.getExtension('WEBGL_debug_renderer_info')
-    console.log('VENDOR WEBGL:', gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL))
+    console.log('VENDOR WEBGL:', gl.getParameter(debugInfo?.UNMASKED_VENDOR_WEBGL ?? gl.VENDOR))
     statData.Texture_Size = gl.getParameter(gl.MAX_TEXTURE_SIZE) // --returns the maximum dimension the GPU can address
   } else {
     statData.Texture_Size = null
