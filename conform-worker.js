@@ -4,7 +4,11 @@ self.onmessage = (event) => {
   const { id, payload } = event.data;
   try {
     const result = conformVolumeData(payload);
-    self.postMessage({ id, result }, [result.img.buffer]);
+    const transfer = [result.img.buffer];
+    if (result.inferenceImg && result.inferenceImg.buffer !== result.img.buffer) {
+      transfer.push(result.inferenceImg.buffer);
+    }
+    self.postMessage({ id, result }, transfer);
   } catch (err) {
     self.postMessage({
       id,
