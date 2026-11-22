@@ -30,7 +30,11 @@ import {
   deriveDescriptor,
 } from '../webgl2_runners/weights.js';
 import { descriptorFor } from '../webgl2_runners/descriptors.js';
-import { isLinuxMesaIntelGen9 } from '../gpu-compatibility.js';
+import {
+  detectV4Platform,
+  resolveV4ExecutionPlan,
+  formatV4PlanDiagnostic,
+} from '../gpu-compatibility.js';
 import {
   tissueProbabilityConfig,
   smoothAndGateTissuePriors,
@@ -75,115 +79,6 @@ function packConvDilFlags(D, writeExtY8) {
     ((shL & 31) << 19) |
     ((writeExtY8 ? 1 : 0) << 24)
   ) >>> 0;
-}
-
-function getV4ExecOverride(modelEntry) {
-  if (modelEntry?.webgpuExecMode) return String(modelEntry.webgpuExecMode).toLowerCase();
-  try {
-    const q = new URLSearchParams(globalThis.location?.search || '').get('webgpuExec');
-    if (q) return q.toLowerCase();
-  } catch { /* worker or non-DOM context */ }
-  return '';
-}
-
-function probeGlRendererHint(device) {
-  if (!device) return '';
-  if (typeof device.__glRenderer === 'string') return device.__glRenderer;
-  let renderer = '';
-  try {
-    const isFirefox = typeof navigator !== 'undefined' && /Firefox/i.test(navigator.userAgent || '');
-    const canvas = typeof OffscreenCanvas !== 'undefined'
-      ? new OffscreenCanvas(1, 1)
-      : (typeof document !== 'undefined' ? document.createElement('canvas') : null);
-    const gl = canvas?.getContext?.('webgl2', { powerPreference: 'high-performance' });
-    if (gl) {
-      if (isFirefox) {
-        renderer = String(gl.getParameter(gl.RENDERER) || '');
-      } else {
-        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
-        renderer = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || '');
-      }
-      gl.getExtension('WEBGL_lose_context')?.loseContext();
-    }
-  } catch { /* ignore fallback probe failure */ }
-  device.__glRenderer = renderer;
-  return renderer;
-}
-
-function detectV4Platform(device) {
-  const adInfo = device?.__adapterInfo || device?.adapterInfo || {};
-  const vendor = String(adInfo.vendor || '').toLowerCase();
-  const arch = String(adInfo.architecture || '').toLowerCase();
-  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
-  const plat = (typeof navigator !== 'undefined' && (navigator.userAgentData?.platform || navigator.platform || '')) || '';
-  const isApple = vendor === 'apple' ||
-    (/Mac|iPhone|iPad|iPod/i.test(`${plat} ${ua}`) && !['intel', 'amd', 'nvidia', 'microsoft'].includes(vendor));
-  const isWindows = !isApple && (/Win/i.test(plat) || /Windows/i.test(ua));
-  // Firefox redacts GPUAdapterInfo strings to ""; consult WebGL2 RENDERER on Windows
-  // so shared-RAM Intel UHD/HD/Iris iGPUs still select the 678 MiB LowMem128 workspace.
-  const glRenderer = isWindows && !vendor ? probeGlRendererHint(device) : String(device?.__glRenderer || '');
-  const desc = `${adInfo.device || ''} ${adInfo.description || ''} ${glRenderer}`;
-  const effVendor = vendor || (
-    /\bintel\b/i.test(glRenderer) ? 'intel' :
-    /\bmicrosoft\b|\bbasic render\b/i.test(glRenderer) ? 'microsoft' : ''
-  );
-  const isWindowsSharedIgpu = isWindows && (
-    effVendor === 'microsoft' ||
-    (effVendor === 'intel' && !/\bArc\b/i.test(desc) && (
-      /^gen-(9|11|12lp)/i.test(arch) ||
-      /(?:UHD|HD)\s+Graphics|Iris(?:\(R\))?\s*(?:Plus|Xe)|Pentium|Celeron/i.test(desc)
-    ))
-  );
-  return { vendor: effVendor, arch, desc, isApple, isWindows, isWindowsSharedIgpu };
-}
-
-function isLinuxIntelGen9Device(device) {
-  const info = device?.__adapterInfo || device?.adapterInfo;
-  if (info?.vendor && info.architecture) {
-    return /Linux/i.test(globalThis.navigator?.platform || '') &&
-      info.vendor === 'intel' && info.architecture === 'gen-9';
-  }
-  return isLinuxMesaIntelGen9(device?.__glRenderer);
-}
-
-function resolveV4InitialExecMode(device, modelEntry, d) {
-  const ov = getV4ExecOverride(modelEntry);
-  if (ov === 'single' || ov === 'pipelined' || ov === 'paced' || ov === 'calibrate') return ov;
-  if (ov === 'chunked') return 'paced';
-  // Large submissions can hit the i915 preemption timeout on this stack.
-  if (shouldPreferMindGrabLowMem128(device, d, modelEntry) ||
-      (d.cs >= 24 && isLinuxIntelGen9Device(device))) return 'paced';
-  const plat = detectV4Platform(device);
-  if (plat.isApple) return 'single';
-  if (plat.isWindows) {
-    if (device?.__v4WinCalibrated) {
-      return device.__v4WinFast ? 'pipelined' : 'paced';
-    }
-    return 'calibrate';
-  }
-  return 'pipelined';
-}
-
-function shouldUseStdChunking(device, modelEntry, d) {
-  const ov = getV4ExecOverride(modelEntry);
-  if (ov === 'single') return false;
-  if (ov === 'paced' || ov === 'chunked' || ov === 'calibrate') return true;
-  if (ov === 'pipelined') return false;
-  return (d.cs >= 24 && isLinuxIntelGen9Device(device)) ||
-    detectV4Platform(device).isWindows;
-}
-
-function shouldPreferLowMem128OnWindows(device, d, modelEntry) {
-  if (modelEntry?.forceLowMem128 === false) return false;
-  const plat = detectV4Platform(device);
-  return plat.isWindowsSharedIgpu && d.cs >= 24 && d.cs % 4 === 0;
-}
-
-function shouldPreferMindGrabLowMem128(device, d, modelEntry) {
-  // MindGrab's 15-channel backbone runs 25 convolutions. The full workspace
-  // can reset the i915 engine even with paced submissions.
-  return modelEntry?.forceLowMem128 !== false && d.chan === 15 &&
-    isLinuxIntelGen9Device(device);
 }
 
 // Select Tier 1 subgroup reduction strategy based on adapter subgroup range:
@@ -4967,7 +4862,7 @@ ${buildClassifierLoopsWgsl({
   };
 }
 
-async function setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelEntry, probCfg) {
+async function setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelEntry, probCfg, plan) {
   const nvox = DIM * DIM * DIM;
   const outBufBytes = probCfg ? nvox * 4 : nvox;
   const numConvs = d.dilations.length;
@@ -5296,8 +5191,9 @@ async function setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelE
       device.queue.writeBuffer(bandUboBuf, 0, bandUboHost);
     }
 
-    let execMode = resolveV4InitialExecMode(device, modelEntry, d);
-    if (execMode === 'paced') console.info('[WebGPU-V4-128M] Using paced GPU submissions');
+    let execMode = plan.execMode === 'calibrate' && device.__v4WinCalibrated
+      ? (device.__v4WinFast ? 'pipelined' : 'paced')
+      : plan.execMode;
     const passCategories = [];
 
     if (execMode === 'single') {
@@ -5517,7 +5413,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelE
       }
       onProgress(frac, msg);
     };
-    const pacer = createPacedQueueController(device, device.__v4MsPerStrip || 0.12, emitProgress);
+    const pacer = createPacedQueueController(device, plan.msPerStrip || device.__v4MsPerStrip || 0.12, emitProgress);
 
     let enc = device.createCommandEncoder();
     prepRes.runPrePasses(enc, passCategories);
@@ -5812,6 +5708,7 @@ async function setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelE
   execute.gpuBytes = () => ws.bytes + ownedAlloc.getBytes();
   execute.__passCategories = [];
   execute.__coneInfo = () => ({ paddedVox, actMiB: actQBytes / 1048576, mode: 'LowMem128' });
+  execute.__v4Plan = () => plan;
   execute.kernels = 'v4-int8';
   return execute;
 }
@@ -5860,17 +5757,23 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
 
   const lim = device.limits || {};
   const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
-  const preferWin128 = shouldPreferLowMem128OnWindows(device, d, modelEntry);
-  const preferMesa128 = shouldPreferMindGrabLowMem128(device, d, modelEntry);
-  if ((modelEntry?.forceLowMem128 || preferWin128 || preferMesa128 || actBytes > maxAllowed || outBufBytes > maxAllowed) && d.cs >= 8 && d.cs % 4 === 0) {
-    return setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelEntry, probCfg);
+  const plan = await resolveV4ExecutionPlan(device, d, modelEntry, {
+    actBytes,
+    outBufBytes,
+    hasF16,
+  });
+  device.__v4LastPlan = plan;
+  console.info(formatV4PlanDiagnostic(plan, d));
+
+  if (plan.layout === 'LowMem128' && d.cs >= 8 && d.cs % 4 === 0) {
+    return setupNetLowMem128(device, d, packed, hasF16, subgroupMode, modelEntry, probCfg, plan);
   }
   if (actBytes > maxAllowed || outBufBytes > maxAllowed) {
     const needMiB = Math.max(actBytes, outBufBytes) >>> 20;
     throw new Error(`meshnet_fast_v4: buffer (${needMiB} MiB) exceeds device limit (${maxAllowed >>> 20} MiB)`);
   }
 
-  const chunkableStd = shouldUseStdChunking(device, modelEntry, d);
+  const chunkableStd = plan.chunkableStd;
   const shaders = buildShaders({
     cs: d.cs,
     chan: d.chan,
@@ -6154,8 +6057,9 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
     const info = prepRes.info;
 
     const schedule = computeConeSchedule(headRowHost, info, d.dilations, useCone);
-    let execMode = resolveV4InitialExecMode(device, modelEntry, d);
-    if (execMode === 'paced') console.info('[WebGPU-V4] Using paced GPU submissions');
+    let execMode = plan.execMode === 'calibrate' && device.__v4WinCalibrated
+      ? (device.__v4WinFast ? 'pipelined' : 'paced')
+      : plan.execMode;
     const passCategories = [];
 
     if (execMode === 'single' && !shaders.chunkableStd) {
@@ -6336,7 +6240,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
       }
       onProgress(frac, msg);
     };
-    const pacer = createPacedQueueController(device, device.__v4MsPerStrip || 0.12, emitProgress);
+    const pacer = createPacedQueueController(device, plan.msPerStrip || device.__v4MsPerStrip || 0.12, emitProgress);
 
     let enc = device.createCommandEncoder();
     prepRes.runPrePasses(enc, passCategories);
@@ -6646,6 +6550,7 @@ async function setupNetInner(device, safetensorBytes, callbackUI, modelEntry = {
   execute.gpuBytes = () => ws.bytes + ownedAlloc.getBytes();
   execute.__passCategories = [];
   execute.__coneInfo = () => ({ paddedVox, actMiB: actBytes / 1048576 });
+  execute.__v4Plan = () => plan;
   execute.kernels = 'v4-int8';
   return execute;
 }
@@ -6657,8 +6562,6 @@ export async function warmupV4CorePipelines(device) {
 
   const hasF16 = !!device.features?.has?.('shader-f16');
   const subgroupMode = resolveSubgroupMode(device, null);
-  const lim = device.limits || {};
-  const maxAllowed = Math.min(lim.maxStorageBufferBindingSize ?? Infinity, lim.maxBufferSize ?? Infinity);
 
   await getIoPipe(device, hasF16 ? 'prep_in_u8_f16' : 'prep_in_u8_f32', () => buildPrepInWgsl(true, hasF16), 'main', ['read-only-storage', 'storage', 'uniform']);
   if (shouldAbort()) return;
@@ -6680,9 +6583,13 @@ export async function warmupV4CorePipelines(device) {
     const splitHalves = d.cs >= 16;
     const csHalf = splitHalves ? d.cs / 2 : d.cs;
     const actBytes = DIM * DIM * csHalf * X4_PAD * 4;
-    const use128 = actBytes > maxAllowed || shouldPreferLowMem128OnWindows(device, d, null) ||
-      shouldPreferMindGrabLowMem128(device, d, null);
-    if (use128) {
+    const plan = await resolveV4ExecutionPlan(device, d, null, {
+      actBytes,
+      outBufBytes: DIM * DIM * DIM,
+      hasF16,
+    });
+    if (shouldAbort()) return;
+    if (plan.layout === 'LowMem128') {
       const shaders = buildShadersLowMem128({
         cs: d.cs,
         chan: d.chan,
@@ -6702,7 +6609,7 @@ export async function warmupV4CorePipelines(device) {
         shouldAbort,
       });
     } else {
-      const chunkableStd = shouldUseStdChunking(device, null, d);
+      const chunkableStd = plan.chunkableStd;
       const shaders = buildShaders({
         cs: d.cs,
         chan: d.chan,

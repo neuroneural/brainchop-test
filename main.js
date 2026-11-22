@@ -1,7 +1,16 @@
 import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
 import { clinicalConform } from "./conform-transform.js";
 import { shiny } from "@niivue/niivue/assets/matcaps";
-import { runInferenceWebGpu, warmupWebGpuRunners, yieldForPaint } from "./inference-webgpu.js";
+import {
+  runInferenceWebGpu,
+  warmupWebGpuRunners,
+  releaseWebGpuWorkspace,
+  yieldForPaint,
+} from "./inference-webgpu.js";
+import {
+  applyWebGpuUrlOverrides,
+  executeWithWebGpuSafeModeRetry,
+} from "./gpu-compatibility.js";
 import { inferenceModelsList, brainChopOpts, resolveModelEntry } from "./brainchop-parameters.js";
 import { localSystemDetails } from "./brainchop-diagnostics.js";
 import { getLabelHistogramU8 } from "./tensor-utils.js";
@@ -1114,20 +1123,46 @@ async function main() {
     if (isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost && !skipWebGpu && modelEntry.webgpu_safetensor) {
       console.log("Attempting WebGPU backend...");
 
-      const forceLowMemoryV4 = modelEntry.quantize8Bit && params.get("webgpuMode") === "low-memory";
-      const currentModelEntry = {
-        ...modelEntry,
-        enableTTA: false,
-        ...(forceLowMemoryV4 ? { forceLowMem128: true, webgpuExecMode: "paced" } : {}),
+      const currentModelEntry = applyWebGpuUrlOverrides(
+        { ...modelEntry, enableTTA: false },
+        window.location.search
+      );
+      const acquireFreshWebGpuDevice = async ({ failedDevice }) => {
+        if (failedDevice) {
+          try { releaseWebGpuWorkspace(failedDevice); } catch {}
+          if (!failedDevice.__isLost) {
+            try { failedDevice.destroy(); } catch {}
+          }
+        }
+        gpuDevice = null;
+        isWebGpuAvailable = false;
+        await initializeBackend(nv1.view?.gl);
+        return isWebGpuAvailable && gpuDevice && !gpuDevice.__isLost ? gpuDevice : null;
       };
-      if (forceLowMemoryV4) console.info("[WebGPU] Low-memory paced V4 requested by URL");
 
       try {
-        await runInferenceWebGpu(gpuDevice, opts, currentModelEntry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI);
+        await executeWithWebGpuSafeModeRetry({
+          device: gpuDevice,
+          modelEntry: currentModelEntry,
+          runAttempt: (dev, entry) =>
+            runInferenceWebGpu(dev, opts, entry, nv1.volumes[0].hdr, niftiImage, callbackImg, callbackUI),
+          requestFreshDevice: acquireFreshWebGpuDevice,
+          onRetry: ({ failureKind, error }) => {
+            console.warn(
+              `[WebGPU-V4] ${failureKind} during standard run (${error?.message || error}); ` +
+              `persisted low-memory safe mode and retrying once in LowMem128 + paced.`
+            );
+            callbackUI("Retrying in low-memory WebGPU mode\u2026", 0.05);
+          },
+        });
+        gpuDeviceLostRecoveries = 0;
         return; // Success
       } catch (e) {
         lastError = e;
-        if (!backendAttemptMessages.length) backendAttemptMessages.push(`WebGPU: ${e?.message || e}`);
+        const msg = e?.message || String(e);
+        if (!backendAttemptMessages.some((m) => m.includes(msg))) {
+          backendAttemptMessages.push(`WebGPU: ${msg}`);
+        }
         console.error("WebGPU inference failed, falling back to native WebGL2.", e);
       }
     } else if (!skipWebGpu && modelEntry.webgpu_safetensor) {

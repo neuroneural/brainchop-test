@@ -238,6 +238,10 @@ const weightsByteCache = new Map();
 const activeRunnerByDevice = new WeakMap();
 const warmedDevices = new WeakSet();
 
+export function releaseWebGpuWorkspace(device) {
+    fastV4Runner.releaseV4Workspace(device);
+}
+
 export async function warmupWebGpuRunners(device) {
     if (!device || warmedDevices.has(device)) return;
     warmedDevices.add(device);
@@ -537,9 +541,12 @@ async function setupNetwork(device, modelEntry, callbackUI) {
             fastV4Runner.releaseV4Workspace(device);
         }
         destroyBuffers(setupBuffers);
-        throw new Error(
-            `Failed to setup network for '${runnerName}': ${error.message}`
+        const wrapped = new Error(
+            `Failed to setup network for '${runnerName}': ${error.message}`,
+            { cause: error }
         );
+        if (error?.oomError) wrapped.oomError = error.oomError;
+        throw wrapped;
     }
 }
 
@@ -702,10 +709,11 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         oomScopeOpen = false;
         const oomError = await device.popErrorScope();
         if (oomError) {
-            throw new Error(
-                `WebGPU out of memory (${oomError.message || 'allocation failed'}) ` +
-                `- falling back to WebGL2.`
+            const err = new Error(
+                `WebGPU out of memory (${oomError.message || 'allocation failed'})`
             );
+            err.oomError = oomError;
+            throw err;
         }
 
         if (!inferenceResultArray || !Array.isArray(inferenceResultArray)) {
@@ -719,6 +727,27 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
         const gpuMiB = (activeEntry.gpuBytes || 0) / 1048576;
         statData.GPU_Memory_MiB = Math.round(gpuMiB);
         statData.WebGPU_Kernels = activeEntry.execute.kernels || 'tinygrad';
+        if (typeof activeEntry.execute.__v4Plan === 'function') {
+            const v4Plan = activeEntry.execute.__v4Plan();
+            statData.WebGPU_V4_Layout = v4Plan.layout;
+            statData.WebGPU_V4_Exec = v4Plan.execMode;
+            statData.WebGPU_V4_Reason = v4Plan.reason;
+            if (Number.isFinite(v4Plan.probeMs)) {
+                statData.WebGPU_V4_Probe_ms = Number(v4Plan.probeMs.toFixed(1));
+            }
+            if (typeof window !== 'undefined' && window.webgpuDiagnostics) {
+                window.webgpuDiagnostics.v4Plan = {
+                    layout: v4Plan.layout,
+                    execMode: v4Plan.execMode,
+                    reason: v4Plan.reason,
+                    tier: v4Plan.tier,
+                    probeMs: v4Plan.probeMs,
+                    estFullLayerMs: v4Plan.estFullLayerMs,
+                    fromCache: v4Plan.fromCache,
+                    safeMode: v4Plan.safeMode,
+                };
+            }
+        }
         const gpuMemory = gpuMiB >= 1024 ? `${(gpuMiB / 1024).toFixed(2)} GiB` : `${Math.round(gpuMiB)} MiB`;
         console.log(
             `WebGPU inference took ${Inference_t}s (${statData.WebGPU_Kernels} kernels, ${gpuMemory} GPU memory).`
@@ -836,25 +865,36 @@ export async function runInferenceWebGpu(device, opts, modelEntry, niftiHeader, 
 
         // If we threw while an OOM error scope was still open (e.g. setupNetwork or
         // execute failed before we popped it), pop it now so the scope stays balanced
-        // and the captured error doesn't leak onto the device's uncaptured-error path.
+        // and any captured GPUOutOfMemoryError is preserved for Layer 3 safe-mode retry.
         if (oomScopeOpen && device) {
             oomScopeOpen = false;
-            try { await device.popErrorScope(); } catch (_) { /* device may be lost */ }
+            try {
+                const scopedOom = await device.popErrorScope();
+                if (scopedOom && error && typeof error === 'object' && !error.oomError) {
+                    error.oomError = scopedOom;
+                }
+            } catch (_) { /* device may be lost */ }
         }
 
         // Provide more specific error messages
-        let errorMessage = error.message;
-        if (error.message.includes('not found')) {
+        let errorMessage = error?.message || String(error);
+        if (error?.oomError && !/out[- ]of[- ]memory|\boom\b/i.test(errorMessage)) {
+            errorMessage = `${errorMessage} (WebGPU out of memory: ${error.oomError.message || 'allocation failed'})`;
+        }
+        if (errorMessage.includes('not found')) {
             errorMessage += '. Check that the runner file exists and the name matches.';
-        } else if (error.message.includes('fetch')) {
+        } else if (errorMessage.includes('fetch')) {
             errorMessage += '. Check network connection and file paths.';
-        } else if (error.message.includes('binding size')) {
+        } else if (errorMessage.includes('binding size')) {
             errorMessage += '. GPU memory limit exceeded.';
         }
 
         markFailure(statData, errorMessage, 'WebGPU inference failed');
 
-        callbackUI('', -1, `WebGPU Error: ${errorMessage}`, statData);
-        throw error; // Re-throw to trigger fallback in main.js
+        const errPrefix = modelEntry?.__v4PlanReasonOverride === 'safe-mode-retry'
+            ? 'WebGPU (low-memory retry) Error'
+            : 'WebGPU Error';
+        callbackUI('', -1, `${errPrefix}: ${errorMessage}`, statData);
+        throw error; // Re-throw to trigger safe-mode retry / fallback in main.js
     }
 }
