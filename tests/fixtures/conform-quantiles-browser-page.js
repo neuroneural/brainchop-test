@@ -1,11 +1,15 @@
 import { NiiVue } from '@niivue/niivue';
-import { clinicalConform } from '../../conform-transform.js';
+import {
+  clinicalConform,
+  DISPLAY_CONFORM_FHIGH,
+  INFERENCE_CONFORM_FHIGH,
+} from '../../conform-transform.js';
 import { computeQuantiles } from '../../tensor-utils.js';
 import { brainChopOpts, inferenceModelsList, resolveModelEntry } from '../../brainchop-parameters.js';
 import { runInferenceWebGpu } from '../../inference-webgpu.js';
 import { createDevice } from './cat-lite-browser-page.js';
 
-export async function verifyConformAndDeterminism(niiBytesArr) {
+export async function verifyConformAndDeterminism(niiBytesArr, flareBytesArr = null) {
   const canvas = document.createElement('canvas');
   canvas.width = 64;
   canvas.height = 64;
@@ -39,6 +43,48 @@ export async function verifyConformAndDeterminism(niiBytesArr) {
   let nonZero = 0;
   for (let i = 0; i < cImg.length; i++) {
     if (cImg[i] > 0) nonZero++;
+  }
+
+  // Dual display (0.999) + inference (0.98) Web Worker verification on clinical coil-flare scan.
+  let flareCheck = null;
+  if (flareBytesArr) {
+    const flareBlob = new Blob([new Uint8Array(flareBytesArr)]);
+    const flareUrl = URL.createObjectURL(flareBlob);
+    try {
+      await nv.loadVolumes([{ url: flareUrl, name: 'synthetic_coil_flare_16bit.nii' }]);
+    } finally {
+      URL.revokeObjectURL(flareUrl);
+    }
+    const flareNative = nv.volumes[0];
+    const flareBefore0 = flareNative.img[0];
+    const flareLen = flareNative.img.length;
+    const tDual = performance.now();
+    const dual = await clinicalConform.apply(flareNative.hdr, flareNative.img, {
+      toRAS: false,
+      fHigh: DISPLAY_CONFORM_FHIGH,
+      inferenceFHigh: INFERENCE_CONFORM_FHIGH,
+    });
+    const dualMs = performance.now() - tDual;
+    const soloDisplay = await nv.volumeTransform.conform(flareNative, { toRAS: false });
+    let displayDiffs = 0;
+    for (let i = 0; i < dual.img.length; i++) {
+      if (dual.img[i] !== soloDisplay.img[i]) displayDiffs++;
+    }
+    const qDisplay = computeQuantiles(dual.img, 0.05, 0.95);
+    const qInfer = computeQuantiles(dual.inferenceImg, 0.05, 0.95);
+    const centerIdx = 128 * 65536 + 128 * 256 + 128;
+    flareCheck = {
+      dualMs,
+      nativeIntact: flareNative.img.length === flareLen && flareNative.img[0] === flareBefore0,
+      distinctBuffers: dual.img !== dual.inferenceImg && dual.img.buffer !== dual.inferenceImg.buffer,
+      displayMatchesSolo: displayDiffs === 0,
+      displayCenter: dual.img[centerIdx],
+      inferCenter: dual.inferenceImg[centerIdx],
+      qDisplay,
+      qInfer,
+      displayMaxNormSpike: (255 - qDisplay.qmin) / Math.max(1, qDisplay.qmax - qDisplay.qmin),
+      inferMaxNormSpike: (255 - qInfer.qmin) / Math.max(1, qInfer.qmax - qInfer.qmin),
+    };
   }
 
   // Repeat-run determinism on bundled t1_crop.nii.gz with live MindMap-16ch WebGPU (NO Math.random mock!)
@@ -85,6 +131,7 @@ export async function verifyConformAndDeterminism(niiBytesArr) {
     cornerVal,
     centerVal,
     nonZero,
+    flareCheck,
     qA,
     qB,
     repeatDiffs,

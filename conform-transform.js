@@ -1,5 +1,11 @@
 import ConformWorker from './conform-worker.js?worker';
-import { conformVolumeData } from './conform-volume.js';
+import {
+  conformVolumeData,
+  DISPLAY_CONFORM_FHIGH,
+  INFERENCE_CONFORM_FHIGH,
+} from './conform-volume.js';
+
+export { DISPLAY_CONFORM_FHIGH, INFERENCE_CONFORM_FHIGH };
 
 let sharedWorker = null;
 let nextRequestId = 1;
@@ -80,7 +86,9 @@ function buildConformedHeader(hdr, res) {
 }
 
 /**
- * NiiVue VolumeTransform for robust 256³ conforming (0–99.9% clip + <2% negative floor).
+ * NiiVue VolumeTransform for robust 256³ conforming (0–99.9% display clip +
+ * <2% negative floor, with optional single-pass 0–98% inference output via
+ * `options.inferenceFHigh`).
  */
 export const clinicalConform = {
   name: 'conform',
@@ -91,6 +99,7 @@ export const clinicalConform = {
     { name: 'asFloat32', type: 'checkbox', label: 'Output as Float32', default: false },
   ],
   async apply(hdr, img, options = {}) {
+    const inferenceFHigh = options.inferenceFHigh ?? null;
     const payload = {
       img,
       datatypeCode: hdr.datatypeCode,
@@ -101,12 +110,17 @@ export const clinicalConform = {
       toRAS: options.toRAS ?? false,
       isLinear: options.isLinear ?? true,
       asFloat32: options.asFloat32 ?? false,
-      fHigh: options.fHigh ?? 0.999,
+      fHigh: options.fHigh ?? DISPLAY_CONFORM_FHIGH,
+      inferenceFHigh,
     };
     const res = await runConformInWorker(payload);
-    return {
+    const out = {
       hdr: buildConformedHeader(hdr, res),
       img: res.img,
     };
+    if (inferenceFHigh != null) {
+      out.inferenceImg = res.inferenceImg ?? res.img;
+    }
+    return out;
   },
 };

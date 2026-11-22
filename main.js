@@ -1,5 +1,10 @@
 import { NiiVue, DRAG_MODE, SHOW_RENDER, nii2volume, writeVolume, makeLabelLut } from "@niivue/niivue";
-import { clinicalConform } from "./conform-transform.js";
+import {
+  clinicalConform,
+  DISPLAY_CONFORM_FHIGH,
+  INFERENCE_CONFORM_FHIGH,
+} from "./conform-transform.js";
+import { isVolumeConformed, createInferenceInputCache } from "./conform-volume.js";
 import { shiny } from "@niivue/niivue/assets/matcaps";
 import {
   runInferenceWebGpu,
@@ -452,6 +457,9 @@ async function main() {
   let lastFullLabelLut = null; // pristine makeLabelLut(...) object for instant LUT-based isolation restore
   let isolationStats = null;   // { lines:[...], color:[r,g,b,a] } drawn as a fixed HUD
   let nativeInputNV = null;    // volume as loaded (native grid), before conform
+  // Identity-bound 0–98% conformed uint8 input for WebGPU/WebGL2 inference
+  // (paired to nv1.volumes[0], which retains FreeSurfer's 0–99.9% display clip).
+  const inferenceInputCache = createInferenceInputCache();
   // CAT-lite temporarily dims the T1 so a neutral-gray probability map remains
   // readable. Preserve the user's slider value and restore it when leaving the
   // probability view; never force ordinary segmentations to 100%.
@@ -765,39 +773,35 @@ async function main() {
 
   async function ensureConformed() {
     const nii = nv1.volumes[0];
-    const pixDims = nii.hdr?.pixDims;
-    const is1mm = !pixDims || (
-      Math.abs(Math.abs(pixDims[1]) - 1) < 1e-3 &&
-      Math.abs(Math.abs(pixDims[2]) - 1) < 1e-3 &&
-      Math.abs(Math.abs(pixDims[3]) - 1) < 1e-3
-    );
-    const slope = nii.hdr?.scl_slope;
-    const inter = nii.hdr?.scl_inter;
-    const isUnscaled =
-      (slope === undefined || slope === 0 || Math.abs(slope - 1) < 1e-6) &&
-      (inter === undefined || Math.abs(inter) < 1e-6);
-    let isConformed =
-      nii.dims[1] === 256 && nii.dims[2] === 256 && nii.dims[3] === 256
-      && nii.img instanceof Uint8Array && nii.img.length === 256 * 256 * 256
-      && is1mm && isUnscaled;
-    if (
-      nii.permRAS[0] !== -1 ||
-      nii.permRAS[1] !== 3 ||
-      nii.permRAS[2] !== -2
-    ) {
-      isConformed = false;
-    }
-    if (isConformed) return;
+    if (isVolumeConformed(nii)) return;
     callbackUI("Conforming input volume to 256\u00b3...", 0.05);
     await yieldForPaint();
     await closeAllOverlays();
-    const nii2 = await nv1.volumeTransform.conform(nii, { toRAS: false });
+    const {
+      hdr: conformedHdr,
+      img: displayImg,
+      inferenceImg,
+    } = await clinicalConform.apply(nii.hdr, nii.img, {
+      toRAS: false,
+      fHigh: DISPLAY_CONFORM_FHIGH,
+      inferenceFHigh: INFERENCE_CONFORM_FHIGH,
+    });
+    const nii2 = nii2volume(
+      conformedHdr,
+      displayImg,
+      nii.name ? `${nii.name}_conform` : "conform"
+    );
     const [nativeNV, nativeName] = [nativeInputNV, nativeInputName];
     const prevModelVal = modelSelect.value;
     await nv1.removeVolume(0);
     await nv1.addVolume(nii2);
-    // addVolume re-ran doLoadImage with the conformed copy; keep the native grid and selected model.
+    // addVolume re-ran doLoadImage with the conformed copy; keep the native grid,
+    // coil-flare-safe 0–98% inference buffer, and selected model.
     [nativeInputNV, nativeInputName] = [nativeNV, nativeName];
+    inferenceInputCache.set(
+      nv1.volumes[0],
+      inferenceImg && inferenceImg !== displayImg ? inferenceImg : nv1.volumes[0]?.img
+    );
     modelSelect.value = prevModelVal;
     syncModelSelectTooltip();
   }
@@ -1102,7 +1106,7 @@ async function main() {
     // Remove trailing slash if present to avoid double slashes when appending paths starting with /
     opts.rootURL = rootUrl.endsWith('/') ? rootUrl.slice(0, -1) : rootUrl;
 
-    const niftiImage = nv1.volumes[0].img;
+    const niftiImage = inferenceInputCache.get(nv1.volumes[0]);
     let lastError = null;
 
     // 1. Try WebGPU (unconditionally V4 8-bit unless ?precision=fp16|fp32; legacy non-V4 runners stay gated on Safari unless ?inference=webgpu)
@@ -1952,10 +1956,14 @@ async function main() {
   };
 
   function doLoadImage() {
+    // Release any cached 0–98% inference buffer as soon as the base volume
+    // changes (including multi-volume .nvd loads or drag-and-drop replacement).
+    inferenceInputCache.sync(nv1.volumes[0]);
     // Retain the volume as loaded (native grid) before ensureConformed() may
     // replace volumes[0] with the 256³ conformed copy — needed to reslice the
     // segmentation back to native space on export.
     if (nv1.volumes.length <= 1) {
+      inferenceInputCache.clear();
       nativeInputNV = nv1.volumes[0] || null;
       nativeInputName = (nativeInputNV && nativeInputNV.name) ? nativeInputNV.name : "input.nii.gz";
       lastModelEntry = null;
