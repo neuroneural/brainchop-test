@@ -601,6 +601,145 @@ function makeDiagAffine(sx, sy, sz, tx = 0, ty = 0, tz = 0) {
   assert.deepEqual(resInt.hdrPatch, { scl_slope: 1, scl_inter: 0 });
 }
 
+// ---------------------------------------------------------------------------
+// 8. Streaming 2x2x2 fixed-point trilinear one-hot label voting on oblique
+//    1 mm / sub-mm grids: eliminates Moire teeth & improves cortical Dice
+// ---------------------------------------------------------------------------
+{
+  // 8a. Isolated corner at NN position (0.6, 0.6, 0.6) is outvoted by 7 neighbors (0.784 vs 0.216)
+  const triIsolated = resliceVolumeData({
+    srcImg: Uint8Array.from([3, 3, 3, 3, 3, 3, 3, 9]),
+    srcDims: [2, 2, 2],
+    srcAffine: ID_AFFINE,
+    dstDims: [1, 1, 1],
+    dstAffine: makeDiagAffine(1, 1, 1, 0.6, 0.6, 0.6),
+    isLabel: true,
+  });
+  assert.equal(triIsolated.img[0], 3);
+
+  // 8b. Multi-class junction sums disjoint corners sharing a label
+  const triJunction = resliceVolumeData({
+    srcImg: Uint8Array.from([1, 2, 2, 4, 1, 2, 2, 4]),
+    srcDims: [2, 2, 2],
+    srcAffine: ID_AFFINE,
+    dstDims: [1, 1, 1],
+    dstAffine: makeDiagAffine(1, 1, 1, 0.6, 0.6, 0.4),
+    isLabel: true,
+  });
+  assert.equal(triJunction.img[0], 2);
+
+  // 8c. Exact 3D midpoint (0.5, 0.5, 0.5) 4-vs-4 tie resolves deterministically to NN corner (1,1,1)
+  const triMid = resliceVolumeData({
+    srcImg: Uint8Array.from([5, 5, 5, 5, 8, 8, 8, 8]),
+    srcDims: [2, 2, 2],
+    srcAffine: ID_AFFINE,
+    dstDims: [1, 1, 1],
+    dstAffine: makeDiagAffine(1, 1, 1, 0.5, 0.5, 0.5),
+    isLabel: true,
+  });
+  assert.equal(triMid.img[0], 8);
+
+  // 8d. Non-zero labelLut[0] fills skipped out-of-bbox background voxels
+  const resNonZeroBg = resliceVolumeData({
+    srcImg: new Uint8Array(8),
+    srcDims: [2, 2, 2],
+    srcAffine: ID_AFFINE,
+    dstDims: [2, 2, 2],
+    dstAffine: makeDiagAffine(1, 1, 1, 0.25, 0, 0),
+    isLabel: true,
+    labelLut: new Int16Array([77, 1001]),
+  });
+  assert.equal(resNonZeroBg.hdrPatch.cal_max, 77);
+  assert.ok(resNonZeroBg.img.every((v) => v === 77));
+
+  // 8e. Analytical folded cortical shell rotated 12 deg: trilinear strictly improves
+  //     cortical Dice and slashes 1-voxel surface teeth vs plain NN.
+  const evalShell = (x, y, z) => {
+    const r = Math.hypot(x, y, z) + 2.4 * Math.sin(0.32 * x) * Math.cos(0.32 * y) + 1.6 * Math.sin(0.28 * z);
+    return r < 14.5 ? 1 : r < 18.0 ? 2 : 0;
+  };
+  const N = 56;
+  const half = N / 2;
+  const conf = new Uint8Array(N * N * N);
+  const idC = [[1, 0, 0, -half], [0, 1, 0, -half], [0, 0, 1, -half], [0, 0, 0, 1]];
+  for (let z = 0; z < N; z++)
+    for (let y = 0; y < N; y++)
+      for (let x = 0; x < N; x++)
+        conf[x + y * N + z * N * N] = evalShell(x - half, y - half, z - half);
+
+  const th = (12 * Math.PI) / 180;
+  const uLen = Math.hypot(1, 1, 0.5);
+  const ux = 1 / uLen, uy = 1 / uLen, uz = 0.5 / uLen;
+  const cs = Math.cos(th), sn = Math.sin(th), om = 1 - cs;
+  const R = [
+    [cs + ux * ux * om, ux * uy * om - uz * sn, ux * uz * om + uy * sn],
+    [uy * ux * om + uz * sn, cs + uy * uy * om, uy * uz * om - ux * sn],
+    [uz * ux * om - uy * sn, uz * uy * om + ux * sn, cs + uz * uz * om],
+  ];
+  const oblAff = [
+    [R[0][0], R[0][1], R[0][2], -(R[0][0] + R[0][1] + R[0][2]) * half],
+    [R[1][0], R[1][1], R[1][2], -(R[1][0] + R[1][1] + R[1][2]) * half],
+    [R[2][0], R[2][1], R[2][2], -(R[2][0] + R[2][1] + R[2][2]) * half],
+    [0, 0, 0, 1],
+  ];
+  const gt = new Uint8Array(N * N * N);
+  const nn = new Uint8Array(N * N * N);
+  for (let z = 0; z < N; z++) {
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const mx = oblAff[0][0] * x + oblAff[0][1] * y + oblAff[0][2] * z + oblAff[0][3];
+        const my = oblAff[1][0] * x + oblAff[1][1] * y + oblAff[1][2] * z + oblAff[1][3];
+        const mz = oblAff[2][0] * x + oblAff[2][1] * y + oblAff[2][2] * z + oblAff[2][3];
+        const idx = x + y * N + z * N * N;
+        gt[idx] = evalShell(mx, my, mz);
+        const sx = Math.floor(mx + half + 0.5);
+        const sy = Math.floor(my + half + 0.5);
+        const sz = Math.floor(mz + half + 0.5);
+        nn[idx] = sx >= 0 && sx < N && sy >= 0 && sy < N && sz >= 0 && sz < N ? conf[sx + sy * N + sz * N * N] : 0;
+      }
+    }
+  }
+  const tri = resliceVolumeData({
+    srcImg: conf,
+    srcDims: [N, N, N],
+    srcAffine: idC,
+    dstDims: [N, N, N],
+    dstAffine: oblAff,
+    isLabel: true,
+  }).img;
+
+  const ctxDice = (a, b) => {
+    let inter = 0, sa = 0, sb = 0;
+    for (let i = 0; i < a.length; i++) {
+      const ma = a[i] === 2, mb = b[i] === 2;
+      if (ma) sa++; if (mb) sb++; if (ma && mb) inter++;
+    }
+    return (2 * inter) / (sa + sb);
+  };
+  const sp4Rate = (v) => {
+    let ns = 0, sp4 = 0;
+    for (let z = 0; z < N; z++) {
+      for (let y = 0; y < N; y++) {
+        for (let x = 0; x < N; x++) {
+          const i = x + y * N + z * N * N;
+          if (v[i] === 0) continue;
+          let nb = 0;
+          if (x > 0 && v[i - 1] > 0) nb++;
+          if (x + 1 < N && v[i + 1] > 0) nb++;
+          if (y > 0 && v[i - N] > 0) nb++;
+          if (y + 1 < N && v[i + N] > 0) nb++;
+          if (z > 0 && v[i - N * N] > 0) nb++;
+          if (z + 1 < N && v[i + N * N] > 0) nb++;
+          if (nb < 6) { ns++; if (nb <= 2) sp4++; }
+        }
+      }
+    }
+    return sp4 / Math.max(1, ns);
+  };
+  assert.ok(ctxDice(gt, tri) > ctxDice(gt, nn) + 0.015);
+  assert.ok(sp4Rate(tri) < sp4Rate(nn) * 0.65);
+}
+
 console.log(
-  "reslice-volume OK (all 1/1.5/2/3/5/7 mm integer & half-integer center, symmetry, tie, OOB, LUT, probability & intensity checks passed)."
+  "reslice-volume OK (all 1/1.5/2/3/5/7 mm integer & half-integer center, oblique trilinear, symmetry, tie, OOB, LUT, probability & intensity checks passed)."
 );
